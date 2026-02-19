@@ -205,8 +205,8 @@ impl Backend for MockBackend {
         None
     }
 
-    fn handle_page_flip(&mut self) -> anyhow::Result<()> {
-        Ok(())
+    fn handle_page_flip(&mut self) -> anyhow::Result<Option<u64>> {
+        Ok(None)
     }
 
     fn set_vrr(&mut self, enabled: bool) -> anyhow::Result<()> {

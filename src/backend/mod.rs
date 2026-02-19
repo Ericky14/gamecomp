@@ -153,7 +153,10 @@ pub trait Backend: Send {
     fn drm_fd(&self) -> Option<RawFd>;
 
     /// Handle a page flip event. Called when the DRM fd is readable.
-    fn handle_page_flip(&mut self) -> anyhow::Result<()>;
+    ///
+    /// Returns the vblank timestamp in nanoseconds (CLOCK_MONOTONIC) if
+    /// a page flip event was received.
+    fn handle_page_flip(&mut self) -> anyhow::Result<Option<u64>>;
 
     /// Set VRR (variable refresh rate) enabled/disabled.
     fn set_vrr(&mut self, enabled: bool) -> anyhow::Result<()>;

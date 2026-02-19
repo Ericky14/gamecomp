@@ -762,13 +762,23 @@ impl Backend for DrmBackend {
         Some(self.fd.as_raw_fd())
     }
 
-    fn handle_page_flip(&mut self) -> anyhow::Result<()> {
+    fn handle_page_flip(&mut self) -> anyhow::Result<Option<u64>> {
         let dev = DrmRef(self.fd.as_fd());
-        // Process DRM events (page flip completion).
-        dev.receive_events()
+        let events = dev
+            .receive_events()
             .context("failed to receive DRM events")?;
+
+        let mut vblank_ns: Option<u64> = None;
+        for event in events {
+            if let drm::control::Event::PageFlip(flip) = event {
+                // flip.duration is the absolute vblank timestamp from the kernel
+                // (typically CLOCK_MONOTONIC when DRM_CAP_TIMESTAMP_MONOTONIC is set).
+                vblank_ns = Some(flip.duration.as_nanos() as u64);
+            }
+        }
+
         self.flip_pending = false;
-        Ok(())
+        Ok(vblank_ns)
     }
 
     fn set_vrr(&mut self, enabled: bool) -> anyhow::Result<()> {

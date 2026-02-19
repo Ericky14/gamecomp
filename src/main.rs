@@ -152,7 +152,7 @@ fn run(config: Config) -> anyhow::Result<()> {
     // client-facing dmabuf module can advertise the real host formats instead
     // of the hardcoded fallback list. This enables zero-copy DMA-BUF forwarding.
     let (calloop_frame_tx, _frame_rx) = calloop::channel::channel::<FrameInfo>();
-    let (_flip_tx, _flip_rx) = calloop::channel::channel::<u64>(); // VBlank timestamp.
+    let (vblank_tx, vblank_rx) = std::sync::mpsc::channel::<u64>(); // VBlank timestamp (ns).
 
     // Shared atomic for detected host display refresh rate (millihertz).
     // Written by the wayland backend's event thread, read by the main loop.
@@ -196,6 +196,7 @@ fn run(config: Config) -> anyhow::Result<()> {
                 detected_refresh_mhz_render,
                 host_dmabuf_formats_render,
                 drm_device,
+                vblank_tx,
             );
         })
         .context("failed to spawn render thread")?;
@@ -274,6 +275,13 @@ fn run(config: Config) -> anyhow::Result<()> {
             && let Err(e) = sess.dispatch()
         {
             warn!(?e, "seat dispatch error");
+        }
+
+        // Drain vblank timestamps from the render thread and feed them to
+        // the frame pacer. This synchronizes frame callback releases with
+        // the display's actual refresh cycle on the DRM path.
+        while let Ok(vblank_ns) = vblank_rx.try_recv() {
+            pacer.mark_vblank(vblank_ns);
         }
 
         // Sync frame pacer and FPS limiter to the host display refresh rate.
@@ -661,6 +669,7 @@ fn render_thread_main(
     detected_refresh_mhz: Arc<AtomicU32>,
     host_dmabuf_formats: Arc<parking_lot::Mutex<std::collections::HashMap<u32, Vec<u64>>>>,
     drm_device: Option<(std::path::PathBuf, std::os::unix::io::OwnedFd)>,
+    vblank_tx: std::sync::mpsc::Sender<u64>,
 ) {
     info!("render thread started");
 
@@ -738,7 +747,7 @@ fn render_thread_main(
         let rx = committed_frames
             .take()
             .expect("committed_frames receiver missing for DRM path");
-        if let Err(e) = run_drm_event_loop(drm, rx) {
+        if let Err(e) = run_drm_event_loop(drm, rx, &vblank_tx) {
             error!(?e, "DRM event loop exited with error");
         }
         info!("render thread exited");
@@ -770,6 +779,7 @@ fn render_thread_main(
 fn run_drm_event_loop(
     drm: &mut crate::backend::drm::DrmBackend,
     committed_frames: std::sync::mpsc::Receiver<wayland::protocols::CommittedBuffer>,
+    vblank_tx: &std::sync::mpsc::Sender<u64>,
 ) -> anyhow::Result<()> {
     let drm_raw_fd = drm
         .drm_fd()
@@ -810,7 +820,10 @@ fn run_drm_event_loop(
 
         // Process page flip completion.
         if flip_ready {
-            drm.handle_page_flip()?;
+            if let Some(vblank_ns) = drm.handle_page_flip()? {
+                // Send vblank timestamp to the main thread for frame pacing.
+                let _ = vblank_tx.send(vblank_ns);
+            }
             flip_pending = false;
             flip_ready = false;
         }

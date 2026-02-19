@@ -134,8 +134,8 @@ impl Backend for HeadlessBackend {
         None
     }
 
-    fn handle_page_flip(&mut self) -> anyhow::Result<()> {
-        Ok(())
+    fn handle_page_flip(&mut self) -> anyhow::Result<Option<u64>> {
+        Ok(None)
     }
 
     fn set_vrr(&mut self, _enabled: bool) -> anyhow::Result<()> {

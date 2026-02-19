@@ -399,9 +399,9 @@ impl Backend for WaylandBackend {
         None
     }
 
-    fn handle_page_flip(&mut self) -> anyhow::Result<()> {
+    fn handle_page_flip(&mut self) -> anyhow::Result<Option<u64>> {
         // In wayland mode, "page flip" completion comes from the host's frame callback.
-        Ok(())
+        Ok(None)
     }
 
     fn set_vrr(&mut self, _enabled: bool) -> anyhow::Result<()> {
