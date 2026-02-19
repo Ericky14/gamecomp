@@ -160,6 +160,29 @@ fn run(config: Config) -> anyhow::Result<()> {
     let detected_refresh_mhz = Arc::new(AtomicU32::new(0));
     let detected_refresh_mhz_render = detected_refresh_mhz.clone();
 
+    // --- DRM path: open session and GPU device on main thread ---
+    // Session management and device discovery must happen before the render
+    // thread is spawned so the DRM fd can be transferred.
+    let mut _session: Option<backend::session::Session> = None;
+    let drm_device: Option<(std::path::PathBuf, std::os::unix::io::OwnedFd)> =
+        if matches!(config.backend, crate::config::BackendKind::Drm) {
+            let mut sess =
+                backend::session::Session::open().context("failed to open seat session")?;
+            let gpus = backend::gpu_discovery::discover_gpus(sess.seat_name())
+                .context("GPU discovery failed")?;
+            let gpu = backend::gpu_discovery::select_primary_gpu(&gpus)
+                .ok_or_else(|| anyhow::anyhow!("no usable GPU found"))?;
+            let path = gpu.dev_path.clone();
+            let fd = sess
+                .open_device(&path)
+                .context("failed to open GPU device via session")?;
+            info!(path = %path.display(), "DRM device opened via session");
+            _session = Some(sess);
+            Some((path, fd))
+        } else {
+            None
+        };
+
     let config_clone = config.clone();
     let host_display_clone = host_wayland_display.clone();
     let host_dmabuf_formats_render = host_dmabuf_formats.clone();
@@ -172,6 +195,7 @@ fn run(config: Config) -> anyhow::Result<()> {
                 frame_rx,
                 detected_refresh_mhz_render,
                 host_dmabuf_formats_render,
+                drm_device,
             );
         })
         .context("failed to spawn render thread")?;
@@ -629,6 +653,7 @@ fn render_thread_main(
     committed_frames: std::sync::mpsc::Receiver<wayland::protocols::CommittedBuffer>,
     detected_refresh_mhz: Arc<AtomicU32>,
     host_dmabuf_formats: Arc<parking_lot::Mutex<std::collections::HashMap<u32, Vec<u64>>>>,
+    drm_device: Option<(std::path::PathBuf, std::os::unix::io::OwnedFd)>,
 ) {
     info!("render thread started");
 
@@ -649,6 +674,7 @@ fn render_thread_main(
     // The backend must stay alive for the entire render loop — dropping it
     // signals the event thread to shut down.
     let mut _backend: Option<crate::backend::wayland::WaylandBackend> = None;
+    let mut _drm_backend: Option<crate::backend::drm::DrmBackend> = None;
 
     match config.backend {
         crate::config::BackendKind::Wayland => {
@@ -669,8 +695,32 @@ fn render_thread_main(
             );
             _backend = Some(backend);
         }
+        crate::config::BackendKind::Drm => {
+            if let Some((path, fd)) = drm_device {
+                let mut drm = crate::backend::drm::DrmBackend::new(path.clone(), fd);
+                if let Err(e) = drm.init() {
+                    error!(?e, path = %path.display(), "failed to initialize DRM backend");
+                    return;
+                }
+                let connectors = drm.connectors();
+                if let Some(conn) = connectors.first() {
+                    let mode = conn.mode;
+                    info!(
+                        connector = %conn.name,
+                        mode_w = mode.size().0,
+                        mode_h = mode.size().1,
+                        vrr = drm.capabilities().vrr,
+                        "DRM backend initialized"
+                    );
+                }
+                _drm_backend = Some(drm);
+            } else {
+                error!("DRM backend selected but no device fd received");
+                return;
+            }
+        }
         _ => {
-            // TODO: Initialize DRM / headless backends.
+            // TODO: Initialize headless backend.
         }
     }
     // TODO: Set up calloop on this thread for DRM page flip fd + frame channel.
