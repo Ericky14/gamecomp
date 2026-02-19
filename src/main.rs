@@ -269,6 +269,13 @@ fn run(config: Config) -> anyhow::Result<()> {
     let mut last_detected_hz: u32 = 0;
 
     while RUNNING.load(Ordering::Relaxed) {
+        // Dispatch libseat events (VT switch notifications) for DRM sessions.
+        if let Some(ref mut sess) = _session
+            && let Err(e) = sess.dispatch()
+        {
+            warn!(?e, "seat dispatch error");
+        }
+
         // Sync frame pacer and FPS limiter to the host display refresh rate.
         update_refresh_rate(
             &detected_refresh_mhz,
@@ -723,9 +730,18 @@ fn render_thread_main(
             // TODO: Initialize headless backend.
         }
     }
-    // TODO: Set up calloop on this thread for DRM page flip fd + frame channel.
+    // --- DRM event loop ---
+    // For the DRM backend, set up a calloop event loop on the render thread
+    // that polls the DRM fd for page flip events.
+    if let Some(ref mut drm) = _drm_backend {
+        if let Err(e) = run_drm_event_loop(drm) {
+            error!(?e, "DRM event loop exited with error");
+        }
+        info!("render thread exited");
+        return;
+    }
 
-    // Monitor the backend until shutdown.
+    // Wayland / headless: monitor the backend until shutdown.
     while RUNNING.load(Ordering::Relaxed) {
         if let Some(ref backend) = _backend
             && !backend.is_alive()
@@ -738,6 +754,55 @@ fn render_thread_main(
     }
 
     info!("render thread exited");
+}
+
+/// Run the DRM event loop on the render thread.
+///
+/// Registers the DRM fd as a calloop event source so page flip completions
+/// are handled promptly. The loop runs until [`RUNNING`] is cleared.
+fn run_drm_event_loop(drm: &mut crate::backend::drm::DrmBackend) -> anyhow::Result<()> {
+    let drm_raw_fd = drm
+        .drm_fd()
+        .context("DRM backend has no fd")?;
+
+    let mut event_loop = calloop::EventLoop::<bool>::try_new()
+        .context("failed to create DRM event loop")?;
+    let handle = event_loop.handle();
+
+    // SAFETY: The DRM fd is owned by DrmBackend which outlives this event
+    // loop. The fd remains valid until DrmBackend is dropped after this
+    // function returns.
+    let wrapper = unsafe { calloop::generic::FdWrapper::new(drm_raw_fd) };
+    let source = calloop::generic::Generic::new(
+        wrapper,
+        calloop::Interest::READ,
+        calloop::Mode::Level,
+    );
+
+    handle
+        .insert_source(source, |_readiness, _fd, flip_ready| {
+            *flip_ready = true;
+            Ok(calloop::PostAction::Continue)
+        })
+        .context("failed to register DRM fd with event loop")?;
+
+    info!("DRM event loop started");
+
+    let mut flip_ready = false;
+    while RUNNING.load(Ordering::Relaxed) {
+        // Block up to 16ms for DRM events.
+        event_loop
+            .dispatch(std::time::Duration::from_millis(16), &mut flip_ready)
+            .context("DRM event loop dispatch failed")?;
+
+        if flip_ready {
+            drm.handle_page_flip()?;
+            flip_ready = false;
+        }
+    }
+
+    info!("DRM event loop exiting");
+    Ok(())
 }
 
 /// Install signal handlers for SIGTERM and SIGINT.
