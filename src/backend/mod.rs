@@ -11,6 +11,7 @@
 
 pub mod drm;
 pub mod gpu;
+pub mod gpu_discovery;
 pub mod headless;
 pub mod session;
 pub mod wayland;
