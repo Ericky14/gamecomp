@@ -682,12 +682,13 @@ fn render_thread_main(
     // signals the event thread to shut down.
     let mut _backend: Option<crate::backend::wayland::WaylandBackend> = None;
     let mut _drm_backend: Option<crate::backend::drm::DrmBackend> = None;
+    let mut committed_frames = Some(committed_frames);
 
     match config.backend {
         crate::config::BackendKind::Wayland => {
             let mut wayland_config = config.to_wayland_config();
             wayland_config.host_wayland_display = host_wayland_display;
-            wayland_config.committed_frame_rx = Some(committed_frames);
+            wayland_config.committed_frame_rx = committed_frames.take();
             wayland_config.detected_refresh_mhz = detected_refresh_mhz;
             wayland_config.host_dmabuf_formats = host_dmabuf_formats;
             let mut backend = crate::backend::wayland::WaylandBackend::new(wayland_config);
@@ -734,7 +735,10 @@ fn render_thread_main(
     // For the DRM backend, set up a calloop event loop on the render thread
     // that polls the DRM fd for page flip events.
     if let Some(ref mut drm) = _drm_backend {
-        if let Err(e) = run_drm_event_loop(drm) {
+        let rx = committed_frames
+            .take()
+            .expect("committed_frames receiver missing for DRM path");
+        if let Err(e) = run_drm_event_loop(drm, rx) {
             error!(?e, "DRM event loop exited with error");
         }
         info!("render thread exited");
@@ -759,8 +763,14 @@ fn render_thread_main(
 /// Run the DRM event loop on the render thread.
 ///
 /// Registers the DRM fd as a calloop event source so page flip completions
-/// are handled promptly. The loop runs until [`RUNNING`] is cleared.
-fn run_drm_event_loop(drm: &mut crate::backend::drm::DrmBackend) -> anyhow::Result<()> {
+/// are handled promptly. Drains the committed frame channel each iteration,
+/// imports the latest DMA-BUF, and presents it via atomic commit.
+///
+/// The loop runs until [`RUNNING`] is cleared.
+fn run_drm_event_loop(
+    drm: &mut crate::backend::drm::DrmBackend,
+    committed_frames: std::sync::mpsc::Receiver<wayland::protocols::CommittedBuffer>,
+) -> anyhow::Result<()> {
     let drm_raw_fd = drm
         .drm_fd()
         .context("DRM backend has no fd")?;
@@ -788,21 +798,114 @@ fn run_drm_event_loop(drm: &mut crate::backend::drm::DrmBackend) -> anyhow::Resu
 
     info!("DRM event loop started");
 
+    let mut flip_pending = false;
     let mut flip_ready = false;
+    let mut frame_count: u64 = 0;
+
     while RUNNING.load(Ordering::Relaxed) {
         // Block up to 16ms for DRM events.
         event_loop
             .dispatch(std::time::Duration::from_millis(16), &mut flip_ready)
             .context("DRM event loop dispatch failed")?;
 
+        // Process page flip completion.
         if flip_ready {
             drm.handle_page_flip()?;
+            flip_pending = false;
             flip_ready = false;
+        }
+
+        // Don't submit a new frame while a flip is pending — the display
+        // hardware can only queue one flip at a time.
+        if flip_pending {
+            continue;
+        }
+
+        // Drain the channel, keeping only the latest buffer (drop stale frames).
+        let mut latest: Option<wayland::protocols::CommittedBuffer> = None;
+        while let Ok(buf) = committed_frames.try_recv() {
+            latest = Some(buf);
+        }
+
+        if let Some(buffer) = latest {
+            match present_committed_buffer(drm, buffer) {
+                Ok(()) => {
+                    flip_pending = true;
+                    frame_count += 1;
+                    if frame_count % 300 == 1 {
+                        tracing::debug!(frame_count, "DRM frame presented");
+                    }
+                }
+                Err(e) => {
+                    warn!(?e, "DRM present failed");
+                }
+            }
         }
     }
 
-    info!("DRM event loop exiting");
+    info!(frame_count, "DRM event loop exiting");
     Ok(())
+}
+
+/// Convert a [`CommittedBuffer`] to a backend [`DmaBuf`], import it, and
+/// present it to the display.
+///
+/// Only DMA-BUF buffers are supported for direct DRM scanout. SHM buffers
+/// would require GPU-side composition (TODO: Vulkan blit path).
+fn present_committed_buffer(
+    drm: &mut crate::backend::drm::DrmBackend,
+    buffer: wayland::protocols::CommittedBuffer,
+) -> anyhow::Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    match buffer {
+        wayland::protocols::CommittedBuffer::DmaBuf {
+            planes,
+            width,
+            height,
+            format,
+            modifier,
+        } => {
+            let fourcc = drm_fourcc::DrmFourcc::try_from(format)
+                .map_err(|_| anyhow::anyhow!("unknown DRM format 0x{format:08x}"))?;
+
+            let dmabuf = crate::backend::DmaBuf {
+                width,
+                height,
+                format: fourcc,
+                modifier: drm_fourcc::DrmModifier::from(modifier),
+                planes: planes
+                    .iter()
+                    .map(|p| crate::backend::DmaBufPlane {
+                        fd: p.fd.as_raw_fd(),
+                        offset: p.offset,
+                        stride: p.stride,
+                    })
+                    .collect(),
+            };
+
+            let fb = drm.import_dmabuf(&dmabuf)?;
+
+            // Try direct scanout first (no GPU composition needed).
+            match drm.try_direct_scanout(&fb) {
+                Ok(true) => {
+                    drm.present(&fb)?;
+                }
+                Ok(false) | Err(_) => {
+                    // Fallback: present through the primary plane.
+                    drm.present(&fb)?;
+                }
+            }
+
+            Ok(())
+        }
+        wayland::protocols::CommittedBuffer::Shm { .. } => {
+            // TODO: SHM buffers require GPU-side blit (Vulkan compositor).
+            // For now, skip SHM frames on the DRM path.
+            tracing::trace!("skipping SHM buffer on DRM path (not yet supported)");
+            Ok(())
+        }
+    }
 }
 
 /// Install signal handlers for SIGTERM and SIGINT.
