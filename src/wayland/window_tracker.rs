@@ -1,0 +1,461 @@
+//! X11 window tracking and focus determination.
+//!
+//! Tracks all X11 windows managed by the XWM, classifies them by role
+//! (game, overlay, notification, etc.), and determines which window
+//! should receive focus.
+//!
+//! # Design
+//!
+//! Each `TrackedWindow` stores the X11 window ID, classification, geometry,
+//! and per-window properties read from atoms. The `FocusState` holds the
+//! current focus decisions — one slot per window role.
+//!
+//! Focus determination runs whenever:
+//! - A window is mapped, unmapped, or destroyed
+//! - A property changes on a window or the root (e.g., `GAMECOMP_BASELAYER_APPID`)
+//! - The compositor requests a focus change via `XwmCommand`
+
+use std::collections::HashMap;
+
+/// Classification of an X11 window's role.
+///
+/// Determines compositing layer order and focus priority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WindowRole {
+    /// A normal application or game window (composited at `LAYER_APP`).
+    #[default]
+    App,
+    /// Steam overlay (Shift+Tab) — composited above the app.
+    Overlay,
+    /// External overlay (MangoHud, etc.) — composited on top of everything.
+    ExternalOverlay,
+    /// Override-redirect popup/dropdown — composited above the focused app.
+    Popup,
+    /// The platform client window (e.g., storefront launcher).
+    PlatformClient,
+}
+
+/// Per-window tracked state in the XWM.
+#[derive(Debug, Clone)]
+pub struct TrackedWindow {
+    /// X11 window ID.
+    pub id: u32,
+    /// Window role classification.
+    pub role: WindowRole,
+    /// Steam AppID (0 = not a Steam game).
+    pub app_id: u32,
+    /// Process ID of the window's client.
+    pub pid: u32,
+    /// Window title.
+    pub title: String,
+    /// Current geometry.
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    /// Opacity (0.0–1.0, from `_NET_WM_OPACITY`).
+    pub opacity: f32,
+    /// Whether the window is currently mapped (visible).
+    pub mapped: bool,
+    /// Whether this is an override-redirect window.
+    pub override_redirect: bool,
+    /// Monotonic sequence number for ordering (higher = more recent).
+    pub map_sequence: u64,
+    /// Whether the window wants fullscreen.
+    pub wants_fullscreen: bool,
+    /// Input focus mode (from `STEAM_INPUT_FOCUS`).
+    /// 0 = normal, 1 = overlay grabs input, 2 = overlay grabs but keyboard stays.
+    pub input_focus_mode: u32,
+}
+
+impl TrackedWindow {
+    /// Create a new tracked window with defaults.
+    pub fn new(id: u32) -> Self {
+        Self {
+            id,
+            role: WindowRole::App,
+            app_id: 0,
+            pid: 0,
+            title: String::new(),
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+            opacity: 1.0,
+            mapped: false,
+            override_redirect: false,
+            map_sequence: 0,
+            wants_fullscreen: false,
+            input_focus_mode: 0,
+        }
+    }
+
+    /// Whether this window is focusable (visible, non-trivial size, app/platform role).
+    #[inline(always)]
+    pub fn is_focusable(&self) -> bool {
+        self.mapped
+            && self.width > 1
+            && self.height > 1
+            && !self.override_redirect
+            && matches!(self.role, WindowRole::App | WindowRole::PlatformClient)
+    }
+}
+
+/// Current focus state — one slot per window role.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FocusState {
+    /// The primary game/app window receiving input.
+    pub app: Option<u32>,
+    /// Steam overlay window (e.g., Shift+Tab).
+    pub overlay: Option<u32>,
+    /// External overlay window (MangoHud, etc.).
+    pub external_overlay: Option<u32>,
+    /// Override-redirect popup/dropdown on top of focused app.
+    pub popup: Option<u32>,
+    /// The AppID of the currently focused game.
+    pub focused_app_id: u32,
+}
+
+/// Tracks all X11 windows and determines focus.
+pub struct WindowTracker {
+    /// All tracked windows, keyed by X11 window ID.
+    windows: HashMap<u32, TrackedWindow>,
+    /// Current focus state.
+    focus: FocusState,
+    /// Monotonic counter for ordering window maps.
+    next_sequence: u64,
+    /// AppID(s) that an external controller (Steam) wants focused.
+    /// Set via `GAMECOMP_BASELAYER_APPID` atom on the root window.
+    requested_app_ids: Vec<u32>,
+    /// Specific window ID that an external controller wants focused.
+    /// Set via `GAMECOMP_BASELAYER_WINDOW` atom on the root window.
+    requested_window: Option<u32>,
+    /// Whether focus needs re-evaluation.
+    focus_dirty: bool,
+}
+
+impl WindowTracker {
+    /// Create a new empty window tracker.
+    pub fn new() -> Self {
+        Self {
+            windows: HashMap::new(),
+            focus: FocusState::default(),
+            next_sequence: 0,
+            requested_app_ids: Vec::new(),
+            requested_window: None,
+            focus_dirty: false,
+        }
+    }
+
+    /// Register a new window (on MapRequest, before mapping).
+    pub fn add_window(&mut self, id: u32) -> &mut TrackedWindow {
+        let seq = self.next_sequence;
+        self.next_sequence += 1;
+        let win = self.windows.entry(id).or_insert_with(|| {
+            let mut w = TrackedWindow::new(id);
+            w.map_sequence = seq;
+            w
+        });
+        self.focus_dirty = true;
+        win
+    }
+
+    /// Mark a window as mapped.
+    pub fn map_window(&mut self, id: u32, width: u32, height: u32) {
+        if let Some(win) = self.windows.get_mut(&id) {
+            win.mapped = true;
+            win.width = width;
+            win.height = height;
+            self.focus_dirty = true;
+        }
+    }
+
+    /// Mark a window as unmapped.
+    pub fn unmap_window(&mut self, id: u32) {
+        if let Some(win) = self.windows.get_mut(&id) {
+            win.mapped = false;
+            self.focus_dirty = true;
+        }
+    }
+
+    /// Remove a window entirely (DestroyNotify).
+    pub fn remove_window(&mut self, id: u32) {
+        self.windows.remove(&id);
+        self.focus_dirty = true;
+    }
+
+    /// Update a window's geometry.
+    pub fn configure_window(&mut self, id: u32, x: i32, y: i32, width: u32, height: u32) {
+        if let Some(win) = self.windows.get_mut(&id) {
+            win.x = x;
+            win.y = y;
+            win.width = width;
+            win.height = height;
+        }
+    }
+
+    /// Set the AppID for a window (from `STEAM_GAME` property).
+    pub fn set_app_id(&mut self, id: u32, app_id: u32) {
+        if let Some(win) = self.windows.get_mut(&id) {
+            win.app_id = app_id;
+            self.focus_dirty = true;
+        }
+    }
+
+    /// Set the window role (from atom properties).
+    pub fn set_role(&mut self, id: u32, role: WindowRole) {
+        if let Some(win) = self.windows.get_mut(&id) {
+            win.role = role;
+            self.focus_dirty = true;
+        }
+    }
+
+    /// Set the opacity for a window (from `_NET_WM_OPACITY`).
+    pub fn set_opacity(&mut self, id: u32, opacity: f32) {
+        if let Some(win) = self.windows.get_mut(&id) {
+            win.opacity = opacity;
+        }
+    }
+
+    /// Set the externally requested focus target(s).
+    pub fn set_requested_app_ids(&mut self, app_ids: Vec<u32>) {
+        self.requested_app_ids = app_ids;
+        self.focus_dirty = true;
+    }
+
+    /// Set the externally requested focus window.
+    pub fn set_requested_window(&mut self, window_id: Option<u32>) {
+        self.requested_window = window_id;
+        self.focus_dirty = true;
+    }
+
+    /// Get a tracked window by ID.
+    pub fn get(&self, id: u32) -> Option<&TrackedWindow> {
+        self.windows.get(&id)
+    }
+
+    /// Get a mutable reference to a tracked window by ID.
+    pub fn get_mut(&mut self, id: u32) -> Option<&mut TrackedWindow> {
+        self.windows.get_mut(&id)
+    }
+
+    /// Current focus state.
+    pub fn focus(&self) -> &FocusState {
+        &self.focus
+    }
+
+    /// Whether focus needs re-evaluation.
+    pub fn is_focus_dirty(&self) -> bool {
+        self.focus_dirty
+    }
+
+    /// Determine focus based on current window state.
+    ///
+    /// 1. Collect all focusable app windows
+    /// 2. If an external controller requested a specific window/app, prefer that
+    /// 3. Otherwise, pick the most recently mapped focusable window
+    /// 4. Pick the best overlay, external overlay, and notification windows
+    ///
+    /// Returns `true` if focus changed.
+    pub fn determine_focus(&mut self) -> bool {
+        self.focus_dirty = false;
+
+        let old_focus = self.focus;
+
+        // Reset focus state — each slot is recomputed from scratch.
+        self.focus = FocusState::default();
+
+        // --- Pick the primary app window ---
+        // If a specific window is requested, use it.
+        if let Some(req_id) = self.requested_window {
+            if self
+                .windows
+                .get(&req_id)
+                .is_some_and(|w| w.mapped && w.width > 1 && w.height > 1)
+            {
+                self.focus.app = Some(req_id);
+            }
+        } else if !self.requested_app_ids.is_empty() {
+            // Find the best window matching one of the requested AppIDs.
+            self.focus.app = self
+                .windows
+                .values()
+                .filter(|w| w.is_focusable() && self.requested_app_ids.contains(&w.app_id))
+                .max_by_key(|w| w.map_sequence)
+                .map(|w| w.id);
+        }
+
+        // Fallback: most recently mapped focusable window.
+        if self.focus.app.is_none() {
+            self.focus.app = self
+                .windows
+                .values()
+                .filter(|w| w.is_focusable())
+                .max_by_key(|w| w.map_sequence)
+                .map(|w| w.id);
+        }
+
+        // Update focused AppID.
+        self.focus.focused_app_id = self
+            .focus
+            .app
+            .and_then(|id| self.windows.get(&id))
+            .map_or(0, |w| w.app_id);
+
+        // --- Pick overlay window (highest opacity mapped overlay) ---
+        self.focus.overlay = self
+            .windows
+            .values()
+            .filter(|w| w.mapped && w.role == WindowRole::Overlay)
+            .max_by(|a, b| {
+                a.opacity
+                    .partial_cmp(&b.opacity)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|w| w.id);
+
+        // --- Pick external overlay ---
+        self.focus.external_overlay = self
+            .windows
+            .values()
+            .filter(|w| w.mapped && w.role == WindowRole::ExternalOverlay)
+            .max_by_key(|w| w.map_sequence)
+            .map(|w| w.id);
+
+        // --- Pick popup/override-redirect ---
+        self.focus.popup = self
+            .windows
+            .values()
+            .filter(|w| w.mapped && w.role == WindowRole::Popup)
+            .max_by_key(|w| w.map_sequence)
+            .map(|w| w.id);
+
+        // Return whether focus changed.
+        self.focus.app != old_focus.app
+            || self.focus.overlay != old_focus.overlay
+            || self.focus.external_overlay != old_focus.external_overlay
+            || self.focus.popup != old_focus.popup
+    }
+
+    /// Build the list of all focusable AppIDs (for feedback atom).
+    pub fn focusable_app_ids(&self) -> Vec<u32> {
+        let mut ids: Vec<u32> = self
+            .windows
+            .values()
+            .filter(|w| w.is_focusable() && w.app_id > 0)
+            .map(|w| w.app_id)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    /// Build focusable window triplets `[windowID, appID, pid]` (for feedback atom).
+    pub fn focusable_window_triplets(&self) -> Vec<u32> {
+        let mut triplets = Vec::new();
+        for w in self.windows.values().filter(|w| w.is_focusable()) {
+            triplets.push(w.id);
+            triplets.push(w.app_id);
+            triplets.push(w.pid);
+        }
+        triplets
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_tracker_has_no_focus() {
+        let mut tracker = WindowTracker::new();
+        tracker.determine_focus();
+        assert!(tracker.focus().app.is_none());
+    }
+
+    #[test]
+    fn single_mapped_window_gets_focus() {
+        let mut tracker = WindowTracker::new();
+        tracker.add_window(42);
+        tracker.map_window(42, 1920, 1080);
+        tracker.determine_focus();
+        assert_eq!(tracker.focus().app, Some(42));
+    }
+
+    #[test]
+    fn most_recent_window_wins_focus() {
+        let mut tracker = WindowTracker::new();
+        tracker.add_window(1);
+        tracker.map_window(1, 1920, 1080);
+        tracker.add_window(2);
+        tracker.map_window(2, 1920, 1080);
+        tracker.determine_focus();
+        assert_eq!(tracker.focus().app, Some(2));
+    }
+
+    #[test]
+    fn requested_app_id_takes_priority() {
+        let mut tracker = WindowTracker::new();
+
+        tracker.add_window(1);
+        tracker.map_window(1, 1920, 1080);
+        tracker.set_app_id(1, 100);
+
+        tracker.add_window(2);
+        tracker.map_window(2, 1920, 1080);
+        tracker.set_app_id(2, 200);
+
+        // Request AppID 100 (window 1), even though window 2 is newer.
+        tracker.set_requested_app_ids(vec![100]);
+        tracker.determine_focus();
+        assert_eq!(tracker.focus().app, Some(1));
+        assert_eq!(tracker.focus().focused_app_id, 100);
+    }
+
+    #[test]
+    fn overlay_classification() {
+        let mut tracker = WindowTracker::new();
+
+        // Game window.
+        tracker.add_window(1);
+        tracker.map_window(1, 1920, 1080);
+
+        // Overlay window.
+        tracker.add_window(2);
+        tracker.map_window(2, 1920, 1080);
+        tracker.set_role(2, WindowRole::Overlay);
+
+        tracker.determine_focus();
+        assert_eq!(tracker.focus().app, Some(1));
+        assert_eq!(tracker.focus().overlay, Some(2));
+    }
+
+    #[test]
+    fn unmapped_window_loses_focus() {
+        let mut tracker = WindowTracker::new();
+        tracker.add_window(1);
+        tracker.map_window(1, 1920, 1080);
+        tracker.determine_focus();
+        assert_eq!(tracker.focus().app, Some(1));
+
+        tracker.unmap_window(1);
+        tracker.determine_focus();
+        assert!(tracker.focus().app.is_none());
+    }
+
+    #[test]
+    fn focusable_app_ids_deduped() {
+        let mut tracker = WindowTracker::new();
+
+        tracker.add_window(1);
+        tracker.map_window(1, 1920, 1080);
+        tracker.set_app_id(1, 100);
+
+        tracker.add_window(2);
+        tracker.map_window(2, 800, 600);
+        tracker.set_app_id(2, 100); // Same AppID.
+
+        let ids = tracker.focusable_app_ids();
+        assert_eq!(ids, vec![100]);
+    }
+}

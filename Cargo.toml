@@ -1,0 +1,97 @@
+[package]
+name = "gamecomp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93.1"
+description = "High-performance single-app fullscreen Wayland compositor"
+license = "MIT"
+
+[features]
+default = ["systemd"]
+systemd = ["dep:libsystemd"]
+hdr = []
+fsr = []
+nis = []
+pipewire = []
+profile-with-tracy = ["dep:profiling", "dep:tracy-client"]
+
+[dependencies]
+# DRM / KMS / GBM
+drm = "0.14"
+drm-fourcc = "2.2"
+gbm = "0.18"
+
+# Vulkan
+ash = "0.38"
+
+# Wayland server
+wayland-server = "0.31"
+wayland-backend = "0.3"
+wayland-scanner = "0.31"
+wayland-protocols = { version = "0.32", features = ["server", "client", "staging", "unstable"] }
+wayland-protocols-wlr = { version = "0.3", features = ["server"] }
+wayland-protocols-misc = { version = "0.3", features = ["server"] }
+
+# Wayland client (for nested mode — connecting to host compositor)
+wayland-client = "0.31"
+
+# Event loop
+calloop = { version = "0.14", features = ["executor"] }
+
+# Input / Session / Udev
+input = "0.9"
+libseat = "0.2"
+udev = "0.9"
+
+# XWayland
+x11rb = { version = "0.13", features = ["composite", "xfixes", "randr", "res"] }
+x11rb-protocol = "0.13"
+
+# Keyboard / Cursor
+xkbcommon = "0.9"
+xcursor = "0.3"
+
+# Display info (EDID, HDR metadata)
+libdisplay-info = "0.3"
+
+# Linux syscalls
+rustix = { version = "1.1", features = ["event", "fs", "mm", "process", "time"] }
+libc = "0.2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Serialization (config)
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# Utilities
+bitflags = "2"
+memmap2 = "0.9"
+parking_lot = "0.12"
+
+# Allocator
+mimalloc = { version = "0.1", default-features = false }
+
+# Optional
+libsystemd = { version = "0.7", optional = true }
+profiling = { version = "1", optional = true, features = ["profile-with-tracy"] }
+tracy-client = { version = "0.17", optional = true }
+
+[build-dependencies]
+shaderc = "0.8"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+opt-level = 3
+
+[profile.release.build-override]
+opt-level = 3

@@ -1,0 +1,201 @@
+//! `wl_compositor`, `wl_surface`, `wl_region`, and `wl_callback` dispatch.
+
+use parking_lot::Mutex;
+use std::os::unix::io::AsFd;
+
+use tracing::{info, trace};
+use wayland_server::protocol::{
+    wl_callback::{self, WlCallback},
+    wl_compositor::{self, WlCompositor},
+    wl_region::{self, WlRegion},
+    wl_surface::{self, WlSurface},
+};
+use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource};
+
+use super::{BufferData, CommittedBuffer, CommittedDmaBufPlane, SurfaceData, sync_dma_buf_fence};
+use crate::wayland::WaylandState;
+
+impl GlobalDispatch<WlCompositor, ()> for WaylandState {
+    fn bind(
+        _state: &mut Self,
+        _dh: &DisplayHandle,
+        _client: &Client,
+        resource: New<WlCompositor>,
+        _data: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+    }
+}
+
+impl Dispatch<WlCompositor, ()> for WaylandState {
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _resource: &WlCompositor,
+        request: wl_compositor::Request,
+        _data: &(),
+        _dh: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        match request {
+            wl_compositor::Request::CreateSurface { id } => {
+                info!("wl_compositor: create_surface");
+                data_init.init(
+                    id,
+                    SurfaceData {
+                        attached_buffer: Mutex::new(None),
+                    },
+                );
+            }
+            wl_compositor::Request::CreateRegion { id } => {
+                data_init.init(id, ());
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<WlSurface, SurfaceData> for WaylandState {
+    fn request(
+        state: &mut Self,
+        _client: &Client,
+        _surface: &WlSurface,
+        request: wl_surface::Request,
+        data: &SurfaceData,
+        _dh: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        match request {
+            wl_surface::Request::Attach { buffer, x: _, y: _ } => {
+                // Store the buffer reference. We'll read pixels on commit.
+                *data.attached_buffer.lock() = buffer;
+            }
+            wl_surface::Request::Damage { .. } | wl_surface::Request::DamageBuffer { .. } => {
+                // Mark surface as damaged for next frame.
+            }
+            wl_surface::Request::Frame { callback } => {
+                let cb = data_init.init(callback, ());
+                state.pending_frame_callbacks.push(cb);
+            }
+            wl_surface::Request::Commit => {
+                state.frame_seq += 1;
+
+                // Read pixels from the attached buffer and send to presenter.
+                let attached = data.attached_buffer.lock();
+                if let Some(ref buffer) = *attached {
+                    let buf_data_opt = buffer.data::<BufferData>();
+                    if let Some(buf_data) = buf_data_opt {
+                        match buf_data {
+                            BufferData::DmaBuf(dmabuf) => {
+                                // Ensure GPU has finished writing to the DMA-BUF
+                                // before forwarding. Export an implicit sync fence
+                                // and wait on it. This prevents the host compositor
+                                // from reading an incomplete render.
+                                if let Some(first_plane) = dmabuf.planes.first() {
+                                    sync_dma_buf_fence(&first_plane.fd);
+                                }
+                                // Zero-copy path: dup the fds and forward metadata.
+                                let planes: Vec<CommittedDmaBufPlane> = dmabuf
+                                    .planes
+                                    .iter()
+                                    .filter_map(|p| {
+                                        rustix::io::dup(p.fd.as_fd()).ok().map(|fd| {
+                                            CommittedDmaBufPlane {
+                                                fd,
+                                                offset: p.offset,
+                                                stride: p.stride,
+                                            }
+                                        })
+                                    })
+                                    .collect();
+                                let committed = CommittedBuffer::DmaBuf {
+                                    planes,
+                                    width: dmabuf.width as u32,
+                                    height: dmabuf.height as u32,
+                                    format: dmabuf.format,
+                                    modifier: dmabuf.modifier,
+                                };
+                                // Stage the buffer for FPS-limited forwarding.
+                                // The main loop forwards the staged buffer to
+                                // the render thread when the FPS limiter allows.
+                                // If the client is committing faster than the
+                                // target FPS, the previous staged buffer is
+                                // silently dropped (its dup'd fds are closed).
+                                state.staged_buffer = Some(committed);
+                                state.defer_frame_callbacks();
+                                // Hold the wl_buffer — do NOT release it.
+                                // By withholding release, the client cannot
+                                // recycle this buffer. Once all client buffers
+                                // are held, the client blocks. The main loop
+                                // releases held buffers when the FPS limiter
+                                // fires, creating real backpressure.
+                                state.held_buffers.push(buffer.clone());
+                            }
+                            BufferData::Shm(shm) => {
+                                // CPU-copy fallback for SHM buffers.
+                                let offset = shm.offset as usize;
+                                let len = (shm.stride * shm.height) as usize;
+                                let pool = shm.pool.lock();
+                                if let Some(pixels) = pool.read_pixels(offset, len) {
+                                    trace!(
+                                        width = shm.width,
+                                        height = shm.height,
+                                        pixel_bytes = pixels.len(),
+                                        "commit: staging SHM frame for FPS-limited forwarding"
+                                    );
+                                    let committed = CommittedBuffer::Shm {
+                                        pixels,
+                                        width: shm.width as u32,
+                                        height: shm.height as u32,
+                                        stride: shm.stride as u32,
+                                    };
+                                    state.staged_buffer = Some(committed);
+                                    state.defer_frame_callbacks();
+                                    state.held_buffers.push(buffer.clone());
+                                }
+                            }
+                        }
+                    } else {
+                        info!("commit: buffer has no BufferData");
+                    }
+                } else {
+                    info!("commit: no attached buffer");
+                }
+            }
+            wl_surface::Request::SetBufferScale { .. }
+            | wl_surface::Request::SetBufferTransform { .. }
+            | wl_surface::Request::Offset { .. } => {}
+            wl_surface::Request::Destroy => {}
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<WlRegion, ()> for WaylandState {
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _resource: &WlRegion,
+        _request: wl_region::Request,
+        _data: &(),
+        _dh: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+        // Handle Add, Subtract, Destroy — stub for now.
+    }
+}
+
+impl Dispatch<WlCallback, ()> for WaylandState {
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _resource: &WlCallback,
+        _request: wl_callback::Request,
+        _data: &(),
+        _dh: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+        // wl_callback has no requests — only the `done` event.
+    }
+}

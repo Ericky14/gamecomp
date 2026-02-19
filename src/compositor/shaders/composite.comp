@@ -1,0 +1,97 @@
+// Composite compute shader.
+//
+// Composites up to 4 layers into a single output image.
+// Each layer has position, opacity, color space, and blend mode.
+// Dispatched as a 2D workgroup grid covering the output dimensions.
+
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// Output image (storage image, written by compute shader).
+layout(set = 0, binding = 0, rgba8) uniform writeonly image2D outputImage;
+
+// Input layer textures (sampled images).
+layout(set = 0, binding = 1) uniform sampler2D layerTextures[4];
+
+// Per-layer parameters, passed via uniform buffer.
+layout(set = 0, binding = 2) uniform LayerParams {
+    // Per layer: src_x, src_y, src_w, src_h
+    vec4 srcRect[4];
+    // Per layer: dst_x, dst_y, dst_w, dst_h
+    vec4 dstRect[4];
+    // Per layer: opacity, blend_mode, color_space, flags
+    vec4 layerFlags[4];
+} layers;
+
+// Global parameters via push constants.
+layout(push_constant) uniform PushConstants {
+    uint outputWidth;
+    uint outputHeight;
+    uint layerCount;
+    uint pad;
+} pc;
+
+// sRGB to linear conversion.
+vec3 srgbToLinear(vec3 srgb) {
+    return mix(
+        srgb / 12.92,
+        pow((srgb + 0.055) / 1.055, vec3(2.4)),
+        step(0.04045, srgb)
+    );
+}
+
+// Linear to sRGB conversion.
+vec3 linearToSrgb(vec3 linear) {
+    return mix(
+        linear * 12.92,
+        1.055 * pow(linear, vec3(1.0 / 2.4)) - 0.055,
+        step(0.0031308, linear)
+    );
+}
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+
+    // Early out if outside output bounds.
+    if (pos.x >= int(pc.outputWidth) || pos.y >= int(pc.outputHeight)) {
+        return;
+    }
+
+    // Start with transparent black.
+    vec4 result = vec4(0.0, 0.0, 0.0, 0.0);
+
+    // Composite layers bottom-to-top.
+    for (uint i = 0; i < pc.layerCount && i < 4; i++) {
+        vec4 dst = layers.dstRect[i];
+        float opacity = layers.layerFlags[i].x;
+        uint blendMode = uint(layers.layerFlags[i].y);
+
+        // Check if pixel is within this layer's destination rect.
+        if (pos.x < int(dst.x) || pos.x >= int(dst.x + dst.z) ||
+            pos.y < int(dst.y) || pos.y >= int(dst.y + dst.w)) {
+            continue;
+        }
+
+        // Map output pixel to source texture coordinate.
+        vec4 src = layers.srcRect[i];
+        vec2 localPos = vec2(pos) - dst.xy;
+        vec2 scale = src.zw / dst.zw;
+        vec2 texCoord = (src.xy + localPos * scale) / textureSize(layerTextures[i], 0);
+
+        vec4 texel = texture(layerTextures[i], texCoord);
+        texel.a *= opacity;
+
+        // Alpha blending (premultiplied alpha).
+        if (blendMode == 0) {
+            // Opaque — replace entirely.
+            result = vec4(texel.rgb, 1.0);
+        } else {
+            // Alpha blend (premultiplied).
+            result.rgb = texel.rgb + result.rgb * (1.0 - texel.a);
+            result.a = texel.a + result.a * (1.0 - texel.a);
+        }
+    }
+
+    imageStore(outputImage, pos, result);
+}

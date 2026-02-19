@@ -1,0 +1,104 @@
+version: "3"
+
+vars:
+  NAME:
+    sh: grep 'name =' Cargo.toml | head -n 1 | cut -d'"' -f2
+  VERSION:
+    sh: grep '^version =' Cargo.toml | head -n 1 | cut -d'"' -f2
+  WIDTH: "1280"
+  HEIGHT: "720"
+
+tasks:
+  default:
+    aliases:
+      - help
+    cmds:
+      - go-task --list
+
+  build:
+    desc: Build release binary
+    cmds:
+      - cargo build --release
+
+  build:debug:
+    desc: Build debug binary
+    cmds:
+      - cargo build
+
+  check:
+    desc: Run cargo check (fast compile validation)
+    cmds:
+      - cargo check --all-features
+
+  test:
+    desc: Run all tests
+    cmds:
+      - cargo test
+
+  lint:
+    desc: Run clippy with all features (zero warnings)
+    cmds:
+      - cargo clippy --all-features -- -D warnings
+
+  fmt:
+    desc: Format all code
+    cmds:
+      - cargo fmt
+
+  fmt:check:
+    desc: Check formatting without modifying files
+    cmds:
+      - cargo fmt -- --check
+
+  ci:
+    desc: Run full CI pipeline (fmt check, clippy, tests)
+    cmds:
+      - task: fmt:check
+      - task: lint
+      - task: test
+
+  run:
+    desc: "Build and run (APP=program)"
+    requires:
+      vars: [APP]
+    cmds:
+      - cargo run -- -W {{.WIDTH}} -H {{.HEIGHT}} -- {{.APP}} {{.CLI_ARGS}}
+
+  run:headless:
+    desc: "Build and run in headless mode (APP=program)"
+    requires:
+      vars: [APP]
+    cmds:
+      - cargo run -- --backend headless -W {{.WIDTH}} -H {{.HEIGHT}} -- {{.APP}} {{.CLI_ARGS}}
+
+  run:release:
+    desc: "Build and run release binary (APP=program)"
+    requires:
+      vars: [APP]
+    cmds:
+      - cargo run --release -- -W {{.WIDTH}} -H {{.HEIGHT}} -- {{.APP}} {{.CLI_ARGS}}
+
+  clean:
+    desc: Remove build artifacts
+    cmds:
+      - cargo clean
+
+  doc:
+    desc: Build and open documentation
+    cmds:
+      - cargo doc --open --no-deps
+
+  loc:
+    desc: Count lines of Rust source code
+    cmds:
+      - "find src -name '*.rs' | xargs wc -l | tail -1"
+
+  deps:
+    desc: Show dependency tree
+    cmds:
+      - cargo tree --depth 1
+
+  bloat:
+    desc: Show binary size breakdown (requires cargo-bloat)
+    cmds:
+      - cargo bloat --release -n 20
