@@ -68,8 +68,7 @@ pub fn discover_gpus(seat: &str) -> anyhow::Result<Vec<GpuInfo>> {
             .ok()
             .flatten()
         {
-            pci.attribute_value("boot_vga")
-                .is_some_and(|v| v == "1")
+            pci.attribute_value("boot_vga").is_some_and(|v| v == "1")
         } else {
             false
         };

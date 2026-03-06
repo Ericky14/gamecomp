@@ -781,23 +781,18 @@ fn run_drm_event_loop(
     committed_frames: std::sync::mpsc::Receiver<wayland::protocols::CommittedBuffer>,
     vblank_tx: &std::sync::mpsc::Sender<u64>,
 ) -> anyhow::Result<()> {
-    let drm_raw_fd = drm
-        .drm_fd()
-        .context("DRM backend has no fd")?;
+    let drm_raw_fd = drm.drm_fd().context("DRM backend has no fd")?;
 
-    let mut event_loop = calloop::EventLoop::<bool>::try_new()
-        .context("failed to create DRM event loop")?;
+    let mut event_loop =
+        calloop::EventLoop::<bool>::try_new().context("failed to create DRM event loop")?;
     let handle = event_loop.handle();
 
     // SAFETY: The DRM fd is owned by DrmBackend which outlives this event
     // loop. The fd remains valid until DrmBackend is dropped after this
     // function returns.
     let wrapper = unsafe { calloop::generic::FdWrapper::new(drm_raw_fd) };
-    let source = calloop::generic::Generic::new(
-        wrapper,
-        calloop::Interest::READ,
-        calloop::Mode::Level,
-    );
+    let source =
+        calloop::generic::Generic::new(wrapper, calloop::Interest::READ, calloop::Mode::Level);
 
     handle
         .insert_source(source, |_readiness, _fd, flip_ready| {
