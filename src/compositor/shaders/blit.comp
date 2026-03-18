@@ -1,0 +1,59 @@
+// Single-layer blit/scale compute shader with contain-rect scaling.
+//
+// Fast path for single fullscreen window composition. Fits the client
+// texture inside the output image with aspect-ratio preservation,
+// rendering black letterbox/pillarbox bars outside the content region.
+// The content area is sampled with hardware bilinear filtering.
+//
+// This replaces vkCmdBlitImage + vkCmdClearColorImage with a single
+// compute dispatch — one pass handles both the clear (black bars) and
+// the scaled blit (content region). Eliminates the clear→blit barrier
+// that was needed when using two separate transfer commands.
+//
+// Performance note: 16×16 workgroup matches the GPU's warp/wavefront
+// size for good occupancy. Bilinear filtering is handled by the texture
+// unit hardware — zero ALU cost compared to manual interpolation.
+
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// Client texture (sampled with bilinear filtering via hardware sampler).
+layout(set = 0, binding = 0) uniform sampler2D srcTexture;
+
+// Output scanout image (display resolution, written directly).
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D dstImage;
+
+layout(push_constant) uniform PushConstants {
+    uvec2 dstSize;       // Output (display) dimensions.
+    ivec2 contentOffset; // Top-left corner of the content region.
+    uvec2 contentSize;   // Dimensions of the scaled content region.
+} pc;
+
+void main() {
+    uvec2 pos = gl_GlobalInvocationID.xy;
+
+    // Early out for threads outside the output image.
+    if (pos.x >= pc.dstSize.x || pos.y >= pc.dstSize.y) {
+        return;
+    }
+
+    // Check if this pixel falls within the content region.
+    ivec2 relPos = ivec2(pos) - pc.contentOffset;
+    if (relPos.x < 0 || relPos.y < 0 ||
+        relPos.x >= int(pc.contentSize.x) || relPos.y >= int(pc.contentSize.y)) {
+        // Outside content region → black letterbox/pillarbox bar.
+        imageStore(dstImage, ivec2(pos), vec4(0.0, 0.0, 0.0, 1.0));
+        return;
+    }
+
+    // Map content-relative pixel to normalized source texture coordinate.
+    // Adding 0.5 centers the sample within the texel for correct
+    // bilinear interpolation at non-integer scale factors.
+    vec2 uv = (vec2(relPos) + 0.5) / vec2(pc.contentSize);
+
+    // Hardware bilinear sampling — the sampler does the filtering.
+    vec4 color = texture(srcTexture, uv);
+
+    imageStore(dstImage, ivec2(pos), color);
+}

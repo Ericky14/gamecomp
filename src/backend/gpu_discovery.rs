@@ -68,7 +68,8 @@ pub fn discover_gpus(seat: &str) -> anyhow::Result<Vec<GpuInfo>> {
             .ok()
             .flatten()
         {
-            pci.attribute_value("boot_vga").is_some_and(|v| v == "1")
+            pci.attribute_value("boot_vga")
+                .is_some_and(|v| v == "1")
         } else {
             false
         };
@@ -129,7 +130,7 @@ pub fn select_primary_gpu(gpus: &[GpuInfo]) -> Option<&GpuInfo> {
 /// Find the render node (e.g., `/dev/dri/renderD128`) for a card node.
 ///
 /// Derives it from the card number: card0 → renderD128, card1 → renderD129, etc.
-fn render_node_for(card_path: &std::path::Path) -> Option<PathBuf> {
+pub fn render_node_for(card_path: &std::path::Path) -> Option<PathBuf> {
     let filename = card_path.file_name()?.to_str()?;
     let card_num: u32 = filename.strip_prefix("card")?.parse().ok()?;
     let render_path = card_path

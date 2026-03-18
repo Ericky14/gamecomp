@@ -231,14 +231,23 @@ impl Dispatch<wl_drm::WlDrm, WlDrmInstanceData> for WaylandState {
 
 /// Discover the DRM render node path for the system's primary GPU.
 ///
-/// Checks `/dev/dri/renderD128` through `/dev/dri/renderD143` and returns
-/// the first one that exists. Falls back to `/dev/dri/renderD128` if
-/// none are found (XWayland will fail gracefully).
+/// Uses udev GPU discovery to find the boot GPU's render node. Falls back
+/// to scanning `/dev/dri/renderD128`–`renderD143` if udev enumeration fails.
 pub fn find_render_node() -> PathBuf {
+    // Try udev-based discovery for an accurate result on multi-GPU systems.
+    if let Ok(gpus) = crate::backend::gpu_discovery::discover_gpus("seat0")
+        && let Some(primary) = crate::backend::gpu_discovery::select_primary_gpu(&gpus)
+        && let Some(render) = crate::backend::gpu_discovery::render_node_for(&primary.dev_path)
+    {
+        info!(path = %render.display(), "found DRM render node for primary GPU");
+        return render;
+    }
+
+    // Fallback: scan render nodes directly.
     for i in 128..144 {
         let path = PathBuf::from(format!("/dev/dri/renderD{}", i));
         if path.exists() {
-            info!(path = %path.display(), "found DRM render node");
+            info!(path = %path.display(), "found DRM render node (fallback scan)");
             return path;
         }
     }

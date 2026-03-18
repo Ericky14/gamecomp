@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread;
 
 use anyhow::Context;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::backend::Backend;
@@ -41,6 +41,7 @@ use crate::compositor::scene::FrameInfo;
 use crate::config::Config;
 use crate::frame_pacer::{FpsLimiter, FramePacer};
 use crate::input::InputHandler;
+use crate::input::keyboard::KeyboardMonitor;
 use crate::retry::{RetryPolicy, retry_with_backoff};
 use crate::stats::StatsTracker;
 use crate::wayland::WaylandServer;
@@ -163,7 +164,7 @@ fn run(config: Config) -> anyhow::Result<()> {
     // --- DRM path: open session and GPU device on main thread ---
     // Session management and device discovery must happen before the render
     // thread is spawned so the DRM fd can be transferred.
-    let mut _session: Option<backend::session::Session> = None;
+    let mut session: Option<backend::session::Session> = None;
     let drm_device: Option<(std::path::PathBuf, std::os::unix::io::OwnedFd)> =
         if matches!(config.backend, crate::config::BackendKind::Drm) {
             let mut sess =
@@ -177,11 +178,27 @@ fn run(config: Config) -> anyhow::Result<()> {
                 .open_device(&path)
                 .context("failed to open GPU device via session")?;
             info!(path = %path.display(), "DRM device opened via session");
-            _session = Some(sess);
+            session = Some(sess);
             Some((path, fd))
         } else {
             None
         };
+
+    // --- Keyboard monitor for VT switching (DRM path only) ---
+    let mut keyboard_monitor: Option<KeyboardMonitor> = None;
+    if let Some(ref mut sess) = session {
+        let mut kbd = KeyboardMonitor::new();
+        kbd.open_from_session(sess);
+        keyboard_monitor = Some(kbd);
+    }
+
+    // Track session active→inactive→active transitions so we can
+    // re-open keyboard devices after VT switch restore. Logind revokes
+    // evdev fds via EVIOCREVOKE when the session goes inactive, making
+    // the old fds permanently dead.
+    let mut session_was_active = true;
+
+    let session_active_flag: Option<Arc<AtomicBool>> = session.as_ref().map(|s| s.active_flag());
 
     let config_clone = config.clone();
     let host_display_clone = host_wayland_display.clone();
@@ -197,6 +214,7 @@ fn run(config: Config) -> anyhow::Result<()> {
                 host_dmabuf_formats_render,
                 drm_device,
                 vblank_tx,
+                session_active_flag,
             );
         })
         .context("failed to spawn render thread")?;
@@ -271,10 +289,31 @@ fn run(config: Config) -> anyhow::Result<()> {
 
     while RUNNING.load(Ordering::Relaxed) {
         // Dispatch libseat events (VT switch notifications) for DRM sessions.
-        if let Some(ref mut sess) = _session
+        if let Some(ref mut sess) = session
             && let Err(e) = sess.dispatch()
         {
             warn!(?e, "seat dispatch error");
+        }
+
+        // Detect session restore (inactive → active) and re-open keyboard
+        // devices. Logind revokes evdev fds via EVIOCREVOKE on VT switch,
+        // making the old fds permanently dead. We must re-open them.
+        if let Some(ref mut sess) = session {
+            let is_active = sess.is_active();
+            if !session_was_active && is_active {
+                info!("session restored, re-opening keyboard devices");
+                if let Some(ref mut kbd) = keyboard_monitor {
+                    kbd.reopen_after_vt_switch(sess);
+                }
+            }
+            session_was_active = is_active;
+        }
+
+        // Poll udev for keyboard hotplug and dispatch VT switch hotkeys.
+        if let Some(ref mut kbd) = keyboard_monitor
+            && let Some(ref mut sess) = session
+        {
+            kbd.poll(sess);
         }
 
         // Drain vblank timestamps from the render thread and feed them to
@@ -662,6 +701,7 @@ fn spawn_xwayland(
 /// Owns the Vulkan compositor and DRM backend exclusively.
 /// Receives FrameInfo from the main thread, composites or performs direct
 /// scanout, and signals flip completion back.
+#[allow(clippy::too_many_arguments)]
 fn render_thread_main(
     config: &Config,
     host_wayland_display: Option<String>,
@@ -670,6 +710,7 @@ fn render_thread_main(
     host_dmabuf_formats: Arc<parking_lot::Mutex<std::collections::HashMap<u32, Vec<u64>>>>,
     drm_device: Option<(std::path::PathBuf, std::os::unix::io::OwnedFd)>,
     vblank_tx: std::sync::mpsc::Sender<u64>,
+    session_active: Option<Arc<AtomicBool>>,
 ) {
     info!("render thread started");
 
@@ -747,7 +788,7 @@ fn render_thread_main(
         let rx = committed_frames
             .take()
             .expect("committed_frames receiver missing for DRM path");
-        if let Err(e) = run_drm_event_loop(drm, rx, &vblank_tx) {
+        if let Err(e) = run_drm_event_loop(drm, rx, &vblank_tx, session_active.clone()) {
             error!(?e, "DRM event loop exited with error");
         }
         info!("render thread exited");
@@ -780,8 +821,49 @@ fn run_drm_event_loop(
     drm: &mut crate::backend::drm::DrmBackend,
     committed_frames: std::sync::mpsc::Receiver<wayland::protocols::CommittedBuffer>,
     vblank_tx: &std::sync::mpsc::Sender<u64>,
+    session_active: Option<Arc<AtomicBool>>,
 ) -> anyhow::Result<()> {
     let drm_raw_fd = drm.drm_fd().context("DRM backend has no fd")?;
+
+    // Get display resolution for blitter initialization.
+    let (display_w, display_h) = drm
+        .connectors()
+        .first()
+        .map(|c| (c.mode.size().0 as u32, c.mode.size().1 as u32))
+        .context("no connected display")?;
+
+    // Create Vulkan blitter for GPU composition. The GBM-backed path
+    // allocates output buffers via GBM (native GEM handles), imports
+    // them into Vulkan for rendering, and creates DRM FBs directly
+    // from GBM — bypassing PRIME_FD_TO_HANDLE which causes tiling
+    // metadata corruption on NVIDIA.
+    let scanout_modifiers = drm.query_primary_plane_modifiers(drm_fourcc::DrmFourcc::Xrgb8888);
+    let mut blitter = crate::backend::gpu::vulkan_blitter::VulkanBlitter::new_for_import()
+        .context("failed to create Vulkan blitter for DRM composition")?;
+
+    // Compute the intersection of DRM plane modifiers and Vulkan importable
+    // modifiers, then allocate GBM buffers with those modifiers.
+    let importable_modifiers = blitter
+        .compute_importable_modifiers(&scanout_modifiers, display_w, display_h)
+        .context("failed to compute importable modifiers")?;
+
+    let gbm_outputs = drm
+        .allocate_gbm_output_buffers(3, display_w, display_h, &importable_modifiers)
+        .context("failed to allocate GBM output buffers")?;
+
+    // Import GBM DMA-BUFs into Vulkan as output images.
+    let gbm_dmabufs: Vec<crate::backend::DmaBuf> =
+        gbm_outputs.iter().map(|o| o.dmabuf.clone()).collect();
+    blitter
+        .import_output_images(&gbm_dmabufs)
+        .context("failed to import GBM output images into Vulkan")?;
+
+    info!(
+        display_w,
+        display_h,
+        output_count = gbm_outputs.len(),
+        "Vulkan blitter ready with GBM-backed output buffers"
+    );
 
     let mut event_loop =
         calloop::EventLoop::<bool>::try_new().context("failed to create DRM event loop")?;
@@ -806,8 +888,55 @@ fn run_drm_event_loop(
     let mut flip_pending = false;
     let mut flip_ready = false;
     let mut frame_count: u64 = 0;
+    /// Maximum consecutive present failures before giving up.
+    const MAX_CONSECUTIVE_FAILURES: u32 = 10;
+    let mut consecutive_failures: u32 = 0;
+
+    // Pending buffer awaiting async DMA-BUF sync (client GPU not done yet).
+    let mut pending_buffer: Option<wayland::protocols::CommittedBuffer> = None;
+
+    // FB cache is pre-populated from GBM allocation — no PRIME import.
+    // Each GBM buffer already has a DRM framebuffer created from its
+    // native GEM handle at allocation time.
+    let mut output_fb_cache: Vec<Option<crate::backend::Framebuffer>> =
+        gbm_outputs.iter().map(|o| Some(o.fb)).collect();
+
+    // Keep GBM output buffers alive — they own the DMA-BUF fds that
+    // back the Vulkan output images and DRM framebuffers.
+    let _gbm_outputs = gbm_outputs;
+
+    // Track the previous direct-scanout FB so we can destroy it after
+    // the page flip completes. Unlike the blit path (where output FBs
+    // are cached forever), the direct-scanout path creates a new FB
+    // every frame from different client DMA-BUFs.
+    let mut prev_scanout_fb: Option<drm::control::framebuffer::Handle> = None;
+
+    let mut was_active = true;
 
     while RUNNING.load(Ordering::Relaxed) {
+        // --- Session pause: stop presenting while VT-switched away ---
+        // When the session is disabled (VT switch), the kernel revokes
+        // DRM master, so all atomic commits would fail with EACCES.
+        // Sleep instead of burning CPU on doomed commits.
+        if let Some(ref active) = session_active {
+            let is_active = active.load(Ordering::Acquire);
+            if !is_active {
+                if was_active {
+                    info!("session inactive, pausing DRM presents");
+                    was_active = false;
+                }
+                // Drain stale frames so we don't replay old content on resume.
+                while committed_frames.try_recv().is_ok() {}
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                continue;
+            } else if !was_active {
+                info!("session re-enabled, forcing modeset");
+                drm.force_modeset();
+                flip_pending = false;
+                was_active = true;
+            }
+        }
+
         // Block up to 16ms for DRM events.
         event_loop
             .dispatch(std::time::Duration::from_millis(16), &mut flip_ready)
@@ -818,6 +947,11 @@ fn run_drm_event_loop(
             if let Some(vblank_ns) = drm.handle_page_flip()? {
                 // Send vblank timestamp to the main thread for frame pacing.
                 let _ = vblank_tx.send(vblank_ns);
+            }
+            // The previous scanout FB is safe to destroy now that the
+            // display has flipped to the new one.
+            if let Some(old_fb) = prev_scanout_fb.take() {
+                drm.destroy_framebuffer(old_fb);
             }
             flip_pending = false;
             flip_ready = false;
@@ -835,17 +969,76 @@ fn run_drm_event_loop(
             latest = Some(buf);
         }
 
-        if let Some(buffer) = latest {
-            match present_committed_buffer(drm, buffer) {
-                Ok(()) => {
-                    flip_pending = true;
+        // --- Async DMA-BUF implicit sync ---
+        //
+        // Instead of blocking inside blit() waiting for the client's GPU
+        // to finish, we do a non-blocking poll(0) here. If the buffer
+        // isn't ready yet, we defer it to the next event loop iteration
+        // (calloop re-dispatches every 16ms). This matches gamescope's
+        // epoll-based approach but without the multi-fd complexity.
+        //
+        // Fast path (>99% of frames): client GPU finished before commit
+        //   → poll(0) returns instantly → blit + present on this iteration.
+        //
+        // Slow path (rare): client GPU still rendering at commit time
+        //   → store as pending_buffer → retry on next iteration.
+        if latest.is_some() {
+            pending_buffer = latest;
+        }
+
+        if let Some(ref buffer) = pending_buffer {
+            let ready = match buffer {
+                wayland::protocols::CommittedBuffer::DmaBuf { planes, .. } => {
+                    use std::os::unix::io::AsFd;
+                    crate::backend::gpu::vulkan_blitter::VulkanBlitter::poll_dmabuf_ready(
+                        planes[0].fd.as_fd(),
+                        0, // Non-blocking
+                    )
+                }
+                // SHM buffers are CPU-side — always ready.
+                wayland::protocols::CommittedBuffer::Shm { .. } => true,
+            };
+
+            if !ready {
+                trace!("DMA-BUF not ready, deferring to next iteration");
+                continue;
+            }
+        }
+
+        if let Some(buffer) = pending_buffer.take() {
+            match present_committed_buffer(
+                drm,
+                buffer,
+                &mut blitter,
+                display_w,
+                display_h,
+                &mut output_fb_cache,
+                &mut prev_scanout_fb,
+            ) {
+                Ok(is_async) => {
+                    flip_pending = is_async;
                     frame_count += 1;
+                    consecutive_failures = 0;
                     if frame_count % 300 == 1 {
                         tracing::debug!(frame_count, "DRM frame presented");
                     }
                 }
                 Err(e) => {
-                    warn!(?e, "DRM present failed");
+                    consecutive_failures += 1;
+                    warn!(
+                        ?e,
+                        consecutive_failures,
+                        max = MAX_CONSECUTIVE_FAILURES,
+                        "DRM present failed"
+                    );
+                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                        error!(
+                            consecutive_failures,
+                            "too many consecutive DRM present failures, exiting"
+                        );
+                        RUNNING.store(false, Ordering::Relaxed);
+                        break;
+                    }
                 }
             }
         }
@@ -858,13 +1051,26 @@ fn run_drm_event_loop(
 /// Convert a [`CommittedBuffer`] to a backend [`DmaBuf`], import it, and
 /// present it to the display.
 ///
-/// Only DMA-BUF buffers are supported for direct DRM scanout. SHM buffers
-/// would require GPU-side composition (TODO: Vulkan blit path).
+/// Flow:
+/// 1. If the client buffer matches the display resolution, try direct
+///    scanout (zero-copy — no GPU work).
+/// 2. Otherwise, blit the client buffer to a display-resolution output
+///    image via [`VulkanBlitter`], then import and present that.
+///
+/// The blitter solves the NVIDIA primary-plane limitation: the DRM plane
+/// cannot scale, so the framebuffer MUST match the CRTC mode dimensions.
+/// Returns `true` if a page flip is pending (async), `false` if the
+/// commit was synchronous (first modeset frame).
 fn present_committed_buffer(
     drm: &mut crate::backend::drm::DrmBackend,
     buffer: wayland::protocols::CommittedBuffer,
-) -> anyhow::Result<()> {
-    use std::os::unix::io::AsRawFd;
+    blitter: &mut crate::backend::gpu::vulkan_blitter::VulkanBlitter,
+    display_w: u32,
+    display_h: u32,
+    output_fb_cache: &mut [Option<crate::backend::Framebuffer>],
+    prev_scanout_fb: &mut Option<drm::control::framebuffer::Handle>,
+) -> anyhow::Result<bool> {
+    use std::os::unix::io::{AsFd, AsRawFd};
 
     match buffer {
         wayland::protocols::CommittedBuffer::DmaBuf {
@@ -874,44 +1080,83 @@ fn present_committed_buffer(
             format,
             modifier,
         } => {
-            let fourcc = drm_fourcc::DrmFourcc::try_from(format)
-                .map_err(|_| anyhow::anyhow!("unknown DRM format 0x{format:08x}"))?;
-
-            let dmabuf = crate::backend::DmaBuf {
-                width,
-                height,
-                format: fourcc,
-                modifier: drm_fourcc::DrmModifier::from(modifier),
-                planes: planes
-                    .iter()
-                    .map(|p| crate::backend::DmaBufPlane {
-                        fd: p.fd.as_raw_fd(),
-                        offset: p.offset,
-                        stride: p.stride,
-                    })
-                    .collect(),
-            };
-
-            let fb = drm.import_dmabuf(&dmabuf)?;
-
-            // Try direct scanout first (no GPU composition needed).
-            match drm.try_direct_scanout(&fb) {
-                Ok(true) => {
-                    drm.present(&fb)?;
+            // --- Direct scanout fast path ---
+            // If the client buffer already matches the display resolution,
+            // skip GPU composition entirely (zero-copy).
+            if width == display_w && height == display_h {
+                let fourcc = drm_fourcc::DrmFourcc::try_from(format)
+                    .map_err(|_| anyhow::anyhow!("unknown DRM format 0x{format:08x}"))?;
+                let dmabuf = crate::backend::DmaBuf {
+                    width,
+                    height,
+                    format: fourcc,
+                    modifier: drm_fourcc::DrmModifier::from(modifier),
+                    planes: planes
+                        .iter()
+                        .map(|p| crate::backend::DmaBufPlane {
+                            fd: p.fd.as_raw_fd(),
+                            offset: p.offset,
+                            stride: p.stride,
+                        })
+                        .collect(),
+                };
+                let fb = drm.import_dmabuf(&dmabuf)?;
+                if drm.try_direct_scanout(&fb)? {
+                    // Track the previous scanout FB for deferred destruction.
+                    // The display controller may still be scanning it out
+                    // until our page flip completes.
+                    *prev_scanout_fb = Some(fb.handle);
+                    match drm.present(&fb)? {
+                        crate::backend::FlipResult::Queued => return Ok(true),
+                        crate::backend::FlipResult::DirectScanout => return Ok(false),
+                        crate::backend::FlipResult::Failed(e) => {
+                            return Err(e.context("direct scanout flip failed"));
+                        }
+                    }
                 }
-                Ok(false) | Err(_) => {
-                    // Fallback: present through the primary plane.
-                    drm.present(&fb)?;
-                }
+                // TEST_ONLY failed (format/modifier mismatch) — fall through to blit.
             }
 
-            Ok(())
+            // --- GPU composition path ---
+            // Blit the client buffer to a display-resolution output image.
+            let first_plane = &planes[0];
+            let exported = blitter
+                .blit(
+                    first_plane.fd.as_fd(),
+                    width,
+                    height,
+                    format,
+                    modifier,
+                    first_plane.offset,
+                    first_plane.stride,
+                )
+                .context("Vulkan blit failed")?;
+
+            // Use the pre-created DRM framebuffer for this output image.
+            // FBs were created at startup (matching gamescope's approach),
+            // so we just look up by buffer index.
+            let out_fb = output_fb_cache[exported.buffer_index]
+                .as_ref()
+                .expect("output FB must be pre-created at startup");
+
+            debug!(
+                buffer_index = exported.buffer_index,
+                fb = ?out_fb.handle,
+                "present: using DRM framebuffer"
+            );
+
+            match drm.present(out_fb)? {
+                crate::backend::FlipResult::Queued => Ok(true),
+                crate::backend::FlipResult::DirectScanout => Ok(false),
+                crate::backend::FlipResult::Failed(e) => {
+                    Err(e.context("blitted frame flip failed"))
+                }
+            }
         }
         wayland::protocols::CommittedBuffer::Shm { .. } => {
             // TODO: SHM buffers require GPU-side blit (Vulkan compositor).
-            // For now, skip SHM frames on the DRM path.
             tracing::trace!("skipping SHM buffer on DRM path (not yet supported)");
-            Ok(())
+            Ok(false)
         }
     }
 }

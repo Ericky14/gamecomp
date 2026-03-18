@@ -27,7 +27,51 @@ use drm::control::{
 use drm_fourcc::{DrmFormat, DrmFourcc, DrmModifier};
 use tracing::{debug, info, warn};
 
-use super::{Backend, BackendCaps, BackendError, ConnectorInfo, DmaBuf, FlipResult, Framebuffer};
+use super::{
+    Backend, BackendCaps, BackendError, ConnectorInfo, DmaBuf, DmaBufPlane, FlipResult, Framebuffer,
+};
+
+/// A GBM-allocated output buffer with a pre-created DRM framebuffer.
+///
+/// Allocated via GBM with native GEM handles, these buffers bypass the
+/// `PRIME_FD_TO_HANDLE` path that causes tiling metadata corruption on
+/// NVIDIA. The DMA-BUF fd is suitable for Vulkan import.
+pub struct GbmOutputBuffer {
+    /// DRM framebuffer created from GBM's native GEM handle.
+    pub fb: Framebuffer,
+    /// DMA-BUF descriptor for importing into Vulkan.
+    pub dmabuf: DmaBuf,
+    /// Owned fd keeping the DMA-BUF alive. The `dmabuf.planes[*].fd`
+    /// raw fds borrow this — must outlive all Vulkan imports.
+    _fd: std::os::unix::io::OwnedFd,
+}
+
+/// Header of the DRM IN_FORMATS property blob (`drm_format_modifier_blob`).
+///
+/// This kernel structure describes the format+modifier pairs a DRM plane
+/// supports for scanout. Parsed to discover which modifiers the display
+/// controller can accept.
+#[repr(C)]
+struct InFormatsBlobHeader {
+    _version: u32,
+    _flags: u32,
+    count_formats: u32,
+    formats_offset: u32,
+    count_modifiers: u32,
+    modifiers_offset: u32,
+}
+
+/// Per-modifier entry in the IN_FORMATS blob (`drm_format_modifier`).
+#[repr(C)]
+struct InFormatsModifier {
+    /// Bitmask of which formats (by index) this modifier applies to.
+    formats: u64,
+    /// Offset into the formats array for this modifier's format range.
+    offset: u32,
+    _pad: u32,
+    /// The DRM modifier value.
+    modifier: u64,
+}
 
 /// State for a single DRM plane (primary, overlay, or cursor).
 #[derive(Debug)]
@@ -38,6 +82,8 @@ struct PlaneState {
     props: PlaneProps,
     /// Formats supported by this plane.
     formats: Vec<DrmFormat>,
+    /// Filter describing which CRTCs this plane can be bound to.
+    possible_crtcs: drm::control::CrtcListFilter,
 }
 
 /// Cached DRM property handles for a plane.
@@ -109,6 +155,10 @@ pub struct DrmBackend {
     scanout_formats: Vec<DrmFormat>,
     /// Whether a page flip is currently pending.
     flip_pending: bool,
+    /// The first atomic commit that assigns an FB to the primary plane
+    /// is effectively a modeset and needs `ALLOW_MODESET`. This flag is
+    /// cleared after the first successful flip.
+    needs_modeset: bool,
 }
 
 /// Wrapper to implement `drm::Device` on an `OwnedFd`.
@@ -153,6 +203,7 @@ impl DrmBackend {
             caps: BackendCaps::default(),
             scanout_formats: Vec::new(),
             flip_pending: false,
+            needs_modeset: true,
         }
     }
 
@@ -200,7 +251,7 @@ impl DrmBackend {
             }
 
             // Collect supported formats.
-            let formats = plane
+            let formats: Vec<_> = plane
                 .formats()
                 .iter()
                 .map(|&f| DrmFormat {
@@ -209,6 +260,16 @@ impl DrmBackend {
                 })
                 .collect();
 
+            let possible_crtcs = plane.possible_crtcs();
+
+            debug!(
+                ?handle,
+                ?kind,
+                ?possible_crtcs,
+                num_formats = formats.len(),
+                "discovered plane"
+            );
+
             self.planes.insert(
                 handle,
                 PlaneState {
@@ -216,12 +277,117 @@ impl DrmBackend {
                     kind,
                     props: plane_props,
                     formats,
+                    possible_crtcs,
                 },
             );
         }
 
         info!(count = self.planes.len(), "discovered DRM planes");
         Ok(())
+    }
+
+    /// Query the modifiers supported by the primary plane's IN_FORMATS blob
+    /// for the given DRM fourcc format code.
+    ///
+    /// These modifiers represent what the display controller can scan out.
+    /// Pass them to `VulkanBlitter` to create output images the hardware can
+    /// display directly, avoiding LINEAR-only fallback that produces noise
+    /// on NVIDIA.
+    pub fn query_primary_plane_modifiers(&self, format: DrmFourcc) -> Vec<u64> {
+        let dev = DrmRef(self.fd.as_fd());
+
+        // Find the primary plane for the first output.
+        let primary_plane = match self.outputs.first() {
+            Some(output) => output.primary_plane,
+            None => return Vec::new(),
+        };
+
+        // Get the plane's properties to find IN_FORMATS.
+        let props = match dev.get_properties(primary_plane) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(?e, "failed to get plane properties for IN_FORMATS");
+                return Vec::new();
+            }
+        };
+
+        // Find the IN_FORMATS property handle and its blob ID value.
+        let mut in_formats_blob_id: Option<u64> = None;
+        for (&prop_handle, &value) in &props {
+            if let Ok(info) = dev.get_property(prop_handle)
+                && info.name().to_str() == Ok("IN_FORMATS")
+            {
+                in_formats_blob_id = Some(value);
+                break;
+            }
+        }
+
+        let Some(blob_id) = in_formats_blob_id else {
+            info!("IN_FORMATS property not found on primary plane");
+            return Vec::new();
+        };
+
+        // Read the blob data.
+        let blob_data = match dev.get_property_blob(blob_id) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(?e, "failed to read IN_FORMATS blob");
+                return Vec::new();
+            }
+        };
+
+        if blob_data.len() < std::mem::size_of::<InFormatsBlobHeader>() {
+            warn!(size = blob_data.len(), "IN_FORMATS blob too small");
+            return Vec::new();
+        }
+
+        // Parse the drm_format_modifier_blob header.
+        // SAFETY: blob_data is a kernel DRM blob with drm_format_modifier_blob
+        // layout. We verified the minimum size above. All fields are POD u32.
+        let header = unsafe { &*(blob_data.as_ptr() as *const InFormatsBlobHeader) };
+
+        let target_fourcc = format as u32;
+        let mut modifiers = Vec::new();
+
+        // Walk the modifier entries and collect modifiers for our target format.
+        for i in 0..header.count_modifiers {
+            let mod_offset = header.modifiers_offset as usize
+                + (i as usize) * std::mem::size_of::<InFormatsModifier>();
+            if mod_offset + std::mem::size_of::<InFormatsModifier>() > blob_data.len() {
+                break;
+            }
+            // SAFETY: bounds-checked above; InFormatsModifier is repr(C) POD.
+            let mod_entry =
+                unsafe { &*(blob_data.as_ptr().add(mod_offset) as *const InFormatsModifier) };
+
+            // Check each format bit in this modifier's bitmask.
+            for j in 0..64u32 {
+                if mod_entry.formats & (1u64 << j) != 0 {
+                    let fmt_idx = (j + mod_entry.offset) as usize;
+                    let fmt_byte_offset = header.formats_offset as usize + fmt_idx * 4;
+                    if fmt_byte_offset + 4 > blob_data.len() {
+                        continue;
+                    }
+                    // SAFETY: bounds-checked above; format codes are u32.
+                    let fourcc =
+                        unsafe { *(blob_data.as_ptr().add(fmt_byte_offset) as *const u32) };
+                    if fourcc == target_fourcc {
+                        modifiers.push(mod_entry.modifier);
+                    }
+                }
+            }
+        }
+
+        info!(
+            count = modifiers.len(),
+            format = format!("{:?}", format),
+            "queried primary plane IN_FORMATS modifiers"
+        );
+        for m in &modifiers {
+            debug!(modifier = format!("0x{:016x}", m), "plane scanout modifier");
+        }
+
+        modifiers
     }
 
     /// Discover connectors and CRTCs, build output configurations.
@@ -308,30 +474,53 @@ impl DrmBackend {
             // Check VRR capability.
             let vrr_capable = conn_props.vrr_capable.is_some();
 
-            // Find primary plane for this CRTC.
+            // Filter planes by possible_crtcs — each plane is only compatible
+            // with specific CRTCs. Using an incompatible plane causes EINVAL
+            // on atomic commit.
             let primary_plane = self
                 .planes
                 .values()
-                .find(|p| p.kind == PlaneType::Primary)
+                .find(|p| {
+                    p.kind == PlaneType::Primary
+                        && resources
+                            .filter_crtcs(p.possible_crtcs)
+                            .contains(&crtc_handle)
+                })
                 .map(|p| p.handle);
 
             let Some(primary_plane) = primary_plane else {
-                warn!(?crtc_handle, "no primary plane found for CRTC");
+                warn!(?crtc_handle, "no compatible primary plane found for CRTC");
                 continue;
             };
 
-            // Collect overlay and cursor planes.
+            debug!(
+                ?crtc_handle,
+                ?primary_plane,
+                "selected primary plane for CRTC"
+            );
+
+            // Collect overlay and cursor planes compatible with this CRTC.
             let overlay_planes: Vec<_> = self
                 .planes
                 .values()
-                .filter(|p| p.kind == PlaneType::Overlay)
+                .filter(|p| {
+                    p.kind == PlaneType::Overlay
+                        && resources
+                            .filter_crtcs(p.possible_crtcs)
+                            .contains(&crtc_handle)
+                })
                 .map(|p| p.handle)
                 .collect();
 
             let cursor_plane = self
                 .planes
                 .values()
-                .find(|p| p.kind == PlaneType::Cursor)
+                .find(|p| {
+                    p.kind == PlaneType::Cursor
+                        && resources
+                            .filter_crtcs(p.possible_crtcs)
+                            .contains(&crtc_handle)
+                })
                 .map(|p| p.handle);
 
             let conn_name = format!("{:?}-{}", conn.interface(), conn.interface_id());
@@ -383,53 +572,90 @@ impl DrmBackend {
         Ok(())
     }
 
-    /// Set the initial mode on the first output via atomic commit.
+    /// Blank all displays except the chosen output by disabling their
+    /// CRTCs and connectors.
+    ///
+    /// The chosen output's CRTC is NOT enabled here — that happens in the
+    /// first `present()` call which combines the modeset with the primary
+    /// plane assignment in a single atomic commit. This avoids a
+    /// double-modeset that NVIDIA's DRM driver may reject.
     fn modeset_first_output(&mut self) -> anyhow::Result<()> {
         let dev = DrmRef(self.fd.as_fd());
 
         let output = self.outputs.first_mut().context("no outputs to modeset")?;
+        let active_connector = output.connector;
+        let active_crtc = output.crtc;
 
-        // Create a mode blob.
-        let mode_blob = dev
-            .create_property_blob(&output.mode)
-            .context("failed to create mode blob")?;
-
-        // Build atomic request.
+        // Build atomic request to disable all OTHER connectors and CRTCs.
         let mut req = drm::control::atomic::AtomicModeReq::new();
+        let mut has_disable = false;
 
-        // Connector → CRTC.
-        if let Some(prop) = output.connector_props.crtc_id {
-            req.add_property(
-                output.connector,
-                prop,
-                drm::control::property::Value::CRTC(Some(output.crtc)),
-            );
+        let resources = dev
+            .resource_handles()
+            .context("failed to get DRM resources for blanking")?;
+
+        for &conn_handle in resources.connectors() {
+            if conn_handle == active_connector {
+                continue; // Will be enabled in first present().
+            }
+            if let Ok(props) = dev.get_properties(conn_handle) {
+                for (&prop_handle, _) in &props {
+                    if let Ok(info) = dev.get_property(prop_handle)
+                        && info.name().to_str() == Ok("CRTC_ID")
+                    {
+                        req.add_property(
+                            conn_handle,
+                            prop_handle,
+                            drm::control::property::Value::CRTC(None),
+                        );
+                        has_disable = true;
+                        debug!(?conn_handle, "disabling connector");
+                    }
+                }
+            }
         }
 
-        // CRTC active + mode.
-        if let Some(prop) = output.crtc_props.active {
-            req.add_property(
-                output.crtc,
-                prop,
-                drm::control::property::Value::Boolean(true),
-            );
-        }
-        if let Some(prop) = output.crtc_props.mode_id {
-            req.add_property(
-                output.crtc,
-                prop,
-                drm::control::property::Value::Blob(mode_blob.into()),
-            );
+        for &crtc_handle in resources.crtcs() {
+            if crtc_handle == active_crtc {
+                continue; // Will be enabled in first present().
+            }
+            if let Ok(props) = dev.get_properties(crtc_handle) {
+                for (&prop_handle, _) in &props {
+                    if let Ok(info) = dev.get_property(prop_handle) {
+                        match info.name().to_str() {
+                            Ok("ACTIVE") => {
+                                req.add_property(
+                                    crtc_handle,
+                                    prop_handle,
+                                    drm::control::property::Value::Boolean(false),
+                                );
+                                has_disable = true;
+                            }
+                            Ok("MODE_ID") => {
+                                req.add_property(
+                                    crtc_handle,
+                                    prop_handle,
+                                    drm::control::property::Value::Blob(0),
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            debug!(?crtc_handle, "disabling CRTC");
         }
 
-        dev.atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req)
-            .context("atomic modeset commit failed")?;
+        if has_disable {
+            dev.atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req)
+                .context("atomic blanking commit failed")?;
+        }
 
-        output.active = true;
         info!(
             connector = %self.connector_info[0].name,
             mode = ?output.mode,
-            "modeset complete"
+            ?active_crtc,
+            "blanked other displays (chosen output will be enabled on first present)"
         );
 
         Ok(())
@@ -479,6 +705,15 @@ impl Backend for DrmBackend {
     fn import_dmabuf(&mut self, dmabuf: &DmaBuf) -> anyhow::Result<Framebuffer> {
         let dev = DrmRef(self.fd.as_fd());
 
+        debug!(
+            width = dmabuf.width,
+            height = dmabuf.height,
+            format = ?dmabuf.format,
+            modifier = ?dmabuf.modifier,
+            num_planes = dmabuf.planes.len(),
+            "importing DMA-BUF"
+        );
+
         // Import DMA-BUF fds as GEM handles via PRIME_FD_TO_HANDLE.
         let mut gem_handles: [Option<drm::buffer::Handle>; 4] = [None; 4];
         let mut pitches = [0u32; 4];
@@ -489,16 +724,36 @@ impl Backend for DrmBackend {
             let gem = dev
                 .prime_fd_to_buffer(borrowed_fd)
                 .context("PRIME_FD_TO_HANDLE failed")?;
+            debug!(
+                plane_idx = i,
+                fd = plane.fd,
+                stride = plane.stride,
+                offset = plane.offset,
+                gem = ?gem,
+                "imported DMA-BUF plane"
+            );
             gem_handles[i] = Some(gem);
             pitches[i] = plane.stride;
             offsets[i] = plane.offset;
         }
 
+        // Decide FB creation path based on modifier.
+        //
+        // DRM_FORMAT_MOD_INVALID: Use the legacy path (drmModeAddFB2 without
+        //   DRM_MODE_FB_MODIFIERS). This is for VK_IMAGE_TILING_LINEAR exports
+        //   matching gamescope's fallback approach. The buffer's memory layout
+        //   is row-major linear, which the legacy path expects.
+        //
+        // Any concrete modifier (including LINEAR=0): Use the modifier-aware
+        //   path (drmModeAddFB2WithModifiers with DRM_MODE_FB_MODIFIERS flag).
+        //   Required by NVIDIA's DRM driver for modifier-aware allocations.
+        let use_modifiers = dmabuf.modifier != DrmModifier::Invalid;
+
         // Wrapper implementing PlanarBuffer for add_planar_framebuffer.
         struct ImportBuffer {
             size: (u32, u32),
             format: DrmFourcc,
-            modifier: DrmModifier,
+            modifier: Option<DrmModifier>,
             handles: [Option<drm::buffer::Handle>; 4],
             pitches: [u32; 4],
             offsets: [u32; 4],
@@ -511,7 +766,7 @@ impl Backend for DrmBackend {
                 self.format
             }
             fn modifier(&self) -> Option<DrmModifier> {
-                Some(self.modifier)
+                self.modifier
             }
             fn pitches(&self) -> [u32; 4] {
                 self.pitches
@@ -527,15 +782,68 @@ impl Backend for DrmBackend {
         let buf = ImportBuffer {
             size: (dmabuf.width, dmabuf.height),
             format: dmabuf.format,
-            modifier: dmabuf.modifier,
+            modifier: if use_modifiers {
+                Some(dmabuf.modifier)
+            } else {
+                None
+            },
             handles: gem_handles,
             pitches,
             offsets,
         };
 
+        let flags = if use_modifiers {
+            FbCmd2Flags::MODIFIERS
+        } else {
+            FbCmd2Flags::empty()
+        };
+
+        info!(
+            use_modifiers,
+            modifier = ?dmabuf.modifier,
+            format = ?dmabuf.format,
+            width = dmabuf.width,
+            height = dmabuf.height,
+            gem_h0 = ?gem_handles[0],
+            pitch0 = pitches[0],
+            offset0 = offsets[0],
+            "creating DRM framebuffer"
+        );
+
         let fb = dev
-            .add_planar_framebuffer(&buf, FbCmd2Flags::MODIFIERS)
+            .add_planar_framebuffer(&buf, flags)
             .context("failed to import DMA-BUF as framebuffer")?;
+
+        info!(
+            fb_id = ?fb,
+            format = ?dmabuf.format,
+            modifier = ?dmabuf.modifier,
+            width = dmabuf.width,
+            height = dmabuf.height,
+            "DRM framebuffer created successfully"
+        );
+
+        // Close GEM handles immediately after FB creation — the kernel's
+        // framebuffer object internally holds a reference to the GEM
+        // objects, keeping the backing memory alive. This matches
+        // gamescope's drm_fbid_from_dmabuf() approach exactly.
+        for gem in gem_handles.iter().filter_map(|h| *h) {
+            // Deduplicate: GEM handles aren't ref-counted per the kernel
+            // API. Two DMA-BUFs may return the same handle, and we must
+            // not double-close them.
+            let already_closed = gem_handles
+                .iter()
+                .take(
+                    gem_handles
+                        .iter()
+                        .position(|h| *h == Some(gem))
+                        .unwrap_or(0),
+                )
+                .any(|h| *h == Some(gem));
+            if !already_closed {
+                let _ = dev.close_buffer(gem);
+            }
+        }
 
         Ok(Framebuffer {
             handle: fb,
@@ -667,10 +975,69 @@ impl Backend for DrmBackend {
 
         let mode = output.mode;
         let (mode_w, mode_h) = (mode.size().0 as u64, mode.size().1 as u64);
+
+        // Source rect must match dest rect — most DRM drivers (including
+        // NVIDIA) do NOT support plane scaling on the primary plane.
+        // Always present at display resolution; the Vulkan compositor must
+        // scale the client buffer to match before we get here.
+        //
+        // For now, use the framebuffer dimensions as both src and dst.
+        // If the FB is smaller than the display, the extra pixels are
+        // undefined (dark/garbage). This avoids EINVAL from the kernel
+        // when src != dst and scaling isn't supported.
         let src_w = (fb.size.0 as u64) << 16;
         let src_h = (fb.size.1 as u64) << 16;
+        let dst_w = fb.size.0 as u64;
+        let dst_h = fb.size.1 as u64;
+
+        debug!(
+            fb_w = fb.size.0,
+            fb_h = fb.size.1,
+            mode_w,
+            mode_h,
+            needs_modeset = self.needs_modeset,
+            primary_plane = ?output.primary_plane,
+            crtc = ?output.crtc,
+            connector = ?output.connector,
+            "presenting framebuffer"
+        );
 
         let mut req = drm::control::atomic::AtomicModeReq::new();
+
+        // When this is the first flip after modeset, we must include
+        // the CRTC and connector properties in the same atomic request.
+        // The kernel requires a complete atomic state when transitioning
+        // from "no plane FB" to "plane FB assigned".
+        if self.needs_modeset {
+            let mode_blob = dev
+                .create_property_blob(&output.mode)
+                .context("failed to create mode blob for present")?;
+
+            // Connector → CRTC.
+            if let Some(prop) = output.connector_props.crtc_id {
+                req.add_property(
+                    output.connector,
+                    prop,
+                    drm::control::property::Value::CRTC(Some(output.crtc)),
+                );
+            }
+            // CRTC active + mode.
+            if let Some(prop) = output.crtc_props.active {
+                req.add_property(
+                    output.crtc,
+                    prop,
+                    drm::control::property::Value::Boolean(true),
+                );
+            }
+            if let Some(prop) = output.crtc_props.mode_id {
+                req.add_property(
+                    output.crtc,
+                    prop,
+                    drm::control::property::Value::Blob(mode_blob.into()),
+                );
+            }
+            debug!("first flip: including CRTC+connector in atomic request");
+        }
 
         // Assign framebuffer to primary plane.
         if let Some(prop) = plane.props.fb_id {
@@ -733,27 +1100,59 @@ impl Backend for DrmBackend {
             req.add_property(
                 output.primary_plane,
                 prop,
-                drm::control::property::Value::UnsignedRange(mode_w),
+                drm::control::property::Value::UnsignedRange(dst_w),
             );
         }
         if let Some(prop) = plane.props.crtc_h {
             req.add_property(
                 output.primary_plane,
                 prop,
-                drm::control::property::Value::UnsignedRange(mode_h),
+                drm::control::property::Value::UnsignedRange(dst_h),
             );
         }
 
-        // Non-blocking commit with page flip event.
-        match dev.atomic_commit(
-            AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::NONBLOCK,
-            req,
-        ) {
-            Ok(()) => {
-                self.flip_pending = true;
-                Ok(FlipResult::Queued)
+        if self.needs_modeset {
+            // The first commit that assigns an FB to the primary plane is
+            // effectively a modeset. NVIDIA's DRM driver does NOT support
+            // NONBLOCK or PAGE_FLIP_EVENT on modeset commits — the kernel
+            // returns EINVAL. Use a synchronous ALLOW_MODESET commit for
+            // the initial flip, then switch to async flips for subsequent
+            // frames.
+            match dev.atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req) {
+                Ok(()) => {
+                    self.needs_modeset = false;
+                    self.outputs.first_mut().unwrap().active = true;
+                    info!("initial modeset+flip committed (synchronous)");
+                    Ok(FlipResult::DirectScanout)
+                }
+                Err(e) => {
+                    warn!(
+                        ?e,
+                        plane = ?output.primary_plane,
+                        crtc = ?output.crtc,
+                        connector = ?output.connector,
+                        possible_crtcs = ?plane.possible_crtcs,
+                        fb = ?fb.handle,
+                        fb_format = ?fb.format,
+                        fb_modifier = ?fb.modifier,
+                        "initial modeset+flip commit failed"
+                    );
+                    Ok(FlipResult::Failed(e.into()))
+                }
             }
-            Err(e) => Ok(FlipResult::Failed(e.into())),
+        } else {
+            let flags = AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::NONBLOCK;
+            match dev.atomic_commit(flags, req) {
+                Ok(()) => {
+                    self.flip_pending = true;
+                    debug!("atomic commit queued (page flip pending)");
+                    Ok(FlipResult::Queued)
+                }
+                Err(e) => {
+                    warn!(?e, "atomic commit failed");
+                    Ok(FlipResult::Failed(e.into()))
+                }
+            }
         }
     }
 
@@ -778,6 +1177,7 @@ impl Backend for DrmBackend {
         }
 
         self.flip_pending = false;
+
         Ok(vblank_ns)
     }
 
@@ -808,5 +1208,161 @@ impl Backend for DrmBackend {
         info!(enabled, "VRR state changed");
 
         Ok(())
+    }
+}
+
+impl DrmBackend {
+    /// Destroy a framebuffer handle.
+    ///
+    /// The kernel will release the underlying GEM references when the FB
+    /// is no longer in use by the display controller. Callers must ensure
+    /// the FB is not currently being scanned out (wait for page flip first).
+    /// Force a modeset on the next present (e.g., after VT switch resume).
+    ///
+    /// When the session is re-enabled after a VT switch, the display controller
+    /// state is lost. The next present must include CRTC+connector state with
+    /// `DRM_MODE_ALLOW_MODESET` to re-establish the display pipeline.
+    pub fn force_modeset(&mut self) {
+        self.needs_modeset = true;
+        self.flip_pending = false;
+    }
+
+    pub fn destroy_framebuffer(&self, fb: drm::control::framebuffer::Handle) {
+        let dev = DrmRef(self.fd.as_fd());
+        if let Err(e) = dev.destroy_framebuffer(fb) {
+            warn!(?fb, ?e, "failed to destroy framebuffer");
+        }
+    }
+
+    /// Allocate GBM-backed output buffers for Vulkan composition.
+    ///
+    /// Creates `count` GBM buffer objects with the given modifiers, creates
+    /// DRM framebuffers from their native GEM handles (no PRIME import),
+    /// and returns DMA-BUF descriptors for importing into Vulkan.
+    ///
+    /// This bypasses `PRIME_FD_TO_HANDLE` entirely — GBM allocates using
+    /// the kernel DRM driver's native allocation path, so the resulting
+    /// GEM handles carry correct tiling metadata. On NVIDIA, this is the
+    /// only reliable way to create scanout buffers that are both renderable
+    /// by Vulkan (via DMA-BUF import) and displayable by the DRM plane.
+    pub fn allocate_gbm_output_buffers(
+        &mut self,
+        count: usize,
+        width: u32,
+        height: u32,
+        modifiers: &[u64],
+    ) -> anyhow::Result<Vec<GbmOutputBuffer>> {
+        use gbm::{BufferObjectFlags, Device as GbmDevice};
+        use std::os::unix::io::AsRawFd;
+
+        let gbm: GbmDevice<DrmRef> = GbmDevice::new(DrmRef(self.fd.as_fd()))
+            .context("failed to create GBM device for output allocation")?;
+
+        info!(
+            backend = gbm.backend_name(),
+            count,
+            width,
+            height,
+            modifier_count = modifiers.len(),
+            "allocating GBM output buffers"
+        );
+
+        let drm_modifiers: Vec<DrmModifier> =
+            modifiers.iter().map(|&m| DrmModifier::from(m)).collect();
+
+        let mut outputs = Vec::with_capacity(count);
+
+        for i in 0..count {
+            let bo = gbm
+                .create_buffer_object_with_modifiers2::<()>(
+                    width,
+                    height,
+                    gbm::Format::Xrgb8888,
+                    drm_modifiers.iter().copied(),
+                    BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING,
+                )
+                .with_context(|| format!("GBM buffer allocation failed for output {i}"))?;
+
+            let bo_modifier = bo.modifier();
+            let bo_stride = bo.stride();
+            let bo_offset = bo.offset(0);
+
+            // Export DMA-BUF fd (GBM dups internally — we get an independent OwnedFd).
+            let bo_fd = bo
+                .fd()
+                .with_context(|| format!("failed to export GBM buffer fd for output {i}"))?;
+
+            info!(
+                i,
+                modifier = format!("0x{:016x}", u64::from(bo_modifier)),
+                stride = bo_stride,
+                offset = bo_offset,
+                fd = bo_fd.as_raw_fd(),
+                plane_count = bo.plane_count(),
+                "GBM output buffer allocated"
+            );
+
+            // Create DRM FB directly from the GBM buffer object.
+            // This uses native GEM handles — no PRIME_FD_TO_HANDLE.
+            let dev = DrmRef(self.fd.as_fd());
+            let flags = if bo_modifier != DrmModifier::Invalid {
+                FbCmd2Flags::MODIFIERS
+            } else {
+                FbCmd2Flags::empty()
+            };
+            let fb_handle = dev
+                .add_planar_framebuffer(&bo, flags)
+                .with_context(|| format!("add_planar_framebuffer failed for output {i}"))?;
+
+            info!(
+                i,
+                fb = ?fb_handle,
+                modifier = format!("0x{:016x}", u64::from(bo_modifier)),
+                "DRM framebuffer created from GBM (native GEM, no PRIME)"
+            );
+
+            let fb = Framebuffer {
+                handle: fb_handle,
+                format: DrmFourcc::Xrgb8888,
+                modifier: bo_modifier,
+                size: (width, height),
+            };
+
+            // The DMA-BUF fd is an independent dup from GBM. We store the
+            // raw fd for the DmaBuf descriptor — Vulkan will dup it again
+            // when importing, so this fd must stay alive until import.
+            let raw_fd = bo_fd.as_raw_fd();
+
+            let dmabuf = DmaBuf {
+                width,
+                height,
+                format: DrmFourcc::Xrgb8888,
+                modifier: bo_modifier,
+                planes: vec![DmaBufPlane {
+                    fd: raw_fd,
+                    offset: bo_offset,
+                    stride: bo_stride,
+                }],
+            };
+
+            outputs.push(GbmOutputBuffer {
+                fb,
+                dmabuf,
+                _fd: bo_fd,
+            });
+
+            // Forget the GBM buffer object to prevent its destructor from
+            // freeing the underlying GEM buffer. The DRM framebuffer holds
+            // a kernel reference to the GEM object, keeping the memory
+            // alive. The DMA-BUF fd we exported is an independent dup.
+            std::mem::forget(bo);
+        }
+
+        // Drop GBM device — all BOs are forgotten and DRM FBs + DMA-BUF
+        // fds keep the backing memory alive. Releases the DrmRef borrow.
+        drop(gbm);
+
+        info!(count = outputs.len(), "GBM output buffers ready");
+        Ok(outputs)
     }
 }

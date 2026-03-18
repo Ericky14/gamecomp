@@ -8,6 +8,8 @@
 //! within a single dispatch cycle are accumulated into one delta, reducing
 //! the number of Wayland events sent to the client.
 
+pub mod keyboard;
+
 use tracing::info;
 
 /// Accumulated input state for one frame.

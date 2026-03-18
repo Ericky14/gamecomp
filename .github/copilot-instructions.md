@@ -30,8 +30,11 @@
 - Error types use `thiserror`. Propagation uses `anyhow::Result` at application boundaries, typed errors within libraries.
 - Use `tracing::{info, warn, error, debug, trace}` for logging. Never `println!` or `eprintln!`.
 - Constants and enums over magic numbers. Use `const` generics where applicable.
+- **Extract repeated flag/constant combinations into module-level `const`.** For example, Vulkan usage flags or DRM modifier sentinels used in multiple functions belong at the top of the module, not redefined locally in each function.
 - Prefer `&[T]` slices over `Vec<T>` in function signatures.
 - File names are `snake_case`. Types are `PascalCase`. Functions and variables are `snake_case`.
+- **Functions should be ≤ 150 lines.** If longer, extract coherent sub-steps into helpers. Exception: single GPU command buffer recordings where splitting breaks readability.
+- **No duplicated logic across functions.** If two functions share > 50% structure, extract the common pattern into a parameterized helper.
 
 ## Testing
 
