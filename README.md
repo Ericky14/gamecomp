@@ -30,13 +30,16 @@ High-level feature goals for Gamecomp. No hard dates — contributions welcome.
 - [x] DMA-BUF import and format negotiation
 - [x] Configuration via CLI args + TOML file
 - [x] SPIR-V shader compilation at build time
+- [x] Vulkan compute shader composition (blit.comp + VulkanBlitter pipeline)
+- [x] Session switching — VT switch handling via libseat (Ctrl+Alt+Fn, pause/resume, fd revocation)
+- [x] Keyboard monitor — raw evdev with udev hotplug, modifier tracking, connect/disconnect support
+- [x] GBM-backed output buffer allocation (native GEM handles, no PRIME corruption)
+- [x] Async DMA-BUF implicit sync (non-blocking poll before blit)
 
 ## In Progress
 
-- [ ] Vulkan compute shader composition — infrastructure ready, pipeline/dispatch not wired up
 - [ ] XWayland window management — core WM works, close/resize/title reading stubbed
 - [ ] Adaptive frame pacing — algorithm complete, needs timerfd scheduling integration
-- [ ] libinput integration — event types defined, device enumeration/polling not implemented
 - [ ] VRR (variable refresh rate) — frame pacer support exists, needs per-connector toggle
 - [ ] Multi-plane assignment — overlay/cursor plane offload to reduce GPU work
 
@@ -51,7 +54,6 @@ High-level feature goals for Gamecomp. No hard dates — contributions welcome.
 - [ ] **Gamepad input** — evdev gamepad passthrough to client
 - [ ] **Color management** — ICC/LUT loading, color-blind filters
 - [ ] **Touch input** — touchscreen support for handheld devices
-- [ ] **Session switching** — VT switch handling via libseat
 
 ## Building
 
@@ -61,7 +63,7 @@ cargo build --release
 
 Requires Rust 1.93.1+ and the following system dependencies:
 - `libdrm`, `libgbm` — DRM/KMS support
-- `libinput`, `libseat`, `libudev` — Input and session management  
+- `libseat`, `libudev` — Session and device management  
 - `libwayland` — Wayland protocol
 - `vulkan-loader` — Vulkan runtime
 
@@ -101,4 +103,4 @@ Portions of this codebase were generated with the assistance of large language m
 
 ## License
 
-MIT. See [LICENSE](LICENSE) for details.
+GPL-3.0. See [LICENSE](LICENSE) for details.
