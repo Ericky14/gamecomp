@@ -1113,10 +1113,10 @@ impl Backend for DrmBackend {
 
         if self.needs_modeset {
             // The first commit that assigns an FB to the primary plane is
-            // effectively a modeset. NVIDIA's DRM driver does NOT support
-            // NONBLOCK or PAGE_FLIP_EVENT on modeset commits — the kernel
-            // returns EINVAL. Use a synchronous ALLOW_MODESET commit for
-            // the initial flip, then switch to async flips for subsequent
+            // effectively a modeset. The kernel's atomic helper rejects
+            // NONBLOCK and PAGE_FLIP_EVENT on modeset commits (returns
+            // EINVAL). Use a synchronous ALLOW_MODESET commit for the
+            // initial flip, then switch to async flips for subsequent
             // frames.
             match dev.atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req) {
                 Ok(()) => {
