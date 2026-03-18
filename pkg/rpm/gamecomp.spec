@@ -2,7 +2,7 @@
 %global debug_package %{nil}
 
 Name:           %{app_name}
-Version: 0.1.0
+Version: 1.0.0
 Release:        0%{?dist}
 Summary:        High-performance single-app fullscreen Wayland compositor
 
