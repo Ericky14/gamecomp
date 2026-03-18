@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.93.1"
 description = "High-performance single-app fullscreen Wayland compositor"
-license = "MIT"
+license = "GPL-3.0-only"
 
 [features]
 default = ["systemd"]
