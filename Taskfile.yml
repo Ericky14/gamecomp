@@ -7,6 +7,9 @@ vars:
     sh: grep '^version =' Cargo.toml | head -n 1 | cut -d'"' -f2
   WIDTH: "1280"
   HEIGHT: "720"
+  IMAGE_NAME: "{{.NAME}}-builder"
+  IMAGE_TAG:
+    sh: sha256sum Dockerfile | cut -d' ' -f1
 
 tasks:
   default:
@@ -108,3 +111,45 @@ tasks:
     desc: Show binary size breakdown (requires cargo-bloat)
     cmds:
       - cargo bloat --release -n 20
+
+  docker:build:
+    desc: Build the container image used for docker:run
+    preconditions:
+      - sh: which docker
+        msg: "Prerequisite utility 'docker' is not installed"
+    status:
+      - docker images | grep {{.IMAGE_NAME}} | grep {{.IMAGE_TAG}}
+    cmds:
+      - docker build -t {{.IMAGE_NAME}}:{{.IMAGE_TAG}} .
+
+  docker:run:
+    desc: "Run tasks inside Docker. E.g. go-task docker:run TARGET=ci"
+    aliases:
+      - in-docker
+    deps:
+      - docker:build
+    preconditions:
+      - sh: which docker
+        msg: "Prerequisite utility 'docker' is not installed"
+    vars:
+      UID:
+        sh: id -u
+      GID:
+        sh: id -g
+      PWD:
+        sh: pwd
+    requires:
+      vars:
+        - TARGET
+    cmds:
+      - mkdir -p .cache/cargo
+      - |
+        docker run --rm \
+          -v "{{.PWD}}:{{.PWD}}" \
+          -v "{{.PWD}}/.cache/cargo:/usr/local/cargo/registry" \
+          --tmpfs /tmp/xdg:rw,exec,nosuid \
+          -e XDG_RUNTIME_DIR=/tmp/xdg \
+          --workdir "{{.PWD}}" \
+          --user {{.UID}}:{{.GID}} \
+          {{.IMAGE_NAME}}:{{.IMAGE_TAG}} \
+          task {{.TARGET}}

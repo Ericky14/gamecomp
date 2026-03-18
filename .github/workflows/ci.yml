@@ -6,48 +6,42 @@ on:
   pull_request:
     branches: [main]
 
-env:
-  CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  # Fast check — no system deps or compilation needed
   fmt:
     name: Format
     runs-on: ubuntu-latest
     steps:
+      - uses: go-task/setup-task@v1
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - run: cargo fmt -- --check
+      - run: task docker:run TARGET=fmt:check
 
-  # Gate expensive jobs behind cheap lint checks
-  clippy:
+  lint:
     name: Clippy
     needs: fmt
     runs-on: ubuntu-latest
     steps:
+      - uses: go-task/setup-task@v1
       - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup
-        with:
-          components: clippy
-      - run: cargo clippy --all-features -- -D warnings
+      - run: task docker:run TARGET=lint
 
   test:
     name: Test
     needs: fmt
     runs-on: ubuntu-latest
     steps:
+      - uses: go-task/setup-task@v1
       - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup
-      - run: cargo test
+      - run: task docker:run TARGET=test
 
   build:
     name: Build Release
-    needs: [clippy, test]
+    needs: [lint, test]
     runs-on: ubuntu-latest
     steps:
+      - uses: go-task/setup-task@v1
       - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup
-      - run: cargo build --release
+      - run: task docker:run TARGET=build
