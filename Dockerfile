@@ -28,4 +28,8 @@ RUN ln -s /usr/lib/x86_64-linux-gnu/libshaderc.so \
 RUN curl -1sLf 'https://dl.cloudsmith.io/public/task/task/setup.deb.sh' | bash \
     && apt-get install -y task
 
+# RPM support
+RUN apt-get update && apt-get install -y rpm librpmbuild10 elfutils \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN rustup component add clippy rustfmt

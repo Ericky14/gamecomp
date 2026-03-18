@@ -1,0 +1,42 @@
+# Semantic Release Configuration
+# https://semantic-release.gitbook.io/semantic-release/usage/configuration
+
+branches:
+  - name: main
+
+plugins:
+  # Analyze commit messages to determine next version
+  - "@semantic-release/commit-analyzer"
+
+  # Generate release notes
+  - "@semantic-release/release-notes-generator"
+
+  # Update CHANGELOG.md
+  - - "@semantic-release/changelog"
+    - changelogFile: CHANGELOG.md
+
+  # Bump version in Cargo.toml and spec, then build RPMs
+  - - "@semantic-release/exec"
+    - shell: true
+      prepareCmd: |
+        sed -i '0,/^version = "[0-9]\+\.[0-9]\+\.[0-9]\+"$/s//version = "${nextRelease.version}"/' Cargo.toml
+        sed -i 's/^Version: .*/Version: ${nextRelease.version}/' pkg/rpm/gamecomp.spec
+        task docker:run TARGET=dist:all ARCH=x86_64
+
+  # Commit version bumps back to git
+  - - "@semantic-release/git"
+    - assets:
+        - CHANGELOG.md
+        - Cargo.toml
+        - Cargo.lock
+        - pkg/rpm/gamecomp.spec
+
+  # Create a GitHub release with artifacts attached
+  - - "@semantic-release/github"
+    - assets:
+        - path: "dist/*x86_64*.rpm"
+          label: "RPM (x86_64)"
+        - path: "dist/*x86_64*.tar.gz"
+          label: "Archive (x86_64)"
+      successComment: false
+      failComment: false

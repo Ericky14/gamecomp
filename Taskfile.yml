@@ -5,6 +5,8 @@ vars:
     sh: grep 'name =' Cargo.toml | head -n 1 | cut -d'"' -f2
   VERSION:
     sh: grep '^version =' Cargo.toml | head -n 1 | cut -d'"' -f2
+  ARCH:
+    sh: uname -m
   WIDTH: "1280"
   HEIGHT: "720"
   IMAGE_NAME: "{{.NAME}}-builder"
@@ -112,6 +114,56 @@ tasks:
     cmds:
       - cargo bloat --release -n 20
 
+  dist:prepare:
+    desc: Prepare the project for packaging
+    deps:
+      - build
+    cmds:
+      - rm -rf .cache/{{.NAME}}
+      - mkdir -p .cache/{{.NAME}}/usr/bin
+      - install -D -m 755 ./target/release/{{.NAME}} .cache/{{.NAME}}/usr/bin
+      - install -D -m 644 ./LICENSE .cache/{{.NAME}}/usr/share/{{.NAME}}/LICENSE
+      - mkdir -p dist
+
+  dist:archive:
+    desc: Build a tar archive of the project
+    deps:
+      - dist:prepare
+    cmds:
+      - tar cvfz dist/{{.NAME}}-{{.ARCH}}.tar.gz -C .cache {{.NAME}}
+
+  dist:rpm:
+    desc: Build an RPM package
+    aliases:
+      - rpm
+    deps:
+      - dist:archive
+    preconditions:
+      - sh: which rpmbuild
+        msg: "Prerequisite utility 'rpmbuild' is not installed"
+    cmds:
+      - mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+      - cp ./pkg/rpm/{{.NAME}}.spec ~/rpmbuild/SPECS
+      - cp dist/{{.NAME}}-{{.ARCH}}.tar.gz ~/rpmbuild/SOURCES
+      - rpmbuild -bb --target {{.ARCH}} ~/rpmbuild/SPECS/{{.NAME}}.spec
+      - cp ~/rpmbuild/RPMS/{{.ARCH}}/{{.NAME}}-{{.VERSION}}-0.{{.ARCH}}.rpm dist
+
+  dist:all:
+    desc: Build all distributable packages
+    aliases:
+      - dist
+    cmds:
+      - task: dist:archive
+      - task: dist:rpm
+
+  release:
+    desc: Publish a new release via semantic-release
+    preconditions:
+      - sh: which npx
+        msg: "Prerequisite utility 'npx' is not installed"
+    cmds:
+      - npx semantic-release
+
   docker:build:
     desc: Build the container image used for docker:run
     preconditions:
@@ -142,13 +194,15 @@ tasks:
       vars:
         - TARGET
     cmds:
-      - mkdir -p .cache/cargo
+      - mkdir -p .cache/cargo .cache/home
       - |
         docker run --rm \
           -v "{{.PWD}}:{{.PWD}}" \
           -v "{{.PWD}}/.cache/cargo:/usr/local/cargo/registry" \
+          -v "{{.PWD}}/.cache/home:/home/build" \
           --tmpfs /tmp/xdg:rw,exec,nosuid \
           -e XDG_RUNTIME_DIR=/tmp/xdg \
+          -e HOME=/home/build \
           --workdir "{{.PWD}}" \
           --user {{.UID}}:{{.GID}} \
           {{.IMAGE_NAME}}:{{.IMAGE_TAG}} \
