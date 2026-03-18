@@ -78,6 +78,12 @@ tasks:
     cmds:
       - cargo run --release -- -W {{.WIDTH}} -H {{.HEIGHT}} -- {{.APP}} {{.CLI_ARGS}}
 
+  install:
+    desc: Build release binary and install to /usr/bin
+    cmds:
+      - task: build
+      - sudo cp ./target/release/{{.NAME}} /usr/bin/
+
   clean:
     desc: Remove build artifacts
     cmds:
