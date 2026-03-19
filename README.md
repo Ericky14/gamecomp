@@ -42,6 +42,7 @@ High-level feature goals for Gamecomp. No hard dates — contributions welcome.
 - [ ] Adaptive frame pacing — algorithm complete, needs timerfd scheduling integration
 - [ ] VRR (variable refresh rate) — frame pacer support exists, needs per-connector toggle
 - [ ] Multi-plane assignment — overlay/cursor plane offload to reduce GPU work
+- [ ] Input routing — wl_seat advertised, keyboard/pointer event forwarding to focused client not yet wired
 
 ## Planned
 
