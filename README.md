@@ -54,6 +54,7 @@ High-level feature goals for Gamecomp. No hard dates — contributions welcome.
 - [ ] **Gamepad input** — evdev gamepad passthrough to client
 - [ ] **Color management** — ICC/LUT loading, color-blind filters
 - [ ] **Touch input** — touchscreen support for handheld devices
+- [ ] **Multi-display** — span or mirror across multiple connected outputs
 
 ## Building
 
