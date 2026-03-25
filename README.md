@@ -33,16 +33,19 @@ High-level feature goals for Gamecomp. No hard dates — contributions welcome.
 - [x] Vulkan compute shader composition (blit.comp + VulkanBlitter pipeline)
 - [x] Session switching — VT switch handling via libseat (Ctrl+Alt+Fn, pause/resume, fd revocation)
 - [x] Keyboard monitor — raw evdev with udev hotplug, modifier tracking, connect/disconnect support
+- [x] Pointer monitor — raw evdev with udev hotplug, motion/button/scroll, connect/disconnect support
 - [x] GBM-backed output buffer allocation (native GEM handles, no PRIME corruption)
 - [x] Async DMA-BUF implicit sync (non-blocking poll before blit)
+- [x] Input routing — keyboard, pointer, scroll forwarding to focused client (DRM evdev + nested host passthrough)
+- [x] Cursor passthrough — client cursor images forwarded to host compositor via SHM
+- [x] XKB keymap and modifier forwarding from host to clients (nested mode)
 
 ## In Progress
 
-- [ ] XWayland window management — core WM works, close/resize/title reading stubbed
+- [ ] XWayland window management — core WM works, close/resize/title reading stubbed, input focus set
 - [ ] Adaptive frame pacing — algorithm complete, needs timerfd scheduling integration
 - [ ] VRR (variable refresh rate) — frame pacer support exists, needs per-connector toggle
 - [ ] Multi-plane assignment — overlay/cursor plane offload to reduce GPU work
-- [ ] Input routing — wl_seat advertised, keyboard/pointer event forwarding to focused client not yet wired
 
 ## Planned
 
