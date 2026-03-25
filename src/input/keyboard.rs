@@ -115,10 +115,19 @@ pub fn set_nonblock(fd: RawFd) -> anyhow::Result<()> {
 }
 
 /// Action detected from keyboard input.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum KeyAction {
     /// Request VT switch to the given terminal number (1-based).
     SwitchVt(i32),
+    /// A raw key press/release for forwarding to clients.
+    Key {
+        /// Evdev key code (KEY_* from input-event-codes.h).
+        key: u32,
+        /// `true` = pressed, `false` = released.
+        pressed: bool,
+        /// Timestamp in milliseconds.
+        time_ms: u32,
+    },
 }
 
 /// Check if a udev device is a keyboard with an `/dev/input/event*` node.
@@ -397,22 +406,28 @@ impl KeyboardMonitor {
         self.devices.keys().copied().collect()
     }
 
-    /// Poll for hotplug events, read keyboard input, and execute actions.
+    /// Poll for hotplug events, read keyboard input, and handle VT switches.
     ///
-    /// Combines hotplug dispatch, event reading, and action handling
-    /// into a single call. VT switch requests are forwarded directly
-    /// to the session.
-    pub fn poll(&mut self, session: &mut crate::backend::session::Session) {
+    /// Combines hotplug dispatch, event reading, and action handling.
+    /// VT switch requests are forwarded directly to the session.
+    /// Returns raw key events for forwarding to the focused Wayland client.
+    pub fn poll(&mut self, session: &mut crate::backend::session::Session) -> Vec<KeyAction> {
         self.dispatch_hotplug(session);
-        for action in self.dispatch() {
+        let actions = self.dispatch();
+        let mut key_events = Vec::new();
+        for action in actions {
             match action {
                 KeyAction::SwitchVt(vt) => {
                     if let Err(e) = session.switch_vt(vt) {
                         warn!(?e, vt, "VT switch failed");
                     }
                 }
+                key_action @ KeyAction::Key { .. } => {
+                    key_events.push(key_action);
+                }
             }
         }
+        key_events
     }
 
     /// Read and process pending events from all keyboard devices.
@@ -446,9 +461,7 @@ impl KeyboardMonitor {
                     let event: InputEvent =
                         unsafe { std::ptr::read_unaligned(self.buf.as_ptr().add(offset).cast()) };
 
-                    if let Some(action) = self.process_event(&event) {
-                        actions.push(action);
-                    }
+                    self.process_event(&event, &mut actions);
                 }
             }
         }
@@ -456,27 +469,45 @@ impl KeyboardMonitor {
         actions
     }
 
-    /// Process a single evdev event. Returns an action if a hotkey was detected.
+    /// Process a single evdev event. Pushes actions to the output vec.
+    ///
+    /// For every key press/release, a `KeyAction::Key` is emitted for
+    /// client forwarding. If a Ctrl+Alt+Fn combo is detected on press,
+    /// a `KeyAction::SwitchVt` is also emitted.
     #[inline(always)]
-    fn process_event(&mut self, event: &InputEvent) -> Option<KeyAction> {
+    fn process_event(&mut self, event: &InputEvent, actions: &mut Vec<KeyAction>) {
         if event.type_ != EV_KEY {
-            return None;
+            return;
         }
 
         let pressed = event.value == 1; // 1 = press, 0 = release, 2 = repeat
 
-        // Update modifier tracking (press and release only, ignore repeat).
-        if event.value != 2 {
-            match event.code {
-                KEY_LEFTCTRL => self.left_ctrl = pressed,
-                KEY_RIGHTCTRL => self.right_ctrl = pressed,
-                KEY_LEFTALT => self.left_alt = pressed,
-                KEY_RIGHTALT => self.right_alt = pressed,
-                _ => {}
-            }
-            self.ctrl_held = self.left_ctrl || self.right_ctrl;
-            self.alt_held = self.left_alt || self.right_alt;
+        // Skip key-repeat events — Wayland clients handle repeat themselves.
+        if event.value == 2 {
+            return;
         }
+
+        let time_ms = (event.tv_sec as u32)
+            .wrapping_mul(1000)
+            .wrapping_add((event.tv_usec as u32) / 1000);
+
+        // Emit raw key event for forwarding to the focused client.
+        actions.push(KeyAction::Key {
+            key: event.code as u32,
+            pressed,
+            time_ms,
+        });
+
+        // Update modifier tracking.
+        match event.code {
+            KEY_LEFTCTRL => self.left_ctrl = pressed,
+            KEY_RIGHTCTRL => self.right_ctrl = pressed,
+            KEY_LEFTALT => self.left_alt = pressed,
+            KEY_RIGHTALT => self.right_alt = pressed,
+            _ => {}
+        }
+        self.ctrl_held = self.left_ctrl || self.right_ctrl;
+        self.alt_held = self.left_alt || self.right_alt;
 
         // Detect Ctrl+Alt+Fn on key press only.
         if pressed
@@ -485,10 +516,8 @@ impl KeyboardMonitor {
             && let Some(vt) = keycode_to_vt(event.code)
         {
             debug!(vt, "VT switch hotkey detected");
-            return Some(KeyAction::SwitchVt(vt));
+            actions.push(KeyAction::SwitchVt(vt));
         }
-
-        None
     }
 }
 

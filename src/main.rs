@@ -41,7 +41,8 @@ use crate::compositor::scene::FrameInfo;
 use crate::config::Config;
 use crate::frame_pacer::{FpsLimiter, FramePacer};
 use crate::input::InputHandler;
-use crate::input::keyboard::KeyboardMonitor;
+use crate::input::keyboard::{KeyAction, KeyboardMonitor};
+use crate::input::pointer::PointerMonitor;
 use crate::retry::{RetryPolicy, retry_with_backoff};
 use crate::stats::StatsTracker;
 use crate::wayland::WaylandServer;
@@ -115,11 +116,28 @@ fn run(config: Config) -> anyhow::Result<()> {
     // capture the original WAYLAND_DISPLAY before overwriting it with our own.
     let host_wayland_display = std::env::var("WAYLAND_DISPLAY").ok();
 
+    // Immediately remove WAYLAND_DISPLAY from the process env so that no
+    // library (e.g., NVIDIA Vulkan driver) accidentally opens a second
+    // connection to the host compositor. The wayland backend receives the
+    // host display via its config; child processes receive their own socket
+    // via Command::env().
+    //
+    // SAFETY: No other threads exist yet (called at the start of main before
+    // spawning any threads), so modifying the environment is safe.
+    unsafe {
+        std::env::remove_var("WAYLAND_DISPLAY");
+        std::env::remove_var("DISPLAY");
+    }
+
     // --- Initialize Wayland server ---
+    // Game resolution (-w×-h): what clients render at.
+    // Output resolution (-W×-H): the physical display or nested window size.
+    // If game resolution is unset, it falls back to the output resolution.
     let (output_w, output_h) = config.resolution.unwrap_or((1280, 720));
-    let mut wayland_server = WaylandServer::new(Vec::new(), output_w, output_h)
+    let (game_w, game_h) = config.game_resolution.unwrap_or((output_w, output_h));
+    let mut wayland_server = WaylandServer::new(Vec::new(), game_w, game_h)
         .context("failed to initialize Wayland server")?;
-    let mut wayland_state = wayland::WaylandState::new(Vec::new(), output_w, output_h);
+    let mut wayland_state = wayland::WaylandState::new(Vec::new(), game_w, game_h);
 
     // Shared host DMA-BUF format→modifier map. Written by the wayland
     // backend's event thread during its initial roundtrip, read by the
@@ -132,18 +150,17 @@ fn run(config: Config) -> anyhow::Result<()> {
     let (frame_tx, frame_rx) = std::sync::mpsc::channel::<wayland::protocols::CommittedBuffer>();
     wayland_state.frame_channel = Some(frame_tx);
 
+    // Create cursor channel: main thread → wayland backend (cursor images).
+    let (cursor_tx, cursor_rx) =
+        std::sync::mpsc::channel::<crate::backend::wayland::CursorUpdate>();
+    wayland_state.cursor_tx = Some(cursor_tx);
+
     let socket_name = wayland_server.socket_name().to_string();
     info!(socket = %socket_name, "Wayland socket ready");
 
     // Determine the XWayland display number early so we can set both
     // WAYLAND_DISPLAY and DISPLAY before spawning any threads.
     let xwayland_display = find_free_x11_display()?;
-
-    // Set environment variables for child processes.
-    // SAFETY: No other threads are reading environment variables at this point —
-    // the render thread, XWM thread, and child processes have not been spawned yet.
-    unsafe { std::env::set_var("WAYLAND_DISPLAY", &socket_name) };
-    unsafe { std::env::set_var("DISPLAY", &xwayland_display) };
 
     // --- Spawn render thread FIRST ---
     // The render thread starts the wayland backend event loop, which connects
@@ -160,6 +177,20 @@ fn run(config: Config) -> anyhow::Result<()> {
     // Ordering: Release on write, Relaxed on read — main loop polls periodically.
     let detected_refresh_mhz = Arc::new(AtomicU32::new(0));
     let detected_refresh_mhz_render = detected_refresh_mhz.clone();
+
+    // Shared atomics for host window physical size. Written by the render
+    // thread when xdg_toplevel configure events arrive, read by the main
+    // loop to advertise output resolution to clients.
+    let host_physical_width = Arc::new(AtomicU32::new(0));
+    let host_physical_height = Arc::new(AtomicU32::new(0));
+    let host_physical_width_render = host_physical_width.clone();
+    let host_physical_height_render = host_physical_height.clone();
+
+    // Channel for host input events (nested mode only). The render thread
+    // forwards keyboard/pointer events from the host compositor to the main
+    // thread so they can be sent to Wayland clients.
+    let (host_input_tx, host_input_rx) =
+        std::sync::mpsc::channel::<crate::backend::wayland::WaylandEvent>();
 
     // --- DRM path: open session and GPU device on main thread ---
     // Session management and device discovery must happen before the render
@@ -184,12 +215,17 @@ fn run(config: Config) -> anyhow::Result<()> {
             None
         };
 
-    // --- Keyboard monitor for VT switching (DRM path only) ---
+    // --- Keyboard monitor for VT switching + input forwarding (DRM path only) ---
     let mut keyboard_monitor: Option<KeyboardMonitor> = None;
+    let mut pointer_monitor: Option<PointerMonitor> = None;
     if let Some(ref mut sess) = session {
         let mut kbd = KeyboardMonitor::new();
         kbd.open_from_session(sess);
         keyboard_monitor = Some(kbd);
+
+        let mut ptr = PointerMonitor::new();
+        ptr.open_from_session(sess);
+        pointer_monitor = Some(ptr);
     }
 
     // Track session active→inactive→active transitions so we can
@@ -210,11 +246,15 @@ fn run(config: Config) -> anyhow::Result<()> {
                 &config_clone,
                 host_display_clone,
                 frame_rx,
+                cursor_rx,
                 detected_refresh_mhz_render,
                 host_dmabuf_formats_render,
                 drm_device,
                 vblank_tx,
                 session_active_flag,
+                host_physical_width_render,
+                host_physical_height_render,
+                host_input_tx,
             );
         })
         .context("failed to spawn render thread")?;
@@ -226,6 +266,18 @@ fn run(config: Config) -> anyhow::Result<()> {
     // host formats, enabling zero-copy DMA-BUF forwarding.
     if matches!(config.backend, crate::config::BackendKind::Wayland) {
         wait_for_host_formats(&host_dmabuf_formats);
+
+        // Also wait for the host window configure so we know the actual
+        // window dimensions before launching XWayland. Without this,
+        // clients start at the CLI-supplied resolution (e.g., 2560×1440)
+        // instead of the host-constrained physical dimensions, causing
+        // buffer size mismatches on the first frames.
+        wait_for_host_configure(&host_physical_width, &host_physical_height);
+        let pw = host_physical_width.load(Ordering::Acquire);
+        let ph = host_physical_height.load(Ordering::Acquire);
+        if pw > 0 && ph > 0 {
+            wayland_state.update_output_resolution(pw, ph);
+        }
     }
 
     // --- Launch XWayland ---
@@ -248,18 +300,31 @@ fn run(config: Config) -> anyhow::Result<()> {
     let xwm_display = xwayland_display.clone();
     let xwm_thread = thread::Builder::new()
         .name("gamecomp-xwm".to_string())
-        .spawn(move || {
-            let result = retry_with_backoff("XWM", &RetryPolicy::DEFAULT, &RUNNING, || {
-                wayland::xwayland::run_xwm(
-                    &xwm_display,
-                    &xwm_event_tx,
-                    &xwm_cmd_rx,
-                    output_w,
-                    output_h,
-                )
-            });
-            if let Err(e) = result {
-                error!(?e, "XWM thread exiting after exhausting retries");
+        .spawn({
+            // Use host physical dims if available, otherwise fall back to
+            // game_w/game_h. After wait_for_host_configure, the atomics
+            // should be set for the Wayland backend.
+            let xwm_w = {
+                let v = host_physical_width.load(Ordering::Acquire);
+                if v > 0 { v } else { game_w }
+            };
+            let xwm_h = {
+                let v = host_physical_height.load(Ordering::Acquire);
+                if v > 0 { v } else { game_h }
+            };
+            move || {
+                let result = retry_with_backoff("XWM", &RetryPolicy::DEFAULT, &RUNNING, || {
+                    wayland::xwayland::run_xwm(
+                        &xwm_display,
+                        &xwm_event_tx,
+                        &xwm_cmd_rx,
+                        xwm_w,
+                        xwm_h,
+                    )
+                });
+                if let Err(e) = result {
+                    error!(?e, "XWM thread exiting after exhausting retries");
+                }
             }
         })
         .context("failed to spawn XWM thread")?;
@@ -295,25 +360,101 @@ fn run(config: Config) -> anyhow::Result<()> {
             warn!(?e, "seat dispatch error");
         }
 
-        // Detect session restore (inactive → active) and re-open keyboard
+        // Detect session restore (inactive → active) and re-open input
         // devices. Logind revokes evdev fds via EVIOCREVOKE on VT switch,
         // making the old fds permanently dead. We must re-open them.
         if let Some(ref mut sess) = session {
             let is_active = sess.is_active();
             if !session_was_active && is_active {
-                info!("session restored, re-opening keyboard devices");
+                info!("session restored, re-opening input devices");
                 if let Some(ref mut kbd) = keyboard_monitor {
                     kbd.reopen_after_vt_switch(sess);
+                }
+                if let Some(ref mut ptr) = pointer_monitor {
+                    ptr.reopen_after_vt_switch(sess);
                 }
             }
             session_was_active = is_active;
         }
 
-        // Poll udev for keyboard hotplug and dispatch VT switch hotkeys.
+        // Poll keyboard: hotplug, VT switch hotkeys, and key events.
         if let Some(ref mut kbd) = keyboard_monitor
             && let Some(ref mut sess) = session
         {
-            kbd.poll(sess);
+            let key_events = kbd.poll(sess);
+            for action in key_events {
+                if let KeyAction::Key {
+                    key,
+                    pressed,
+                    time_ms,
+                } = action
+                {
+                    wayland_state.send_key(key, pressed, time_ms);
+                }
+            }
+        }
+
+        // Poll pointer: hotplug, motion, button, and scroll events.
+        if let Some(ref mut ptr) = pointer_monitor
+            && let Some(ref mut sess) = session
+        {
+            use crate::input::pointer::PointerEvent;
+            let pointer_events = ptr.poll(sess);
+            for event in pointer_events {
+                match event {
+                    PointerEvent::Motion { dx, dy, time_ms } => {
+                        wayland_state.send_pointer_motion(dx, dy, time_ms);
+                    }
+                    PointerEvent::Button(btn) => {
+                        let time_ms = (btn.time_usec / 1000) as u32;
+                        wayland_state.send_pointer_button(btn.button, btn.pressed, time_ms);
+                    }
+                    PointerEvent::Scroll(scroll) => {
+                        let time_ms = (scroll.time_usec / 1000) as u32;
+                        wayland_state.send_pointer_axis(scroll.dx, scroll.dy, time_ms);
+                    }
+                }
+            }
+        }
+
+        // Drain host input events (nested/wayland mode). The render thread
+        // forwards keyboard/pointer events from the host compositor.
+        {
+            use crate::backend::wayland::WaylandEvent;
+            let now_ms = (wayland::monotonic_ns() / 1_000_000) as u32;
+            while let Ok(event) = host_input_rx.try_recv() {
+                match event {
+                    WaylandEvent::Key { key, pressed } => {
+                        wayland_state.send_key(key, pressed, now_ms);
+                    }
+                    WaylandEvent::Modifiers {
+                        mods_depressed,
+                        mods_latched,
+                        mods_locked,
+                        group,
+                    } => {
+                        wayland_state.send_modifiers(
+                            mods_depressed,
+                            mods_latched,
+                            mods_locked,
+                            group,
+                        );
+                    }
+                    WaylandEvent::Keymap { format, fd, size } => {
+                        wayland_state.send_keymap(format, fd, size);
+                    }
+                    WaylandEvent::PointerMotion { x, y } => {
+                        wayland_state.send_pointer_motion_absolute(x, y, now_ms);
+                    }
+                    WaylandEvent::PointerButton { button, pressed } => {
+                        wayland_state.send_pointer_button(button, pressed, now_ms);
+                    }
+                    WaylandEvent::Scroll { dx, dy } => {
+                        wayland_state.send_pointer_axis(dx, dy, now_ms);
+                    }
+                    _ => {}
+                }
+            }
         }
 
         // Drain vblank timestamps from the render thread and feed them to
@@ -331,6 +472,22 @@ fn run(config: Config) -> anyhow::Result<()> {
             &mut pacer,
             &mut fps_limiter,
         );
+
+        // Propagate host window physical pixel size as our advertised output
+        // resolution. Clients may render at this size or choose their own.
+        // The wayland backend's viewport applies contain-fit scaling to
+        // fit the game buffer within the host window, preserving aspect ratio.
+        {
+            let pw = host_physical_width.load(Ordering::Acquire);
+            let ph = host_physical_height.load(Ordering::Acquire);
+            if pw > 0 && ph > 0 {
+                wayland_state.update_output_resolution(pw, ph);
+                let _ = xwm_cmd_tx.send(wayland::xwayland::XwmCommand::SetResolution {
+                    width: pw,
+                    height: ph,
+                });
+            }
+        }
 
         // Monitor XWayland and respawn if it crashed.
         monitor_xwayland(
@@ -358,6 +515,9 @@ fn run(config: Config) -> anyhow::Result<()> {
         {
             warn!(?e, "Wayland dispatch error");
         }
+
+        // Send keyboard/pointer enter to the focused surface (once).
+        wayland_state.send_focus_enter();
 
         wayland_server.flush();
 
@@ -592,6 +752,45 @@ fn wait_for_host_formats(
     }
 }
 
+/// Wait for the host compositor to send its first `xdg_toplevel.configure`
+/// so that `host_physical_width` / `host_physical_height` are non-zero.
+///
+/// Without this, XWayland and the game start with the CLI-supplied
+/// resolution instead of the host-constrained size, causing buffer
+/// dimensions to mismatch the first viewport commit.
+fn wait_for_host_configure(
+    host_physical_width: &Arc<AtomicU32>,
+    host_physical_height: &Arc<AtomicU32>,
+) {
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
+    info!("waiting for host window configure before launching XWayland");
+
+    let start = std::time::Instant::now();
+    loop {
+        let pw = host_physical_width.load(Ordering::Acquire);
+        let ph = host_physical_height.load(Ordering::Acquire);
+        if pw > 0 && ph > 0 {
+            info!(
+                physical_w = pw,
+                physical_h = ph,
+                elapsed_ms = start.elapsed().as_millis(),
+                "host configure received, proceeding with XWayland launch"
+            );
+            return;
+        }
+        if start.elapsed() >= TIMEOUT {
+            warn!(
+                "timeout waiting for host configure — \
+                 XWayland will start with CLI resolution"
+            );
+            return;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
 // ─── XWayland management ────────────────────────────────────────────
 
 /// Find a free X11 display number and return the display string (e.g., ":1").
@@ -706,11 +905,15 @@ fn render_thread_main(
     config: &Config,
     host_wayland_display: Option<String>,
     committed_frames: std::sync::mpsc::Receiver<wayland::protocols::CommittedBuffer>,
+    cursor_updates: std::sync::mpsc::Receiver<crate::backend::wayland::CursorUpdate>,
     detected_refresh_mhz: Arc<AtomicU32>,
     host_dmabuf_formats: Arc<parking_lot::Mutex<std::collections::HashMap<u32, Vec<u64>>>>,
     drm_device: Option<(std::path::PathBuf, std::os::unix::io::OwnedFd)>,
     vblank_tx: std::sync::mpsc::Sender<u64>,
     session_active: Option<Arc<AtomicBool>>,
+    host_physical_width: Arc<AtomicU32>,
+    host_physical_height: Arc<AtomicU32>,
+    host_input_tx: std::sync::mpsc::Sender<crate::backend::wayland::WaylandEvent>,
 ) {
     info!("render thread started");
 
@@ -733,12 +936,14 @@ fn render_thread_main(
     let mut _backend: Option<crate::backend::wayland::WaylandBackend> = None;
     let mut _drm_backend: Option<crate::backend::drm::DrmBackend> = None;
     let mut committed_frames = Some(committed_frames);
+    let mut cursor_updates = Some(cursor_updates);
 
     match config.backend {
         crate::config::BackendKind::Wayland => {
             let mut wayland_config = config.to_wayland_config();
             wayland_config.host_wayland_display = host_wayland_display;
             wayland_config.committed_frame_rx = committed_frames.take();
+            wayland_config.cursor_rx = cursor_updates.take();
             wayland_config.detected_refresh_mhz = detected_refresh_mhz;
             wayland_config.host_dmabuf_formats = host_dmabuf_formats;
             let mut backend = crate::backend::wayland::WaylandBackend::new(wayland_config);
@@ -797,12 +1002,40 @@ fn render_thread_main(
 
     // Wayland / headless: monitor the backend until shutdown.
     while RUNNING.load(Ordering::Relaxed) {
-        if let Some(ref backend) = _backend
-            && !backend.is_alive()
-        {
-            info!("wayland backend closed, initiating shutdown");
-            RUNNING.store(false, Ordering::Relaxed);
-            break;
+        if let Some(ref mut backend) = _backend {
+            if !backend.is_alive() {
+                info!("wayland backend closed, initiating shutdown");
+                RUNNING.store(false, Ordering::Relaxed);
+                break;
+            }
+            // Drain events and publish host window size changes to the main
+            // thread so it can update the Wayland output resolution.
+            // Forward input events so they reach Wayland clients.
+            for event in backend.drain_events() {
+                match event {
+                    crate::backend::wayland::WaylandEvent::Resized {
+                        width: _,
+                        height: _,
+                        physical_width,
+                        physical_height,
+                    } => {
+                        host_physical_width.store(physical_width, Ordering::Release);
+                        host_physical_height.store(physical_height, Ordering::Release);
+                    }
+                    crate::backend::wayland::WaylandEvent::FrameCallback => {
+                        // Handled by the backend internally.
+                    }
+                    crate::backend::wayland::WaylandEvent::CloseRequested => {
+                        // Handled by is_alive() check above.
+                    }
+                    other => {
+                        // Forward all input events (Key, Modifiers, Keymap,
+                        // PointerMotion, PointerButton, Scroll, FocusIn,
+                        // FocusOut) to the main thread.
+                        let _ = host_input_tx.send(other);
+                    }
+                }
+            }
         }
         std::thread::sleep(std::time::Duration::from_millis(16));
     }
@@ -974,8 +1207,7 @@ fn run_drm_event_loop(
         // Instead of blocking inside blit() waiting for the client's GPU
         // to finish, we do a non-blocking poll(0) here. If the buffer
         // isn't ready yet, we defer it to the next event loop iteration
-        // (calloop re-dispatches every 16ms). This matches gamescope's
-        // epoll-based approach but without the multi-fd complexity.
+        // (calloop re-dispatches every 16ms).
         //
         // Fast path (>99% of frames): client GPU finished before commit
         //   → poll(0) returns instantly → blit + present on this iteration.
@@ -1133,7 +1365,7 @@ fn present_committed_buffer(
                 .context("Vulkan blit failed")?;
 
             // Use the pre-created DRM framebuffer for this output image.
-            // FBs were created at startup (matching gamescope's approach),
+            // FBs were created at startup,
             // so we just look up by buffer index.
             let out_fb = output_fb_cache[exported.buffer_index]
                 .as_ref()

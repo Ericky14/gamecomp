@@ -21,10 +21,11 @@ mod seat;
 mod shm;
 mod subcompositor;
 pub mod wl_drm;
-mod xdg_shell;
+pub mod xdg_shell;
 
 use parking_lot::Mutex;
 use std::os::unix::io::{AsFd, OwnedFd};
+use std::sync::atomic::{AtomicBool, AtomicI32};
 
 use tracing::{debug, info};
 use wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1;
@@ -57,6 +58,14 @@ pub struct SurfaceData {
     /// on user data. This is only accessed from the main thread so the lock
     /// is uncontended.
     pub attached_buffer: Mutex<Option<WlBuffer>>,
+    /// `true` if this surface has the cursor role (set via
+    /// `wl_pointer.set_cursor`). Cursor surfaces must not be staged
+    /// as application frames.
+    pub is_cursor: AtomicBool,
+    /// Cursor hotspot X, set by `wl_pointer.set_cursor`.
+    pub hotspot_x: AtomicI32,
+    /// Cursor hotspot Y, set by `wl_pointer.set_cursor`.
+    pub hotspot_y: AtomicI32,
 }
 
 /// Wrapper enum for `WlBuffer` user data — either SHM or DMA-BUF.

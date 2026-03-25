@@ -740,8 +740,7 @@ impl Backend for DrmBackend {
         // Decide FB creation path based on modifier.
         //
         // DRM_FORMAT_MOD_INVALID: Use the legacy path (drmModeAddFB2 without
-        //   DRM_MODE_FB_MODIFIERS). This is for VK_IMAGE_TILING_LINEAR exports
-        //   matching gamescope's fallback approach. The buffer's memory layout
+        //   DRM_MODE_FB_MODIFIERS). The buffer's memory layout
         //   is row-major linear, which the legacy path expects.
         //
         // Any concrete modifier (including LINEAR=0): Use the modifier-aware
@@ -825,8 +824,7 @@ impl Backend for DrmBackend {
 
         // Close GEM handles immediately after FB creation — the kernel's
         // framebuffer object internally holds a reference to the GEM
-        // objects, keeping the backing memory alive. This matches
-        // gamescope's drm_fbid_from_dmabuf() approach exactly.
+        // objects, keeping the backing memory alive.
         for gem in gem_handles.iter().filter_map(|h| *h) {
             // Deduplicate: GEM handles aren't ref-counted per the kernel
             // API. Two DMA-BUFs may return the same handle, and we must

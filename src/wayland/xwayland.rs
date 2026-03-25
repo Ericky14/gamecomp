@@ -229,12 +229,34 @@ pub fn run_xwm(
 
     info!("XWM registered as window manager with atom support");
 
+    // Mutable output dimensions — updated via SetResolution commands
+    // when the host window resizes.
+    let mut output_width = output_width;
+    let mut output_height = output_height;
+
     // Event loop.
-    while let ControlFlow::Continue = process_command(cmd_rx, &conn, root, &atoms, &mut tracker) {
+    while let ControlFlow::Continue = process_command(
+        cmd_rx,
+        &conn,
+        root,
+        &atoms,
+        &mut tracker,
+        &mut output_width,
+        &mut output_height,
+    ) {
         // --- Poll for X11 events (non-blocking) ---
         match conn.poll_for_event() {
             Ok(Some(event)) => {
-                handle_x11_event(&conn, &atoms, &mut tracker, event_tx, root, event);
+                handle_x11_event(
+                    &conn,
+                    &atoms,
+                    &mut tracker,
+                    event_tx,
+                    root,
+                    event,
+                    output_width,
+                    output_height,
+                );
             }
             Ok(None) => {
                 // No events pending. Brief sleep to avoid busy-waiting.
@@ -285,6 +307,8 @@ fn process_command<C: Connection>(
     root: u32,
     atoms: &Atoms,
     tracker: &mut WindowTracker,
+    output_width: &mut u32,
+    output_height: &mut u32,
 ) -> ControlFlow {
     use x11rb::protocol::xproto::{AtomEnum, PropMode};
     match cmd_rx.try_recv() {
@@ -293,8 +317,21 @@ fn process_command<C: Connection>(
             return ControlFlow::Break;
         }
         Ok(XwmCommand::SetResolution { width, height }) => {
-            debug!(width, height, "XWM: resolution change requested");
-            // TODO: Use RANDR to resize the root window.
+            if width != *output_width || height != *output_height {
+                info!(
+                    old_w = *output_width,
+                    old_h = *output_height,
+                    new_w = width,
+                    new_h = height,
+                    "XWM: output resolution changed"
+                );
+                *output_width = width;
+                *output_height = height;
+
+                // Do NOT reconfigure existing windows.
+                // Clients choose their own resolution. The compositor
+                // handles contain-fit viewport scaling at present time.
+            }
         }
         Ok(XwmCommand::CloseWindow { window_id }) => {
             debug!(window_id, "XWM: close window requested");
@@ -336,6 +373,7 @@ fn process_command<C: Connection>(
 }
 
 /// Handle a single X11 event — map, unmap, destroy, configure, or property change.
+#[allow(clippy::too_many_arguments)]
 fn handle_x11_event<C: Connection>(
     conn: &C,
     atoms: &Atoms,
@@ -343,6 +381,8 @@ fn handle_x11_event<C: Connection>(
     event_tx: &calloop::channel::Sender<XwmEvent>,
     root: u32,
     event: x11rb::protocol::Event,
+    output_width: u32,
+    output_height: u32,
 ) {
     use x11rb::protocol::xproto::{
         ChangeWindowAttributesAux, ConfigureWindowAux, ConnectionExt, EventMask,
@@ -362,18 +402,23 @@ fn handle_x11_event<C: Connection>(
                 ),
             );
 
-            // Map the window at the client's requested size.
+            // Do NOT force-configure the window to
+            // fill the output. Let the client render at whatever size it
+            // chooses. The compositor handles viewport scaling (contain-fit)
+            // at present time. Clients that want fullscreen will go fullscreen
+            // at one of the advertised XRandR resolutions.
+            // Map the window as-is.
             let _ = conn.map_window(e.window);
             let _ = conn.flush();
 
-            // Read geometry.
-            let (w, h) = match conn.get_geometry(e.window) {
-                Ok(cookie) => match cookie.reply() {
-                    Ok(geo) => (geo.width as u32, geo.height as u32),
-                    Err(_) => (0, 0),
-                },
-                Err(_) => (0, 0),
-            };
+            // Read current geometry for tracking.
+            let geom = conn
+                .get_geometry(e.window)
+                .ok()
+                .and_then(|c| c.reply().ok());
+            let (w, h) = geom.map_or((output_width, output_height), |g| {
+                (g.width as u32, g.height as u32)
+            });
 
             // Read initial properties for classification.
             let role = classify_window(conn, atoms, e.window);
@@ -458,7 +503,8 @@ fn handle_x11_event<C: Connection>(
     }
 }
 
-/// Write focus feedback atoms to the root window and notify the main thread.
+/// Write focus feedback atoms to the root window, set X11 input focus,
+/// and notify the main thread.
 fn publish_focus_feedback<C: Connection>(
     conn: &C,
     root: u32,
@@ -466,9 +512,16 @@ fn publish_focus_feedback<C: Connection>(
     tracker: &WindowTracker,
     event_tx: &calloop::channel::Sender<XwmEvent>,
 ) {
-    use x11rb::protocol::xproto::{AtomEnum, PropMode};
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt, InputFocus, PropMode};
     let focus = *tracker.focus();
     debug!(?focus, "focus changed");
+
+    // Set X11 input focus so XWayland forwards keyboard events to the
+    // focused window. Without this, key events are discarded.
+    let focus_target = focus.overlay.or(focus.app);
+    if let Some(win_id) = focus_target {
+        let _ = conn.set_input_focus(InputFocus::NONE, win_id, x11rb::CURRENT_TIME);
+    }
 
     let _ = conn.change_property32(
         PropMode::REPLACE,

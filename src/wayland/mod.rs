@@ -23,9 +23,16 @@ use std::os::unix::io::RawFd;
 use anyhow::Context;
 use tracing::info;
 use wayland_server::protocol::wl_callback::WlCallback;
-use wayland_server::{Display, ListeningSocket};
+use wayland_server::protocol::wl_keyboard::WlKeyboard;
+use wayland_server::protocol::wl_output::WlOutput;
+use wayland_server::protocol::wl_pointer::{self, WlPointer};
+use wayland_server::protocol::wl_surface::WlSurface;
+use wayland_server::{Display, ListeningSocket, Resource};
+
+use wayland_protocols::xdg::shell::server::xdg_toplevel::XdgToplevel;
 
 use crate::backend::ConnectorInfo;
+use crate::backend::wayland::CursorUpdate;
 use crate::wayland::protocols::CommittedBuffer;
 
 /// Per-client data stored with each Wayland client connection.
@@ -108,6 +115,26 @@ pub struct WaylandState {
     /// module to advertise formats that allow zero-copy forwarding to the host.
     pub host_dmabuf_formats:
         std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<u32, Vec<u64>>>>,
+    /// Client's `wl_keyboard` objects — used to forward key events.
+    pub keyboards: Vec<WlKeyboard>,
+    /// Client's `wl_pointer` objects — used to forward pointer events.
+    pub pointers: Vec<WlPointer>,
+    /// All client surfaces — used for focus enter/leave events.
+    /// Multiple clients (XWayland, Flutter) may each create a surface.
+    pub client_surfaces: Vec<WlSurface>,
+    /// Surfaces that have an xdg_toplevel role. Used preferentially for
+    /// focus enter — cursor and subsurfaces are ignored.
+    pub toplevel_surfaces: Vec<WlSurface>,
+    /// Client IDs that have already received `wl_keyboard.enter`.
+    pub keyboard_entered_clients: std::collections::HashSet<wayland_server::backend::ClientId>,
+    /// Client IDs that have already received `wl_pointer.enter`.
+    pub pointer_entered_clients: std::collections::HashSet<wayland_server::backend::ClientId>,
+    /// Bound `wl_output` objects — used to send mode updates on resize.
+    pub bound_outputs: Vec<WlOutput>,
+    /// Active `xdg_toplevel` objects — used to re-configure on output resize.
+    pub toplevels: Vec<XdgToplevel>,
+    /// Channel to send cursor image updates to the host compositor thread.
+    pub cursor_tx: Option<std::sync::mpsc::Sender<CursorUpdate>>,
 }
 
 impl WaylandState {
@@ -131,6 +158,15 @@ impl WaylandState {
             host_dmabuf_formats: std::sync::Arc::new(parking_lot::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            keyboards: Vec::new(),
+            pointers: Vec::new(),
+            client_surfaces: Vec::new(),
+            toplevel_surfaces: Vec::new(),
+            keyboard_entered_clients: std::collections::HashSet::new(),
+            pointer_entered_clients: std::collections::HashSet::new(),
+            bound_outputs: Vec::new(),
+            toplevels: Vec::new(),
+            cursor_tx: None,
         }
     }
 
@@ -138,6 +174,49 @@ impl WaylandState {
     #[inline(always)]
     pub fn output_resolution(&self) -> (u32, u32) {
         (self.output_width, self.output_height)
+    }
+
+    /// Update the advertised output resolution and notify bound clients.
+    ///
+    /// Sends updated `wl_output.mode` + `wl_output.done` to all bound
+    /// output objects so clients re-configure at the new size.
+    pub fn update_output_resolution(&mut self, width: u32, height: u32) {
+        if width == self.output_width && height == self.output_height {
+            return;
+        }
+        info!(
+            old_w = self.output_width,
+            old_h = self.output_height,
+            new_w = width,
+            new_h = height,
+            "updating Wayland output resolution"
+        );
+        self.output_width = width;
+        self.output_height = height;
+
+        // Notify all bound wl_output objects.
+        self.bound_outputs.retain(|o| o.is_alive());
+        for output in &self.bound_outputs {
+            output.mode(
+                wayland_server::protocol::wl_output::Mode::Current
+                    | wayland_server::protocol::wl_output::Mode::Preferred,
+                width as i32,
+                height as i32,
+                60_000,
+            );
+            output.done();
+        }
+
+        // Re-configure all toplevels so clients resize their buffers.
+        self.toplevels.retain(|t| t.is_alive());
+        let states = protocols::xdg_shell::activated_fullscreen_states();
+        let serial = self.next_serial();
+        for toplevel in &self.toplevels {
+            toplevel.configure(width as i32, height as i32, states.clone());
+            if let Some(td) = toplevel.data::<protocols::xdg_shell::XdgToplevelData>() {
+                td.xdg_surface.configure(serial);
+            }
+        }
     }
 
     /// Get the next serial number for protocol events.
@@ -207,6 +286,245 @@ impl WaylandState {
     pub fn release_all_buffers(&mut self) {
         for buf in self.held_buffers.drain(..) {
             buf.release();
+        }
+    }
+
+    /// Send keyboard and pointer enter events to each client's own surface.
+    ///
+    /// Called every main loop iteration. For each keyboard/pointer, finds the
+    /// surface belonging to the same Wayland client and sends enter if not
+    /// already sent. Prefers toplevel surfaces (xdg_toplevel role) so that
+    /// native Wayland clients like Flutter/GTK receive enter on the correct
+    /// window surface rather than a cursor or subsurface.
+    pub fn send_focus_enter(&mut self) {
+        if self.client_surfaces.is_empty() && self.toplevel_surfaces.is_empty() {
+            return;
+        }
+
+        // Clean up dead surfaces.
+        self.client_surfaces.retain(|s| s.is_alive());
+        self.toplevel_surfaces.retain(|s| s.is_alive());
+
+        // Helper: find the best surface for a client. Prefer toplevel
+        // surfaces; fall back to client_surfaces (bare surfaces from
+        // XWayland that never create an xdg_toplevel).
+        let find_surface =
+            |cid: &wayland_server::backend::ClientId, toplevel: &[WlSurface]| -> Option<usize> {
+                // First try toplevel_surfaces.
+                for (i, s) in toplevel.iter().enumerate() {
+                    if s.client().map(|c| c.id()).as_ref() == Some(cid) {
+                        // Return a sentinel: index >= toplevel.len() not needed,
+                        // we'll use a tag to distinguish.
+                        return Some(i);
+                    }
+                }
+                None
+            };
+
+        // ── Keyboard enters ────────────────────────────────────────
+        // (keyboard_index, surface_ref) where surface_ref encodes
+        // which list the surface is in: true=toplevel, false=client.
+        let mut kb_enters: Vec<(usize, usize, bool)> = Vec::new();
+        for (ki, kb) in self.keyboards.iter().enumerate() {
+            if !kb.is_alive() {
+                continue;
+            }
+            let Some(kb_client) = kb.client() else {
+                continue;
+            };
+            let kb_cid = kb_client.id();
+            if self.keyboard_entered_clients.contains(&kb_cid) {
+                continue;
+            }
+            if let Some(si) = find_surface(&kb_cid, &self.toplevel_surfaces) {
+                kb_enters.push((ki, si, true));
+            } else {
+                // Fall back to client_surfaces (XWayland).
+                for (si, surface) in self.client_surfaces.iter().enumerate() {
+                    if surface.client().map(|c| c.id()) == Some(kb_cid.clone()) {
+                        kb_enters.push((ki, si, false));
+                        break;
+                    }
+                }
+            }
+        }
+
+        for (ki, si, is_toplevel) in &kb_enters {
+            let serial = self.next_serial();
+            let surface = if *is_toplevel {
+                &self.toplevel_surfaces[*si]
+            } else {
+                &self.client_surfaces[*si]
+            };
+            let kb = &self.keyboards[*ki];
+            kb.enter(serial, surface, vec![]);
+            if let Some(c) = kb.client() {
+                self.keyboard_entered_clients.insert(c.id());
+            }
+        }
+
+        // ── Pointer enters ─────────────────────────────────────────
+        let mut ptr_enters: Vec<(usize, usize, bool)> = Vec::new();
+        for (pi, ptr) in self.pointers.iter().enumerate() {
+            if !ptr.is_alive() {
+                continue;
+            }
+            let Some(ptr_client) = ptr.client() else {
+                continue;
+            };
+            let ptr_cid = ptr_client.id();
+            if self.pointer_entered_clients.contains(&ptr_cid) {
+                continue;
+            }
+            if let Some(si) = find_surface(&ptr_cid, &self.toplevel_surfaces) {
+                ptr_enters.push((pi, si, true));
+            } else {
+                for (si, surface) in self.client_surfaces.iter().enumerate() {
+                    if surface.client().map(|c| c.id()) == Some(ptr_cid.clone()) {
+                        ptr_enters.push((pi, si, false));
+                        break;
+                    }
+                }
+            }
+        }
+
+        let cx = (self.output_width as f64) / 2.0;
+        let cy = (self.output_height as f64) / 2.0;
+        for (pi, si, is_toplevel) in &ptr_enters {
+            let serial = self.next_serial();
+            let surface = if *is_toplevel {
+                &self.toplevel_surfaces[*si]
+            } else {
+                &self.client_surfaces[*si]
+            };
+            let ptr = &self.pointers[*pi];
+            ptr.enter(serial, surface, cx, cy);
+            ptr.frame();
+            if let Some(c) = ptr.client() {
+                self.pointer_entered_clients.insert(c.id());
+            }
+        }
+    }
+
+    /// Forward a keyboard key event to the focused client.
+    ///
+    /// `key` is the raw Linux evdev keycode. The Wayland `wl_keyboard.key`
+    /// event sends evdev keycodes directly — the XKB keymap handles the
+    /// evdev→keysym translation on the client side.
+    pub fn send_key(&mut self, key: u32, pressed: bool, time_ms: u32) {
+        let serial = self.next_serial();
+        let state = if pressed {
+            wayland_server::protocol::wl_keyboard::KeyState::Pressed
+        } else {
+            wayland_server::protocol::wl_keyboard::KeyState::Released
+        };
+        for kb in &self.keyboards {
+            if kb.is_alive() {
+                kb.key(serial, time_ms, key, state);
+            }
+        }
+    }
+
+    /// Forward keyboard modifier state to the focused client.
+    ///
+    /// Must be sent after keymap and after key events that change
+    /// modifier state (Shift, Ctrl, Alt, etc.).
+    pub fn send_modifiers(
+        &mut self,
+        mods_depressed: u32,
+        mods_latched: u32,
+        mods_locked: u32,
+        group: u32,
+    ) {
+        let serial = self.next_serial();
+        for kb in &self.keyboards {
+            if kb.is_alive() {
+                kb.modifiers(serial, mods_depressed, mods_latched, mods_locked, group);
+            }
+        }
+    }
+
+    /// Forward an XKB keymap to the focused client.
+    ///
+    /// Sends `wl_keyboard.keymap` with the given format, fd, and size.
+    /// Used in nested mode to forward the host compositor's keymap
+    /// instead of a hardcoded one.
+    pub fn send_keymap(&mut self, format: u32, fd: std::os::unix::io::OwnedFd, size: u32) {
+        use std::os::unix::io::AsFd;
+        use wayland_server::protocol::wl_keyboard::KeymapFormat;
+        let fmt = if format == 1 {
+            KeymapFormat::XkbV1
+        } else {
+            KeymapFormat::NoKeymap
+        };
+        for kb in &self.keyboards {
+            if kb.is_alive() {
+                kb.keymap(fmt, fd.as_fd(), size);
+            }
+        }
+    }
+
+    /// Forward a pointer motion event to the focused client.
+    ///
+    /// Accumulates relative deltas (DRM mode evdev). Tracks position in
+    /// output space, clamped to `output_width × output_height`.
+    pub fn send_pointer_motion(&mut self, dx: f64, dy: f64, time_ms: u32) {
+        self.pointer_x = (self.pointer_x + dx).clamp(0.0, self.output_width as f64 - 1.0);
+        self.pointer_y = (self.pointer_y + dy).clamp(0.0, self.output_height as f64 - 1.0);
+        for ptr in &self.pointers {
+            if ptr.is_alive() {
+                ptr.motion(time_ms, self.pointer_x, self.pointer_y);
+                ptr.frame();
+            }
+        }
+    }
+
+    /// Forward an absolute pointer position to the focused client.
+    ///
+    /// Used in nested mode where the host backend has already mapped
+    /// host surface-local coordinates to client buffer coordinates.
+    /// Coordinates are clamped to `output_width × output_height`.
+    pub fn send_pointer_motion_absolute(&mut self, x: f64, y: f64, time_ms: u32) {
+        let w = self.output_width.max(1) as f64;
+        let h = self.output_height.max(1) as f64;
+        self.pointer_x = x.clamp(0.0, w - 1.0);
+        self.pointer_y = y.clamp(0.0, h - 1.0);
+        for ptr in &self.pointers {
+            if ptr.is_alive() {
+                ptr.motion(time_ms, self.pointer_x, self.pointer_y);
+                ptr.frame();
+            }
+        }
+    }
+
+    /// Forward a pointer button event to the focused client.
+    pub fn send_pointer_button(&mut self, button: u32, pressed: bool, time_ms: u32) {
+        let serial = self.next_serial();
+        let state = if pressed {
+            wl_pointer::ButtonState::Pressed
+        } else {
+            wl_pointer::ButtonState::Released
+        };
+        for ptr in &self.pointers {
+            if ptr.is_alive() {
+                ptr.button(serial, time_ms, button, state);
+                ptr.frame();
+            }
+        }
+    }
+
+    /// Forward a scroll event to the focused client.
+    pub fn send_pointer_axis(&mut self, dx: f64, dy: f64, time_ms: u32) {
+        for ptr in &self.pointers {
+            if ptr.is_alive() {
+                if dy.abs() > f64::EPSILON {
+                    ptr.axis(time_ms, wl_pointer::Axis::VerticalScroll, dy);
+                }
+                if dx.abs() > f64::EPSILON {
+                    ptr.axis(time_ms, wl_pointer::Axis::HorizontalScroll, dx);
+                }
+                ptr.frame();
+            }
         }
     }
 }

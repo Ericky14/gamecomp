@@ -7,8 +7,9 @@ use wayland_server::protocol::{
     wl_pointer::{self, WlPointer},
     wl_seat::{self, WlSeat},
 };
-use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New};
+use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource};
 
+use super::SurfaceData;
 use crate::wayland::WaylandState;
 
 impl GlobalDispatch<WlSeat, ()> for WaylandState {
@@ -28,7 +29,7 @@ impl GlobalDispatch<WlSeat, ()> for WaylandState {
 
 impl Dispatch<WlSeat, ()> for WaylandState {
     fn request(
-        _state: &mut Self,
+        state: &mut Self,
         _client: &Client,
         _seat: &WlSeat,
         request: wl_seat::Request,
@@ -38,7 +39,8 @@ impl Dispatch<WlSeat, ()> for WaylandState {
     ) {
         match request {
             wl_seat::Request::GetPointer { id } => {
-                data_init.init(id, ());
+                let ptr = data_init.init(id, ());
+                state.pointers.push(ptr);
             }
             wl_seat::Request::GetKeyboard { id } => {
                 let kb = data_init.init(id, ());
@@ -79,6 +81,13 @@ impl Dispatch<WlSeat, ()> for WaylandState {
                         kb.keymap(wl_keyboard::KeymapFormat::XkbV1, fd.as_fd(), size as u32);
                     }
                 }
+                // XWayland requires an initial modifiers event after the keymap.
+                let serial = state.next_serial();
+                kb.modifiers(serial, 0, 0, 0, 0);
+                // GTK4/Flutter need repeat_info to initialise keyboard handling;
+                // without it GTK falls back to GSettings and hits a fatal GLib error.
+                kb.repeat_info(25, 600);
+                state.keyboards.push(kb);
             }
             wl_seat::Request::GetTouch { id } => {
                 data_init.init(id, ());
@@ -91,15 +100,40 @@ impl Dispatch<WlSeat, ()> for WaylandState {
 
 impl Dispatch<WlPointer, ()> for WaylandState {
     fn request(
-        _state: &mut Self,
+        state: &mut Self,
         _client: &Client,
         _resource: &WlPointer,
-        _request: wl_pointer::Request,
+        request: wl_pointer::Request,
         _data: &(),
         _dh: &DisplayHandle,
         _data_init: &mut DataInit<'_, Self>,
     ) {
-        // Handle SetCursor, Release.
+        match request {
+            wl_pointer::Request::SetCursor {
+                surface,
+                hotspot_x,
+                hotspot_y,
+                ..
+            } => {
+                if let Some(ref s) = surface {
+                    if let Some(sd) = s.data::<SurfaceData>() {
+                        sd.is_cursor
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        sd.hotspot_x
+                            .store(hotspot_x, std::sync::atomic::Ordering::Relaxed);
+                        sd.hotspot_y
+                            .store(hotspot_y, std::sync::atomic::Ordering::Relaxed);
+                    }
+                } else {
+                    // surface=None means hide cursor.
+                    if let Some(ref tx) = state.cursor_tx {
+                        let _ = tx.send(crate::backend::wayland::CursorUpdate::Hide);
+                    }
+                }
+            }
+            wl_pointer::Request::Release => {}
+            _ => {}
+        }
     }
 }
 

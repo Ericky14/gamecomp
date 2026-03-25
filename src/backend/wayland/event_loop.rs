@@ -12,18 +12,19 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use anyhow::Context;
 use tracing::{debug, info, trace, warn};
 use wayland_client::protocol::wl_buffer::WlBuffer;
-use wayland_client::protocol::wl_subsurface::WlSubsurface;
+
+use wayland_client::protocol::wl_subsurface;
 use wayland_client::protocol::{wl_shm, wl_shm_pool, wl_surface};
 use wayland_client::{Connection, EventQueue, QueueHandle};
 use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_buffer_params_v1;
 use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1;
 use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
-use wayland_protocols::xdg::decoration::zv1::client::zxdg_toplevel_decoration_v1;
 
 use super::WaylandEvent;
 use super::host_state::HostState;
 use crate::backend::BackendError;
 use crate::backend::gpu::vulkan_blitter::VulkanBlitter;
+use crate::backend::wayland::CursorUpdate;
 use crate::wayland::protocols::{CommittedBuffer, CommittedDmaBufPlane};
 
 /// Parameters for the host compositor event loop thread.
@@ -35,62 +36,27 @@ pub(super) struct HostLoopParams {
     pub title: String,
     pub host_display: Option<String>,
     pub committed_rx: Option<std::sync::mpsc::Receiver<CommittedBuffer>>,
+    pub cursor_rx: Option<std::sync::mpsc::Receiver<CursorUpdate>>,
     pub detected_refresh_mhz: Arc<AtomicU32>,
     pub host_dmabuf_formats: Arc<parking_lot::Mutex<std::collections::HashMap<u32, Vec<u64>>>>,
 }
 
-// ── Scaling helpers ─────────────────────────────────────────────────────────
-
-/// Largest rectangle preserving `src` aspect ratio that fits in `dst`.
-/// Uses integer cross-multiplication to avoid floating-point.
-#[inline(always)]
-fn aspect_fit(src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> (u32, u32) {
-    if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
-        return (dst_w, dst_h);
-    }
-    if src_w == dst_w && src_h == dst_h {
-        return (dst_w, dst_h);
-    }
-    let lhs = (src_w as u64) * (dst_h as u64);
-    let rhs = (src_h as u64) * (dst_w as u64);
-    if lhs > rhs {
-        let fit_h = ((dst_w as u64) * (src_h as u64) / (src_w as u64)) as u32;
-        (dst_w, fit_h.max(1))
-    } else {
-        let fit_w = ((dst_h as u64) * (src_w as u64) / (src_h as u64)) as u32;
-        (fit_w.max(1), dst_h)
-    }
-}
-
 // ── Surface bundle ──────────────────────────────────────────────────────────
 
-/// Parent + game subsurface and their viewports.
-///
-/// Layout: parent surface (black SHM background) fills the window,
-/// game subsurface is viewport-scaled to aspect-fit within it.
+/// - **Parent surface**: xdg_toplevel with a 1×1 black buffer stretched via
+///   viewport to fill the window. Acts as a black letterbox background.
+///   Receives decorations, configure events, and fractional scale.
+/// - **Game subsurface**: child subsurface in sync mode. Game DMA-BUF buffers
+///   are attached here with a viewport using contain-fit scaling:
+///   `set_source(0,0,buf_w,buf_h)` → `set_destination(fit_w, fit_h)` where
+///   `(fit_w, fit_h)` preserves the buffer's aspect ratio within the window.
+///   The subsurface is positioned at `(off_x, off_y)` to center the content.
 struct Surfaces {
     parent: wl_surface::WlSurface,
     parent_viewport: Option<WpViewport>,
-    game: wl_surface::WlSurface,
-    game_sub: WlSubsurface,
+    game_surface: wl_surface::WlSurface,
     game_viewport: Option<WpViewport>,
-}
-
-impl Surfaces {
-    /// Set game subsurface viewport + position for aspect-fit letterboxing.
-    #[inline(always)]
-    fn position_game(&self, buf_w: u32, buf_h: u32, win_w: u32, win_h: u32) {
-        let (fit_w, fit_h) = aspect_fit(buf_w, buf_h, win_w, win_h);
-        let off_x = (win_w.saturating_sub(fit_w)) / 2;
-        let off_y = (win_h.saturating_sub(fit_h)) / 2;
-
-        self.game.set_buffer_scale(1);
-        if let Some(ref gvp) = self.game_viewport {
-            gvp.set_source(0.0, 0.0, buf_w as f64, buf_h as f64);
-            gvp.set_destination(fit_w as i32, fit_h as i32);
-        }
-        self.game_sub.set_position(off_x as i32, off_y as i32);
-    }
+    game_subsurface: wl_subsurface::WlSubsurface,
 }
 
 // ── Presentation state ──────────────────────────────────────────────────────
@@ -100,8 +66,14 @@ impl Surfaces {
 struct PresentState {
     logical_w: u32,
     logical_h: u32,
+    /// Window size in physical pixels (logical × frac_scale / 120).
+    /// We blit to this size so the host compositor only sees a buffer matching its window.
+    physical_w: u32,
+    physical_h: u32,
     prev_w: u32,
     prev_h: u32,
+    /// Fractional scale factor (denominator 120). 120 = 1×, 210 = 1.75×.
+    fractional_scale: u32,
     force_blit: bool,
     vulkan_blitter: Option<VulkanBlitter>,
     blitter_width: u32,
@@ -113,20 +85,45 @@ struct PresentState {
     present_count: u64,
 }
 
+/// Convert logical coordinates to physical pixels using the fractional scale factor (denominator 120).
+///   physical = logical * fractional_scale / 120   (floor)
+#[inline(always)]
+fn scale_to_physical(logical: u32, frac_scale: u32) -> u32 {
+    let frac = frac_scale.max(120) as u64;
+    ((logical as u64 * frac) / 120) as u32
+}
+
+/// Contain-mode fit: uniformly scale `(src_w, src_h)` to fit within
+/// `(dst_w, dst_h)` while preserving aspect ratio (no crop, no stretch).
+/// Returns `(fit_w, fit_h, offset_x, offset_y)` in the same coordinate
+/// space as the destination.
+#[inline(always)]
+fn contain_fit(src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> (u32, u32, i32, i32) {
+    if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
+        return (dst_w, dst_h, 0, 0);
+    }
+    let scale_x = dst_w as f64 / src_w as f64;
+    let scale_y = dst_h as f64 / src_h as f64;
+    let scale = scale_x.min(scale_y);
+    let fit_w = (src_w as f64 * scale).round() as u32;
+    let fit_h = (src_h as f64 * scale).round() as u32;
+    let offset_x = ((dst_w as i64 - fit_w as i64) / 2) as i32;
+    let offset_y = ((dst_h as i64 - fit_h as i64) / 2) as i32;
+    (fit_w, fit_h, offset_x, offset_y)
+}
+
 #[allow(clippy::too_many_arguments)]
 impl PresentState {
     /// React to host compositor resize (xdg_toplevel.configure).
-    fn handle_resize(
-        &mut self,
-        host_state: &HostState,
-        surfaces: &Surfaces,
-        shm: &wl_shm::WlShm,
-        qh: &QueueHandle<HostState>,
-    ) {
-        if host_state.width == self.prev_w && host_state.height == self.prev_h {
+    fn handle_resize(&mut self, host_state: &HostState, surfaces: &Surfaces) {
+        let frac_changed = host_state.fractional_scale != self.fractional_scale;
+        if host_state.width == self.prev_w && host_state.height == self.prev_h && !frac_changed {
             return;
         }
         let (w, h) = (host_state.width, host_state.height);
+        if frac_changed {
+            self.fractional_scale = host_state.fractional_scale;
+        }
         info!(
             old_w = self.logical_w,
             old_h = self.logical_h,
@@ -139,30 +136,32 @@ impl PresentState {
         self.logical_w = w;
         self.logical_h = h;
 
-        // Update xdg geometry.
+        // Compute physical pixel dimensions. The blitter composites at this size
+        // so the buffer sent to the host always matches the window.
+        let phys_w = scale_to_physical(w, self.fractional_scale);
+        let phys_h = scale_to_physical(h, self.fractional_scale);
+        self.physical_w = phys_w;
+        self.physical_h = phys_h;
+
+        // Update xdg geometry — logical coordinates.
         if let Some(ref xdg_surf) = host_state.xdg_surface {
             xdg_surf.set_window_geometry(0, 0, w as i32, h as i32);
         }
 
-        // Re-present black SHM background at new size.
-        if let Ok(frame) = present_shm_frame(shm, &surfaces.parent, qh, w, h, None) {
-            self.current_shm_frame = Some(frame);
-        }
-
-        // Update parent viewport.
+        // Update parent viewport: stretch 1×1 black to fill window.
         if let Some(ref vp) = surfaces.parent_viewport {
-            vp.set_source(0.0, 0.0, w as f64, h as f64);
             vp.set_destination(w as i32, h as i32);
         }
 
-        // Invalidate blitter — will recreate lazily on next blit frame.
+        // Invalidate blitter — will recreate lazily at physical size.
         self.output_buffer_cache.clear();
         if self.vulkan_blitter.take().is_some() {
-            info!(w, h, "wayland: dropped blitter for resize");
+            info!(phys_w, phys_h, "wayland: dropped blitter for resize");
         }
-        self.blitter_width = w;
-        self.blitter_height = h;
+        self.blitter_width = phys_w;
+        self.blitter_height = phys_h;
 
+        surfaces.game_surface.commit();
         surfaces.parent.commit();
     }
 
@@ -236,8 +235,12 @@ impl PresentState {
                 self.force_blit,
                 format = format!("0x{:08x}", format),
                 modifier = format!("0x{:016x}", modifier),
-                width,
-                height,
+                buf_w = width,
+                buf_h = height,
+                physical_w = self.physical_w,
+                physical_h = self.physical_h,
+                logical_w = self.logical_w,
+                logical_h = self.logical_h,
                 "wayland: first DMA-BUF presentation path"
             );
         }
@@ -303,10 +306,19 @@ impl PresentState {
             (),
         );
 
-        surfaces.position_game(width, height, self.logical_w, self.logical_h);
-        surfaces.game.attach(Some(&host_buffer), 0, 0);
-        surfaces.game.damage(0, 0, i32::MAX, i32::MAX);
-        surfaces.game.commit();
+        let (fit_w, fit_h, off_x, off_y) =
+            contain_fit(width, height, self.logical_w, self.logical_h);
+
+        if let Some(ref vp) = surfaces.game_viewport {
+            vp.set_source(0.0, 0.0, width as f64, height as f64);
+            vp.set_destination(fit_w as i32, fit_h as i32);
+        }
+        surfaces.game_subsurface.set_position(off_x, off_y);
+        surfaces.game_surface.set_buffer_scale(1);
+        surfaces.game_surface.attach(Some(&host_buffer), 0, 0);
+        surfaces.game_surface.damage(0, 0, i32::MAX, i32::MAX);
+        surfaces.game_surface.commit();
+        surfaces.parent.commit();
 
         // Keep buffer alive until host releases it (typically 1–2 frames).
         self.in_flight_buffers.push_back(host_buffer);
@@ -401,15 +413,23 @@ impl PresentState {
             })
             .clone();
 
-        surfaces.position_game(
+        let (fit_w, fit_h, off_x, off_y) = contain_fit(
             exported.width,
             exported.height,
             self.logical_w,
             self.logical_h,
         );
-        surfaces.game.attach(Some(&host_buffer), 0, 0);
-        surfaces.game.damage(0, 0, i32::MAX, i32::MAX);
-        surfaces.game.commit();
+
+        if let Some(ref vp) = surfaces.game_viewport {
+            vp.set_source(0.0, 0.0, exported.width as f64, exported.height as f64);
+            vp.set_destination(fit_w as i32, fit_h as i32);
+        }
+        surfaces.game_subsurface.set_position(off_x, off_y);
+        surfaces.game_surface.set_buffer_scale(1);
+        surfaces.game_surface.attach(Some(&host_buffer), 0, 0);
+        surfaces.game_surface.damage(0, 0, i32::MAX, i32::MAX);
+        surfaces.game_surface.commit();
+        surfaces.parent.commit();
 
         self.present_count += 1;
         self.current_shm_frame = None;
@@ -437,12 +457,11 @@ impl PresentState {
             bytes = pixels.len(),
             "wayland: presenting SHM frame"
         );
-        let Ok(frame) = present_shm_frame(shm, &surfaces.game, qh, width, height, Some(pixels))
+        let Ok(frame) = present_shm_frame(shm, &surfaces.parent, qh, width, height, Some(pixels))
         else {
             return false;
         };
-        surfaces.position_game(width, height, self.logical_w, self.logical_h);
-        surfaces.game.commit();
+        surfaces.parent.commit();
         self.current_shm_frame = Some(frame);
         self.in_flight_buffers.clear();
         self.present_count += 1;
@@ -469,11 +488,11 @@ impl PresentState {
             pixel[2] = 0xFF; // R
             pixel[3] = 0xFF; // X
         }
-        let Ok(frame) = present_shm_frame(shm, &surfaces.game, qh, w, h, Some(&red_pixels)) else {
+        let Ok(frame) = present_shm_frame(shm, &surfaces.parent, qh, w, h, Some(&red_pixels))
+        else {
             return false;
         };
-        surfaces.position_game(w, h, self.logical_w, self.logical_h);
-        surfaces.game.commit();
+        surfaces.parent.commit();
         self.current_shm_frame = Some(frame);
         self.in_flight_buffers.clear();
         self.present_count += 1;
@@ -526,6 +545,7 @@ pub(super) fn wayland_event_loop(params: HostLoopParams) {
         &params.title,
         params.host_display,
         params.committed_rx,
+        params.cursor_rx,
         params.detected_refresh_mhz,
         params.host_dmabuf_formats,
     ) {
@@ -609,8 +629,12 @@ fn create_host_window(
         .as_ref()
         .context("host compositor missing wl_shm")?
         .clone();
+    let subcompositor = host_state
+        .subcompositor
+        .clone()
+        .context("host compositor missing wl_subcompositor")?;
 
-    // Parent surface.
+    // ── Parent surface (background + xdg toplevel) ──────────────────
     let surface = compositor.create_surface(qh, ());
     host_state.surface = Some(surface.clone());
     surface.set_buffer_scale(1);
@@ -620,14 +644,14 @@ fn create_host_window(
     opaque_region.add(0, 0, i32::MAX, i32::MAX);
     surface.set_opaque_region(Some(&opaque_region));
 
-    // Viewport for 1:1 buffer mapping regardless of display scale.
-    let viewport = host_state.viewporter.as_ref().map(|vp| {
+    // Parent viewport: stretches 1×1 black buffer to fill the window.
+    let parent_viewport = host_state.viewporter.as_ref().map(|vp| {
         let viewport = vp.get_viewport(&surface, qh, ());
-        info!("wayland: created wp_viewport for surface");
+        info!("wayland: created wp_viewport for parent surface");
         viewport
     });
 
-    // Fractional scale events.
+    // Fractional scale — so we receive the denominator-120 scale factor.
     if let Some(mgr) = host_state.fractional_scale_mgr.as_ref() {
         mgr.get_fractional_scale(&surface, qh, ());
     }
@@ -638,10 +662,12 @@ fn create_host_window(
     xdg_toplevel.set_title(title.to_string());
     xdg_toplevel.set_app_id("gamecomp".to_string());
 
-    // Request server-side decorations.
+    // Request server-side decorations so the host compositor draws the
+    // title bar. Keeps the client area clean for game content.
     if let Some(ref decoration_mgr) = host_state.decoration_mgr {
+        use wayland_protocols::xdg::decoration::zv1::client::zxdg_toplevel_decoration_v1::Mode;
         let deco = decoration_mgr.get_toplevel_decoration(&xdg_toplevel, qh, ());
-        deco.set_mode(zxdg_toplevel_decoration_v1::Mode::ServerSide);
+        deco.set_mode(Mode::ServerSide);
         info!("wayland: requested server-side decorations");
     } else {
         warn!("wayland: host does not support zxdg_decoration_manager_v1");
@@ -650,40 +676,45 @@ fn create_host_window(
     host_state.xdg_surface = Some(xdg_surface);
     host_state.xdg_toplevel = Some(xdg_toplevel);
 
+    // ── Game subsurface ─────────────────────────────────────────────
+    // Game content goes on a child subsurface with its own viewport, positioned at (0,0)
+    // relative to the parent in sync mode.
+    let game_surface = compositor.create_surface(qh, ());
+    game_surface.set_buffer_scale(1);
+
+    // Mark game surface opaque.
+    let game_opaque = compositor.create_region(qh, ());
+    game_opaque.add(0, 0, i32::MAX, i32::MAX);
+    game_surface.set_opaque_region(Some(&game_opaque));
+
+    // Game viewport: maps game buffer → host logical coordinates.
+    let game_viewport = host_state.viewporter.as_ref().map(|vp| {
+        let viewport = vp.get_viewport(&game_surface, qh, ());
+        info!("wayland: created wp_viewport for game subsurface");
+        viewport
+    });
+
+    // Disable input on the subsurface — parent handles all input.
+    let empty_region = compositor.create_region(qh, ());
+    game_surface.set_input_region(Some(&empty_region));
+
+    let game_subsurface = subcompositor.get_subsurface(&game_surface, &surface, qh, ());
+    game_subsurface.set_sync();
+    game_subsurface.place_above(&surface);
+    info!("wayland: created game subsurface (sync mode, above parent)");
+
     // Commit to trigger initial configure.
     surface.commit();
     event_queue
         .roundtrip(host_state)
         .context("failed to get initial configure")?;
 
-    // Game content subsurface (desync mode).
-    let game_surface = compositor.create_surface(qh, ());
-    game_surface.set_buffer_scale(1);
-
-    let game_sub = host_state
-        .subcompositor
-        .as_ref()
-        .context("host compositor missing wl_subcompositor")?
-        .get_subsurface(&game_surface, &surface, qh, ());
-    game_sub.set_desync();
-
-    let game_viewport = host_state.viewporter.as_ref().map(|vp| {
-        let gvp = vp.get_viewport(&game_surface, qh, ());
-        info!("wayland: created wp_viewport for game subsurface");
-        gvp
-    });
-
-    // Opaque region on game subsurface.
-    let game_opaque = compositor.create_region(qh, ());
-    game_opaque.add(0, 0, i32::MAX, i32::MAX);
-    game_surface.set_opaque_region(Some(&game_opaque));
-
     let surfaces = Surfaces {
         parent: surface,
-        parent_viewport: viewport,
-        game: game_surface,
-        game_sub,
+        parent_viewport,
+        game_surface,
         game_viewport,
+        game_subsurface,
     };
 
     Ok((surfaces, shm))
@@ -701,6 +732,7 @@ fn run_host_connection(
     title: &str,
     host_display: Option<String>,
     committed_rx: Option<std::sync::mpsc::Receiver<CommittedBuffer>>,
+    cursor_rx: Option<std::sync::mpsc::Receiver<CursorUpdate>>,
     detected_refresh_mhz: Arc<AtomicU32>,
     shared_host_formats: Arc<parking_lot::Mutex<std::collections::HashMap<u32, Vec<u64>>>>,
 ) -> anyhow::Result<()> {
@@ -714,6 +746,8 @@ fn run_host_connection(
         closed: false,
         width,
         height,
+        desired_width: width,
+        desired_height: height,
         compositor: None,
         subcompositor: None,
         wm_base: None,
@@ -722,6 +756,7 @@ fn run_host_connection(
         viewporter: None,
         fractional_scale_mgr: None,
         decoration_mgr: None,
+        seat: None,
         fractional_scale: 120,
         surface: None,
         xdg_surface: None,
@@ -732,6 +767,10 @@ fn run_host_connection(
         surface_outputs: Vec::new(),
         host_dmabuf_formats: HashMap::new(),
         can_use_modifiers: false,
+        pointer_enter_serial: 0,
+        pointer: None,
+        game_buf_w: 0,
+        game_buf_h: 0,
     };
 
     init_host_state(
@@ -744,21 +783,17 @@ fn run_host_connection(
 
     let (surfaces, shm) = create_host_window(&mut host_state, &mut event_queue, &qh, title)?;
 
-    // Compute logical dimensions from fractional scale.
-    let frac_scale = host_state.fractional_scale;
-    let (logical_w, logical_h) = if frac_scale > 120 {
-        let lw = (host_state.width * 120).div_ceil(frac_scale);
-        let lh = (host_state.height * 120).div_ceil(frac_scale);
-        (lw, lh)
-    } else {
-        (host_state.width, host_state.height)
-    };
+    // After the roundtrip, the configure handler has already computed
+    // the desired logical window size from our physical pixel dimensions
+    // and the host's fractional scale.
+    let logical_w = host_state.width;
+    let logical_h = host_state.height;
 
     info!(
-        width = host_state.width,
-        height = host_state.height,
-        fractional_scale = frac_scale,
-        effective_scale = format!("{:.2}", frac_scale as f64 / 120.0),
+        desired_physical_w = host_state.desired_width,
+        desired_physical_h = host_state.desired_height,
+        fractional_scale = host_state.fractional_scale,
+        effective_scale = format!("{:.2}", host_state.fractional_scale as f64 / 120.0),
         logical_w,
         logical_h,
         "host window configured"
@@ -769,37 +804,44 @@ fn run_host_connection(
         xdg_surf.set_window_geometry(0, 0, logical_w as i32, logical_h as i32);
     }
 
-    // Present initial black SHM frame at logical size.
+    // Present initial 1×1 black SHM frame on parent, stretched via viewport
+    // to cover the window.
     let initial_shm_frame = Some(present_shm_frame(
         &shm,
         &surfaces.parent,
         &qh,
-        logical_w,
-        logical_h,
-        None,
+        1,
+        1,
+        None, // None = black
     )?);
-    if let Some(vp) = &surfaces.parent_viewport {
-        vp.set_source(0.0, 0.0, logical_w as f64, logical_h as f64);
+    // Parent viewport: source = 1×1 pixel, destination = full window.
+    if let Some(ref vp) = surfaces.parent_viewport {
+        vp.set_source(0.0, 0.0, 1.0, 1.0);
         vp.set_destination(logical_w as i32, logical_h as i32);
     }
+    surfaces.parent.set_buffer_scale(1);
     surfaces.parent.commit();
 
-    info!(logical_w, logical_h, "wayland: game subsurface ready");
-
-    // Normalize host_state to logical coordinates. All subsequent
-    // xdg_toplevel.configure events use logical coordinates.
-    host_state.width = logical_w;
-    host_state.height = logical_h;
+    let frac_scale = host_state.fractional_scale;
+    let physical_w = scale_to_physical(logical_w, frac_scale);
+    let physical_h = scale_to_physical(logical_h, frac_scale);
+    info!(
+        logical_w,
+        logical_h, physical_w, physical_h, frac_scale, "wayland: surface ready"
+    );
 
     let mut state = PresentState {
         logical_w,
         logical_h,
+        physical_w,
+        physical_h,
         prev_w: logical_w,
         prev_h: logical_h,
+        fractional_scale: frac_scale,
         force_blit: std::env::var("GAMECOMP_FORCE_BLIT").is_ok(),
         vulkan_blitter: None,
-        blitter_width: logical_w,
-        blitter_height: logical_h,
+        blitter_width: physical_w,
+        blitter_height: physical_h,
         output_buffer_cache: HashMap::new(),
         in_flight_buffers: std::collections::VecDeque::with_capacity(4),
         current_shm_frame: initial_shm_frame,
@@ -842,7 +884,7 @@ fn run_host_connection(
         let _ = event_queue.flush();
 
         // Handle resize.
-        state.handle_resize(&host_state, &surfaces, &shm, &qh);
+        state.handle_resize(&host_state, &surfaces);
         if state.prev_w != host_state.width || state.prev_h != host_state.height {
             // handle_resize already ran above, but we need to flush.
             let _ = event_queue.flush();
@@ -861,6 +903,14 @@ fn run_host_connection(
                 trace!(drain_count, "wayland: drained buffers");
             }
             if let (Some(buffer), true) = (latest, host_state.surface.is_some()) {
+                // Update the game buffer dimensions so the pointer handler
+                // can compute the correct viewport offset + scale.
+                let (bw, bh) = match &buffer {
+                    CommittedBuffer::DmaBuf { width, height, .. } => (*width, *height),
+                    CommittedBuffer::Shm { width, height, .. } => (*width, *height),
+                };
+                host_state.game_buf_w = bw;
+                host_state.game_buf_h = bh;
                 presented = state.present_frame(
                     buffer,
                     &host_state,
@@ -878,6 +928,14 @@ fn run_host_connection(
             warn!("wayland: no committed_rx channel — will never receive frames");
         }
 
+        // Forward cursor updates to the host compositor.
+        if let Some(ref rx) = cursor_rx {
+            while let Ok(update) = rx.try_recv() {
+                apply_cursor_update(&update, &host_state, &shm, &qh);
+            }
+            let _ = event_queue.flush();
+        }
+
         // Periodic FPS logging.
         if last_status.elapsed() >= std::time::Duration::from_secs(2) {
             let elapsed = fps_start.elapsed().as_secs_f64();
@@ -889,6 +947,12 @@ fn run_host_connection(
             info!(
                 fps = format!("{fps:.1}"),
                 present_count = state.present_count,
+                logical_w = state.logical_w,
+                logical_h = state.logical_h,
+                physical_w = state.physical_w,
+                physical_h = state.physical_h,
+                game_buf_w = host_state.game_buf_w,
+                game_buf_h = host_state.game_buf_h,
                 loop_count,
                 "wayland: status"
             );
@@ -907,6 +971,97 @@ fn run_host_connection(
     }
 
     Ok(())
+}
+
+// ── Cursor forwarding ───────────────────────────────────────────────────────
+
+/// Apply a cursor update from a client to the host compositor's pointer.
+///
+/// Creates a temporary SHM buffer with the cursor pixels and calls
+/// `wl_pointer.set_cursor` on the host. For `Hide`, passes `None`
+/// to remove the cursor image.
+fn apply_cursor_update(
+    update: &CursorUpdate,
+    host_state: &HostState,
+    shm: &wl_shm::WlShm,
+    qh: &QueueHandle<HostState>,
+) {
+    let Some(ref pointer) = host_state.pointer else {
+        return;
+    };
+    let serial = host_state.pointer_enter_serial;
+
+    match update {
+        CursorUpdate::Image {
+            pixels,
+            width,
+            height,
+            hotspot_x,
+            hotspot_y,
+        } => {
+            let w = *width;
+            let h = *height;
+            if w == 0 || h == 0 {
+                return;
+            }
+            let stride = w * 4;
+            let size = (stride * h) as usize;
+            if pixels.len() < size {
+                return;
+            }
+
+            let name = c"gamecomp-cursor";
+            let Ok(fd) = rustix::fs::memfd_create(name, rustix::fs::MemfdFlags::CLOEXEC) else {
+                return;
+            };
+            if rustix::fs::ftruncate(&fd, size as u64).is_err() {
+                return;
+            }
+
+            // SAFETY: Valid fd, valid size, no concurrent access.
+            let ptr = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    rustix::fd::AsRawFd::as_raw_fd(&fd),
+                    0,
+                )
+            };
+            if ptr == libc::MAP_FAILED {
+                return;
+            }
+            // SAFETY: ptr is valid for `size` bytes.
+            unsafe {
+                std::ptr::copy_nonoverlapping(pixels.as_ptr(), ptr as *mut u8, size);
+                libc::munmap(ptr, size);
+            }
+
+            let pool = shm.create_pool(rustix::fd::AsFd::as_fd(&fd), size as i32, qh, ());
+            let buffer = pool.create_buffer(
+                0,
+                w as i32,
+                h as i32,
+                stride as i32,
+                wl_shm::Format::Argb8888,
+                qh,
+                (),
+            );
+
+            // Create a temporary surface for the cursor.
+            if let Some(ref compositor) = host_state.compositor {
+                let cursor_surface = compositor.create_surface(qh, ());
+                cursor_surface.attach(Some(&buffer), 0, 0);
+                cursor_surface.damage(0, 0, w as i32, h as i32);
+                cursor_surface.commit();
+                pointer.set_cursor(serial, Some(&cursor_surface), *hotspot_x, *hotspot_y);
+            }
+        }
+        CursorUpdate::Hide => {
+            pointer.set_cursor(serial, None, 0, 0);
+        }
+    }
 }
 
 // ── SHM frame helper ────────────────────────────────────────────────────────

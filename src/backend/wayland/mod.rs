@@ -20,7 +20,7 @@
 mod event_loop;
 mod host_state;
 
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{OwnedFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -33,11 +33,37 @@ use super::{Backend, BackendCaps, ConnectorInfo, DmaBuf, FlipResult, Framebuffer
 use crate::wayland::protocols::CommittedBuffer;
 use event_loop::{HostLoopParams, wayland_event_loop};
 
+/// Cursor update from a client, forwarded to the host compositor.
+pub enum CursorUpdate {
+    /// Client set a cursor image via `wl_pointer.set_cursor`.
+    Image {
+        /// ARGB8888 pixel data.
+        pixels: Vec<u8>,
+        /// Width in pixels.
+        width: u32,
+        /// Height in pixels.
+        height: u32,
+        /// Hotspot X offset.
+        hotspot_x: i32,
+        /// Hotspot Y offset.
+        hotspot_y: i32,
+    },
+    /// Client requested cursor hide (surface = None in set_cursor).
+    Hide,
+}
+
 /// Events from the host compositor.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum WaylandEvent {
     /// The window was resized by the host compositor.
-    Resized { width: u32, height: u32 },
+    /// `width`/`height` are host logical coords; `physical_width`/`physical_height`
+    /// are the pixel dimensions after applying fractional scale.
+    Resized {
+        width: u32,
+        height: u32,
+        physical_width: u32,
+        physical_height: u32,
+    },
     /// The window should close.
     CloseRequested,
     /// Pointer motion within the window.
@@ -48,6 +74,15 @@ pub enum WaylandEvent {
     Scroll { dx: f64, dy: f64 },
     /// Keyboard key event.
     Key { key: u32, pressed: bool },
+    /// Keyboard modifier state update from host.
+    Modifiers {
+        mods_depressed: u32,
+        mods_latched: u32,
+        mods_locked: u32,
+        group: u32,
+    },
+    /// XKB keymap from the host compositor (format, fd, size).
+    Keymap { format: u32, fd: OwnedFd, size: u32 },
     /// Window gained focus.
     FocusIn,
     /// Window lost focus.
@@ -72,6 +107,8 @@ pub struct WaylandConfig {
     pub host_wayland_display: Option<String>,
     /// Receiver for committed frames from the Wayland server.
     pub committed_frame_rx: Option<std::sync::mpsc::Receiver<CommittedBuffer>>,
+    /// Receiver for cursor image updates from the Wayland server.
+    pub cursor_rx: Option<std::sync::mpsc::Receiver<CursorUpdate>>,
     /// Shared atomic for detected host display refresh rate (millihertz).
     /// Written by the event thread, read by the main thread.
     pub detected_refresh_mhz: Arc<AtomicU32>,
@@ -104,6 +141,7 @@ impl Clone for WaylandConfig {
             use_vulkan: self.use_vulkan,
             host_wayland_display: self.host_wayland_display.clone(),
             committed_frame_rx: None, // Receiver is not cloneable.
+            cursor_rx: None,
             detected_refresh_mhz: self.detected_refresh_mhz.clone(),
             host_dmabuf_formats: Arc::new(
                 parking_lot::Mutex::new(std::collections::HashMap::new()),
@@ -122,6 +160,7 @@ impl Default for WaylandConfig {
             use_vulkan: true,
             host_wayland_display: None,
             committed_frame_rx: None,
+            cursor_rx: None,
             detected_refresh_mhz: Arc::new(AtomicU32::new(0)),
             host_dmabuf_formats: Arc::new(
                 parking_lot::Mutex::new(std::collections::HashMap::new()),
@@ -202,14 +241,22 @@ impl WaylandBackend {
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
             match &event {
-                WaylandEvent::Resized { width, height } => {
+                WaylandEvent::Resized {
+                    width,
+                    height,
+                    physical_width,
+                    physical_height,
+                } => {
                     self.width = *width;
                     self.height = *height;
                     // Update connector info.
                     if let Some(ci) = self.connector_info.first_mut() {
                         ci.name = format!("WAYLAND-1 ({}x{})", width, height);
                     }
-                    info!(width, height, "wayland window resized");
+                    info!(
+                        width,
+                        height, physical_width, physical_height, "wayland window resized"
+                    );
                 }
                 WaylandEvent::CloseRequested => {
                     info!("wayland window close requested");
@@ -332,6 +379,7 @@ impl Backend for WaylandBackend {
         let title = self.config.title.clone();
         let host_display = self.config.host_wayland_display.clone();
         let committed_rx = self.config.committed_frame_rx.take();
+        let cursor_rx = self.config.cursor_rx.take();
         self.event_thread = Some(
             std::thread::Builder::new()
                 .name("gamecomp-wayland".to_string())
@@ -344,6 +392,7 @@ impl Backend for WaylandBackend {
                         title,
                         host_display,
                         committed_rx,
+                        cursor_rx,
                         detected_refresh_mhz,
                         host_dmabuf_formats,
                     });
@@ -445,6 +494,7 @@ mod tests {
             use_vulkan: true,
             host_wayland_display: None,
             committed_frame_rx: None,
+            cursor_rx: None,
             detected_refresh_mhz: Arc::new(AtomicU32::new(0)),
             host_dmabuf_formats: Arc::new(
                 parking_lot::Mutex::new(std::collections::HashMap::new()),

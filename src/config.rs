@@ -33,6 +33,12 @@ pub struct Config {
     pub xwayland_count: u32,
     /// Frame pacer red zone in microseconds.
     pub red_zone_us: u64,
+    /// Game render resolution (`-w`×`-h`). This is the resolution
+    /// advertised to Wayland/XWayland clients — the size the game
+    /// actually renders at. When set, it stays fixed regardless of
+    /// window resizing (the compositor scales to the output).
+    /// If `None`, falls back to `resolution`.
+    pub game_resolution: Option<(u32, u32)>,
     /// FPS limit. 0 = match display refresh rate (no explicit cap).
     pub fps_limit: u32,
     /// Cursor hide delay in milliseconds. 0 = never hide.
@@ -83,6 +89,7 @@ impl Default for Config {
             upscale: UpscaleMode::None,
             xwayland_count: 1,
             red_zone_us: 1500,
+            game_resolution: None,
             fps_limit: 0,
             cursor_hide_delay_ms: 3000,
             child_command: None,
@@ -106,6 +113,7 @@ impl Config {
             use_vulkan: true,
             host_wayland_display: None,
             committed_frame_rx: None,
+            cursor_rx: None,
             detected_refresh_mhz: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             host_dmabuf_formats: std::sync::Arc::new(parking_lot::Mutex::new(
                 std::collections::HashMap::new(),
@@ -195,17 +203,31 @@ impl Config {
                     config.backend = BackendKind::Wayland;
                     backend_explicit = true;
                 }
-                "--width" | "-W" => {
+                "--output-width" | "--width" | "-W" => {
                     if let Some(val) = args.get(i + 1).and_then(|v| v.parse().ok()) {
                         let h = config.resolution.map_or(0, |(_, h)| h);
                         config.resolution = Some((val, h));
                         i += 1;
                     }
                 }
-                "--height" | "-H" => {
+                "--output-height" | "--height" | "-H" => {
                     if let Some(val) = args.get(i + 1).and_then(|v| v.parse().ok()) {
                         let w = config.resolution.map_or(0, |(w, _)| w);
                         config.resolution = Some((w, val));
+                        i += 1;
+                    }
+                }
+                "--nested-width" | "-w" => {
+                    if let Some(val) = args.get(i + 1).and_then(|v| v.parse().ok()) {
+                        let h = config.game_resolution.map_or(0, |(_, h)| h);
+                        config.game_resolution = Some((val, h));
+                        i += 1;
+                    }
+                }
+                "--nested-height" | "-h" => {
+                    if let Some(val) = args.get(i + 1).and_then(|v| v.parse().ok()) {
+                        let w = config.game_resolution.map_or(0, |(w, _)| w);
+                        config.game_resolution = Some((w, val));
                         i += 1;
                     }
                 }

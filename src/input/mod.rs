@@ -9,6 +9,7 @@
 //! the number of Wayland events sent to the client.
 
 pub mod keyboard;
+pub mod pointer;
 
 use tracing::info;
 

@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use tracing::{debug, info, trace, warn};
 use wayland_client::protocol::{
-    wl_compositor, wl_output, wl_region, wl_registry, wl_shm, wl_shm_pool, wl_subcompositor,
-    wl_subsurface, wl_surface,
+    wl_compositor, wl_keyboard, wl_output, wl_pointer, wl_region, wl_registry, wl_seat, wl_shm,
+    wl_shm_pool, wl_subcompositor, wl_subsurface, wl_surface,
 };
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
 use wayland_protocols::wp::fractional_scale::v1::client::{
@@ -36,8 +36,14 @@ use super::WaylandEvent;
 pub(super) struct HostState {
     pub configured: bool,
     pub closed: bool,
+    /// Current host window dimensions (logical pixels, as per xdg_toplevel configure).
     pub width: u32,
     pub height: u32,
+    /// Desired physical pixel size from config (-W×-H). Used to compute the
+    /// logical window size when responding to xdg_toplevel.configure, so the
+    /// host compositor allocates the right number of physical pixels.
+    pub desired_width: u32,
+    pub desired_height: u32,
     pub compositor: Option<wl_compositor::WlCompositor>,
     pub subcompositor: Option<wl_subcompositor::WlSubcompositor>,
     pub wm_base: Option<xdg_wm_base::XdgWmBase>,
@@ -46,6 +52,8 @@ pub(super) struct HostState {
     pub viewporter: Option<wp_viewporter::WpViewporter>,
     pub fractional_scale_mgr: Option<wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1>,
     pub decoration_mgr: Option<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1>,
+    /// Host seat for keyboard/pointer input.
+    pub seat: Option<wl_seat::WlSeat>,
     /// Fractional scale denominator from wp_fractional_scale_v1.
     /// 120 = scale 1.0, 240 = scale 2.0, 150 = scale 1.25, etc.
     pub fractional_scale: u32,
@@ -69,9 +77,68 @@ pub(super) struct HostState {
     /// Whether the host compositor advertised any non-INVALID modifier.
     /// When true, we include explicit modifiers in `create_immed` calls.
     pub can_use_modifiers: bool,
+    /// Serial from the most recent `wl_pointer.enter` event on the host.
+    /// Needed for `wl_pointer.set_cursor` on the host pointer.
+    pub pointer_enter_serial: u32,
+    /// Host `wl_pointer` proxy — needed to call `set_cursor`.
+    pub pointer: Option<wl_pointer::WlPointer>,
+    /// Last-presented game buffer dimensions. Updated on each present
+    /// call. Used together with `width`/`height` to compute the viewport
+    /// offset and scale for pointer coordinate mapping.
+    pub game_buf_w: u32,
+    pub game_buf_h: u32,
 }
 
 impl HostState {
+    /// Map host surface-local pointer coordinates to client buffer coordinates.
+    ///
+    /// Accounts for the viewport-based aspect-fit letterboxing: the game
+    /// subsurface is centered within the host window, viewport-scaled from
+    /// `game_buf_w × game_buf_h` to a `fit_w × fit_h` destination. Pointer
+    /// coordinates from the host include the letterbox offset, so we must
+    /// subtract it and rescale to the buffer's native resolution.
+    ///
+    /// Returns `(buf_x, buf_y)` in the client buffer's coordinate space,
+    /// clamped to `[0, game_buf_w) × [0, game_buf_h)`.
+    #[inline(always)]
+    pub fn host_to_buffer_coords(&self, host_x: f64, host_y: f64) -> (f64, f64) {
+        // Before the first frame, no buffer dimensions are known — pass through.
+        if self.game_buf_w == 0 || self.game_buf_h == 0 {
+            return (host_x, host_y);
+        }
+
+        let win_w = self.width.max(1) as f64;
+        let win_h = self.height.max(1) as f64;
+        let buf_w = self.game_buf_w as f64;
+        let buf_h = self.game_buf_h as f64;
+
+        // Replicate the contain_fit() logic from event_loop.rs.
+        let (fit_w, fit_h) = {
+            let lhs = (self.game_buf_w as u64) * (self.height as u64);
+            let rhs = (self.game_buf_h as u64) * (self.width as u64);
+            if lhs > rhs {
+                let fw = self.width;
+                let fh = ((self.width as u64) * (self.game_buf_h as u64) / (self.game_buf_w as u64))
+                    as u32;
+                (fw.max(1) as f64, fh.max(1) as f64)
+            } else {
+                let fh = self.height;
+                let fw = ((self.height as u64) * (self.game_buf_w as u64)
+                    / (self.game_buf_h as u64)) as u32;
+                (fw.max(1) as f64, fh.max(1) as f64)
+            }
+        };
+
+        let off_x = (win_w - fit_w) / 2.0;
+        let off_y = (win_h - fit_h) / 2.0;
+
+        // Subtract letterbox offset, then map viewport-dest → buffer coords.
+        let bx = ((host_x - off_x) * buf_w / fit_w).clamp(0.0, buf_w - 1.0);
+        let by = ((host_y - off_y) * buf_h / fit_h).clamp(0.0, buf_h - 1.0);
+
+        (bx, by)
+    }
+
     /// Check whether the host compositor supports a given format+modifier pair.
     ///
     /// Returns `true` when the host advertised the exact (format, modifier)
@@ -208,6 +275,11 @@ impl Dispatch<wl_registry::WlRegistry, ()> for HostState {
                     // this output in surface enter/leave events.
                     let _output =
                         registry.bind::<wl_output::WlOutput, _, _>(name, version.min(4), qh, name);
+                }
+                "wl_seat" => {
+                    let seat = registry.bind::<wl_seat::WlSeat, _, _>(name, version.min(9), qh, ());
+                    state.seat = Some(seat);
+                    info!("bound host wl_seat for input");
                 }
                 _ => {}
             }
@@ -505,24 +577,50 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for HostState {
                     states_len = states.len(),
                     "xdg_toplevel configure from host"
                 );
-                if width > 0 && height > 0 {
-                    let new_w = width as u32;
-                    let new_h = height as u32;
-                    if new_w != state.width || new_h != state.height {
-                        info!(
-                            old_w = state.width,
-                            old_h = state.height,
-                            new_w,
-                            new_h,
-                            "host resize: updating dimensions"
-                        );
-                        state.width = new_w;
-                        state.height = new_h;
-                        let _ = state.tx.send(WaylandEvent::Resized {
-                            width: new_w,
-                            height: new_h,
-                        });
-                    }
+
+                // Compute our desired logical window size from the physical
+                // pixel dimensions and the current fractional scale.
+                let frac = state.fractional_scale.max(120);
+                let desired_logical_w =
+                    (state.desired_width as u64 * 120).div_ceil(frac as u64) as u32;
+                let desired_logical_h =
+                    (state.desired_height as u64 * 120).div_ceil(frac as u64) as u32;
+
+                // When the host sends 0×0 it means "use your preferred size".
+                // Otherwise accept the host's actual dimensions — it may be
+                // constrained by decorations, screen size, or tiling.
+                let new_w = if width > 0 {
+                    width as u32
+                } else {
+                    desired_logical_w
+                };
+                let new_h = if height > 0 {
+                    height as u32
+                } else {
+                    desired_logical_h
+                };
+                if new_w != state.width || new_h != state.height {
+                    info!(
+                        old_w = state.width,
+                        old_h = state.height,
+                        new_w,
+                        new_h,
+                        desired_logical_w,
+                        desired_logical_h,
+                        fractional_scale = frac,
+                        "host resize: accepting host configure"
+                    );
+                    state.width = new_w;
+                    state.height = new_h;
+                    // Compute physical pixel dimensions
+                    let phys_w = ((new_w as u64 * frac as u64) / 120) as u32;
+                    let phys_h = ((new_h as u64 * frac as u64) / 120) as u32;
+                    let _ = state.tx.send(WaylandEvent::Resized {
+                        width: new_w,
+                        height: new_h,
+                        physical_width: phys_w,
+                        physical_height: phys_h,
+                    });
                 }
             }
             xdg_toplevel::Event::Close => {
@@ -623,6 +721,151 @@ impl Dispatch<wp_fractional_scale_v1::WpFractionalScaleV1, ()> for HostState {
                 "host fractional scale changed"
             );
             state.fractional_scale = scale;
+        }
+    }
+}
+
+// ─── Host input: wl_seat / wl_keyboard / wl_pointer ─────────────────
+
+// wl_seat — acquire keyboard and pointer when capabilities are advertised.
+impl Dispatch<wl_seat::WlSeat, ()> for HostState {
+    fn event(
+        state: &mut Self,
+        seat: &wl_seat::WlSeat,
+        event: wl_seat::Event,
+        _data: &(),
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        if let wl_seat::Event::Capabilities { capabilities } = event {
+            let caps = wl_seat::Capability::from_bits_truncate(capabilities.into());
+            if caps.contains(wl_seat::Capability::Keyboard) {
+                seat.get_keyboard(qh, ());
+                info!("acquired host wl_keyboard");
+            }
+            if caps.contains(wl_seat::Capability::Pointer) {
+                let ptr = seat.get_pointer(qh, ());
+                state.pointer = Some(ptr);
+                info!("acquired host wl_pointer");
+            }
+        }
+    }
+}
+
+// wl_keyboard — forward key, keymap, and modifier events to the main thread.
+impl Dispatch<wl_keyboard::WlKeyboard, ()> for HostState {
+    fn event(
+        state: &mut Self,
+        _proxy: &wl_keyboard::WlKeyboard,
+        event: wl_keyboard::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_keyboard::Event::Keymap { format, fd, size } => {
+                let format_val = match format {
+                    wayland_client::WEnum::Value(wl_keyboard::KeymapFormat::XkbV1) => 1,
+                    wayland_client::WEnum::Value(wl_keyboard::KeymapFormat::NoKeymap) => 0,
+                    _ => return,
+                };
+                // The fd is owned by us for the duration of this callback.
+                // Convert to OwnedFd to send through the channel.
+                let owned = fd;
+                info!(format = format_val, size, "received host keymap");
+                let _ = state.tx.send(WaylandEvent::Keymap {
+                    format: format_val,
+                    fd: owned,
+                    size,
+                });
+            }
+            wl_keyboard::Event::Modifiers {
+                mods_depressed,
+                mods_latched,
+                mods_locked,
+                group,
+                ..
+            } => {
+                let _ = state.tx.send(WaylandEvent::Modifiers {
+                    mods_depressed,
+                    mods_latched,
+                    mods_locked,
+                    group,
+                });
+            }
+            wl_keyboard::Event::Key {
+                key,
+                state: key_state,
+                ..
+            } => {
+                let pressed =
+                    key_state == wayland_client::WEnum::Value(wl_keyboard::KeyState::Pressed);
+                let _ = state.tx.send(WaylandEvent::Key { key, pressed });
+            }
+            wl_keyboard::Event::Enter { .. } => {
+                let _ = state.tx.send(WaylandEvent::FocusIn);
+            }
+            wl_keyboard::Event::Leave { .. } => {
+                let _ = state.tx.send(WaylandEvent::FocusOut);
+            }
+            _ => {}
+        }
+    }
+}
+
+// wl_pointer — forward motion, button, and axis events to the main thread.
+impl Dispatch<wl_pointer::WlPointer, ()> for HostState {
+    fn event(
+        state: &mut Self,
+        _proxy: &wl_pointer::WlPointer,
+        event: wl_pointer::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_pointer::Event::Motion {
+                surface_x,
+                surface_y,
+                ..
+            } => {
+                let (bx, by) = state.host_to_buffer_coords(surface_x, surface_y);
+                let _ = state.tx.send(WaylandEvent::PointerMotion { x: bx, y: by });
+            }
+            wl_pointer::Event::Button {
+                button,
+                state: btn_state,
+                ..
+            } => {
+                let pressed =
+                    btn_state == wayland_client::WEnum::Value(wl_pointer::ButtonState::Pressed);
+                let _ = state
+                    .tx
+                    .send(WaylandEvent::PointerButton { button, pressed });
+            }
+            wl_pointer::Event::Axis { axis, value, .. } => {
+                let (dx, dy) = match axis {
+                    wayland_client::WEnum::Value(wl_pointer::Axis::VerticalScroll) => (0.0, value),
+                    wayland_client::WEnum::Value(wl_pointer::Axis::HorizontalScroll) => {
+                        (value, 0.0)
+                    }
+                    _ => (0.0, 0.0),
+                };
+                if dx != 0.0 || dy != 0.0 {
+                    let _ = state.tx.send(WaylandEvent::Scroll { dx, dy });
+                }
+            }
+            wl_pointer::Event::Enter {
+                serial,
+                surface_x,
+                surface_y,
+                ..
+            } => {
+                state.pointer_enter_serial = serial;
+                let (bx, by) = state.host_to_buffer_coords(surface_x, surface_y);
+                let _ = state.tx.send(WaylandEvent::PointerMotion { x: bx, y: by });
+            }
+            _ => {}
         }
     }
 }

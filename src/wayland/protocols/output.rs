@@ -14,7 +14,7 @@ pub struct OutputData {
 
 impl GlobalDispatch<WlOutput, OutputData> for WaylandState {
     fn bind(
-        _state: &mut Self,
+        state: &mut Self,
         _dh: &DisplayHandle,
         _client: &Client,
         resource: New<WlOutput>,
@@ -40,6 +40,7 @@ impl GlobalDispatch<WlOutput, OutputData> for WaylandState {
         );
         output.scale(1);
         output.done();
+        state.bound_outputs.push(output);
     }
 }
 

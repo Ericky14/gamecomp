@@ -2,6 +2,7 @@
 
 use parking_lot::Mutex;
 use std::os::unix::io::AsFd;
+use std::sync::atomic::Ordering;
 
 use tracing::{info, trace};
 use wayland_server::protocol::{
@@ -30,7 +31,7 @@ impl GlobalDispatch<WlCompositor, ()> for WaylandState {
 
 impl Dispatch<WlCompositor, ()> for WaylandState {
     fn request(
-        _state: &mut Self,
+        state: &mut Self,
         _client: &Client,
         _resource: &WlCompositor,
         request: wl_compositor::Request,
@@ -41,12 +42,17 @@ impl Dispatch<WlCompositor, ()> for WaylandState {
         match request {
             wl_compositor::Request::CreateSurface { id } => {
                 info!("wl_compositor: create_surface");
-                data_init.init(
+                let surface = data_init.init(
                     id,
                     SurfaceData {
                         attached_buffer: Mutex::new(None),
+                        is_cursor: std::sync::atomic::AtomicBool::new(false),
+                        hotspot_x: std::sync::atomic::AtomicI32::new(0),
+                        hotspot_y: std::sync::atomic::AtomicI32::new(0),
                     },
                 );
+                // Track all client surfaces for per-client focus enter.
+                state.client_surfaces.push(surface);
             }
             wl_compositor::Request::CreateRegion { id } => {
                 data_init.init(id, ());
@@ -79,6 +85,34 @@ impl Dispatch<WlSurface, SurfaceData> for WaylandState {
                 state.pending_frame_callbacks.push(cb);
             }
             wl_surface::Request::Commit => {
+                // Cursor surfaces: read SHM pixels and forward to host
+                // compositor instead of staging as application frames.
+                if data.is_cursor.load(Ordering::Relaxed) {
+                    let attached = data.attached_buffer.lock();
+                    if let Some(ref buffer) = *attached
+                        && let Some(BufferData::Shm(shm)) = buffer.data::<BufferData>()
+                    {
+                        let len = (shm.stride * shm.height) as usize;
+                        if let Some(pixels) = shm.pool.lock().read_pixels(shm.offset as usize, len)
+                        {
+                            let hotspot_x = data.hotspot_x.load(Ordering::Relaxed);
+                            let hotspot_y = data.hotspot_y.load(Ordering::Relaxed);
+                            if let Some(ref tx) = state.cursor_tx {
+                                let _ = tx.send(crate::backend::wayland::CursorUpdate::Image {
+                                    pixels,
+                                    width: shm.width as u32,
+                                    height: shm.height as u32,
+                                    hotspot_x,
+                                    hotspot_y,
+                                });
+                            }
+                        }
+                    }
+                    // Fire cursor surface's frame callbacks so the client
+                    // can keep animating the cursor.
+                    state.fire_frame_callbacks();
+                    return;
+                }
                 state.frame_seq += 1;
 
                 // Read pixels from the attached buffer and send to presenter.
