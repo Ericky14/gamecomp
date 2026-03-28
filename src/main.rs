@@ -388,32 +388,8 @@ fn run(config: Config) -> anyhow::Result<()> {
     }
 
     // --- Launch child command ---
-    let mut child_process: Option<std::process::Child> = None;
-    if let Some(ref cmd) = config.child_command {
-        info!(command = %cmd, "launching child process");
-        let mut child_cmd = std::process::Command::new("sh");
-        child_cmd
-            .arg("-c")
-            .arg(cmd)
-            .env("WAYLAND_DISPLAY", &socket_name)
-            .env("DISPLAY", &xwayland_servers[0].display);
-
-        // Set STEAM_GAME_DISPLAY_N env vars for game servers (1+).
-        // This matches gamescope's convention so Steam can direct games
-        // to specific XWayland servers.
-        if xwayland_count > 1 {
-            for server in xwayland_servers.iter().skip(1) {
-                let env_name = format!("STEAM_GAME_DISPLAY_{}", server.index - 1);
-                child_cmd.env(&env_name, &server.display);
-            }
-        }
-
-        child_process = Some(
-            child_cmd
-                .spawn()
-                .context("failed to launch child command")?,
-        );
-    }
+    let mut child_process =
+        launch_child_command(&config, &socket_name, &xwayland_servers, xwayland_count)?;
 
     // --- Main event loop ---
     info!("entering main event loop");
@@ -427,109 +403,15 @@ fn run(config: Config) -> anyhow::Result<()> {
     let mut focus_arbiter = FocusArbiter::new(xwayland_count as usize);
 
     while RUNNING.load(Ordering::Relaxed) {
-        // Dispatch libseat events (VT switch notifications) for DRM sessions.
-        if let Some(ref mut sess) = session
-            && let Err(e) = sess.dispatch()
-        {
-            warn!(?e, "seat dispatch error");
-        }
-
-        // Detect session restore (inactive → active) and re-open input
-        // devices. Logind revokes evdev fds via EVIOCREVOKE on VT switch,
-        // making the old fds permanently dead. We must re-open them.
-        if let Some(ref mut sess) = session {
-            let is_active = sess.is_active();
-            if !session_was_active && is_active {
-                info!("session restored, re-opening input devices");
-                if let Some(ref mut kbd) = keyboard_monitor {
-                    kbd.reopen_after_vt_switch(sess);
-                }
-                if let Some(ref mut ptr) = pointer_monitor {
-                    ptr.reopen_after_vt_switch(sess);
-                }
-            }
-            session_was_active = is_active;
-        }
-
-        // Poll keyboard: hotplug, VT switch hotkeys, and key events.
-        if let Some(ref mut kbd) = keyboard_monitor
-            && let Some(ref mut sess) = session
-        {
-            let key_events = kbd.poll(sess);
-            for action in key_events {
-                if let KeyAction::Key {
-                    key,
-                    pressed,
-                    time_ms,
-                } = action
-                {
-                    wayland_state.send_key(key, pressed, time_ms);
-                }
-            }
-        }
-
-        // Poll pointer: hotplug, motion, button, and scroll events.
-        if let Some(ref mut ptr) = pointer_monitor
-            && let Some(ref mut sess) = session
-        {
-            use crate::input::pointer::PointerEvent;
-            let pointer_events = ptr.poll(sess);
-            for event in pointer_events {
-                match event {
-                    PointerEvent::Motion { dx, dy, time_ms } => {
-                        wayland_state.send_pointer_motion(dx, dy, time_ms);
-                    }
-                    PointerEvent::Button(btn) => {
-                        let time_ms = (btn.time_usec / 1000) as u32;
-                        wayland_state.send_pointer_button(btn.button, btn.pressed, time_ms);
-                    }
-                    PointerEvent::Scroll(scroll) => {
-                        let time_ms = (scroll.time_usec / 1000) as u32;
-                        wayland_state.send_pointer_axis(scroll.dx, scroll.dy, time_ms);
-                    }
-                }
-            }
-        }
-
-        // Drain host input events (nested/wayland mode). The render thread
-        // forwards keyboard/pointer events from the host compositor.
-        {
-            use crate::backend::wayland::WaylandEvent;
-            let now_ms = (wayland::monotonic_ns() / 1_000_000) as u32;
-            while let Ok(event) = host_input_rx.try_recv() {
-                match event {
-                    WaylandEvent::Key { key, pressed } => {
-                        wayland_state.send_key(key, pressed, now_ms);
-                    }
-                    WaylandEvent::Modifiers {
-                        mods_depressed,
-                        mods_latched,
-                        mods_locked,
-                        group,
-                    } => {
-                        wayland_state.send_modifiers(
-                            mods_depressed,
-                            mods_latched,
-                            mods_locked,
-                            group,
-                        );
-                    }
-                    WaylandEvent::Keymap { format, fd, size } => {
-                        wayland_state.send_keymap(format, fd, size);
-                    }
-                    WaylandEvent::PointerMotion { x, y } => {
-                        wayland_state.send_pointer_motion_absolute(x, y, now_ms);
-                    }
-                    WaylandEvent::PointerButton { button, pressed } => {
-                        wayland_state.send_pointer_button(button, pressed, now_ms);
-                    }
-                    WaylandEvent::Scroll { dx, dy } => {
-                        wayland_state.send_pointer_axis(dx, dy, now_ms);
-                    }
-                    _ => {}
-                }
-            }
-        }
+        dispatch_session(
+            &mut session,
+            &mut session_was_active,
+            &mut keyboard_monitor,
+            &mut pointer_monitor,
+        );
+        poll_keyboard(&mut keyboard_monitor, &mut session, &mut wayland_state);
+        poll_pointer(&mut pointer_monitor, &mut session, &mut wayland_state);
+        drain_host_input(&host_input_rx, &mut wayland_state);
 
         // Drain vblank timestamps from the render thread and feed them to
         // the frame pacer. This synchronizes frame callback releases with
@@ -538,7 +420,6 @@ fn run(config: Config) -> anyhow::Result<()> {
             pacer.mark_vblank(vblank_ns);
         }
 
-        // Sync frame pacer and FPS limiter to the host display refresh rate.
         update_refresh_rate(
             &detected_refresh_mhz,
             &mut last_detected_hz,
@@ -547,28 +428,12 @@ fn run(config: Config) -> anyhow::Result<()> {
             &mut fps_limiter,
         );
 
-        // Propagate host window physical pixel size as our advertised output
-        // resolution. Clients may render at this size or choose their own.
-        // The wayland backend's viewport applies contain-fit scaling to
-        // fit the game buffer within the host window, preserving aspect ratio.
-        {
-            let pw = host_physical_width.load(Ordering::Acquire);
-            let ph = host_physical_height.load(Ordering::Acquire);
-            if pw > 0 && ph > 0 {
-                wayland_state.update_output_resolution(pw, ph);
-                // Send SetResolution to all XWM threads so each updates
-                // its output tracking. For multi-server mode, server 0
-                // gets the output resolution; game servers keep theirs.
-                for srv in &xwayland_servers {
-                    let _ = srv
-                        .cmd_tx
-                        .send(wayland::xwayland::XwmCommand::SetResolution {
-                            width: pw,
-                            height: ph,
-                        });
-                }
-            }
-        }
+        propagate_host_resolution(
+            &host_physical_width,
+            &host_physical_height,
+            &mut wayland_state,
+            &xwayland_servers,
+        );
 
         // Monitor all XWayland instances and respawn crashed ones.
         for srv in &mut xwayland_servers {
@@ -655,6 +520,183 @@ fn run(config: Config) -> anyhow::Result<()> {
 }
 
 // ─── Event loop helpers ─────────────────────────────────────────────
+
+/// Launch the child process (e.g., Steam, vkcube) with the correct
+/// `WAYLAND_DISPLAY`, `DISPLAY`, and `STEAM_GAME_DISPLAY_N` env vars.
+fn launch_child_command(
+    config: &Config,
+    socket_name: &str,
+    xwayland_servers: &[XWaylandInstance],
+    xwayland_count: u32,
+) -> anyhow::Result<Option<std::process::Child>> {
+    let Some(ref cmd) = config.child_command else {
+        return Ok(None);
+    };
+
+    info!(command = %cmd, "launching child process");
+    let mut child_cmd = std::process::Command::new("sh");
+    child_cmd
+        .arg("-c")
+        .arg(cmd)
+        .env("WAYLAND_DISPLAY", socket_name)
+        .env("DISPLAY", &xwayland_servers[0].display);
+
+    // Set STEAM_GAME_DISPLAY_N env vars for game servers (1+).
+    // This matches gamescope's convention so Steam can direct games
+    // to specific XWayland servers.
+    if xwayland_count > 1 {
+        for server in xwayland_servers.iter().skip(1) {
+            let env_name = format!("STEAM_GAME_DISPLAY_{}", server.index - 1);
+            child_cmd.env(&env_name, &server.display);
+        }
+    }
+
+    child_cmd
+        .spawn()
+        .map(Some)
+        .context("failed to launch child command")
+}
+
+/// Dispatch libseat events and handle VT switch recovery.
+///
+/// On session restore (inactive → active), re-opens input devices since
+/// logind revokes evdev fds via `EVIOCREVOKE` on VT switch.
+fn dispatch_session(
+    session: &mut Option<backend::session::Session>,
+    was_active: &mut bool,
+    keyboard_monitor: &mut Option<KeyboardMonitor>,
+    pointer_monitor: &mut Option<PointerMonitor>,
+) {
+    let Some(sess) = session.as_mut() else { return };
+
+    if let Err(e) = sess.dispatch() {
+        warn!(?e, "seat dispatch error");
+    }
+
+    let is_active = sess.is_active();
+    if !*was_active && is_active {
+        info!("session restored, re-opening input devices");
+        if let Some(kbd) = keyboard_monitor.as_mut() {
+            kbd.reopen_after_vt_switch(sess);
+        }
+        if let Some(ptr) = pointer_monitor.as_mut() {
+            ptr.reopen_after_vt_switch(sess);
+        }
+    }
+    *was_active = is_active;
+}
+
+/// Poll evdev keyboard devices and forward key events to Wayland clients.
+fn poll_keyboard(
+    keyboard_monitor: &mut Option<KeyboardMonitor>,
+    session: &mut Option<backend::session::Session>,
+    wayland_state: &mut wayland::WaylandState,
+) {
+    if let Some(kbd) = keyboard_monitor.as_mut()
+        && let Some(sess) = session.as_mut()
+    {
+        for action in kbd.poll(sess) {
+            if let KeyAction::Key {
+                key,
+                pressed,
+                time_ms,
+            } = action
+            {
+                wayland_state.send_key(key, pressed, time_ms);
+            }
+        }
+    }
+}
+
+/// Poll evdev pointer devices and forward events to Wayland clients.
+fn poll_pointer(
+    pointer_monitor: &mut Option<PointerMonitor>,
+    session: &mut Option<backend::session::Session>,
+    wayland_state: &mut wayland::WaylandState,
+) {
+    use crate::input::pointer::PointerEvent;
+
+    if let Some(ptr) = pointer_monitor.as_mut()
+        && let Some(sess) = session.as_mut()
+    {
+        for event in ptr.poll(sess) {
+            match event {
+                PointerEvent::Motion { dx, dy, time_ms } => {
+                    wayland_state.send_pointer_motion(dx, dy, time_ms);
+                }
+                PointerEvent::Button(btn) => {
+                    let time_ms = (btn.time_usec / 1000) as u32;
+                    wayland_state.send_pointer_button(btn.button, btn.pressed, time_ms);
+                }
+                PointerEvent::Scroll(scroll) => {
+                    let time_ms = (scroll.time_usec / 1000) as u32;
+                    wayland_state.send_pointer_axis(scroll.dx, scroll.dy, time_ms);
+                }
+            }
+        }
+    }
+}
+
+/// Drain host compositor input events (nested/wayland mode) and forward
+/// them to Wayland clients.
+fn drain_host_input(
+    host_input_rx: &std::sync::mpsc::Receiver<crate::backend::wayland::WaylandEvent>,
+    wayland_state: &mut wayland::WaylandState,
+) {
+    use crate::backend::wayland::WaylandEvent;
+
+    let now_ms = (wayland::monotonic_ns() / 1_000_000) as u32;
+    while let Ok(event) = host_input_rx.try_recv() {
+        match event {
+            WaylandEvent::Key { key, pressed } => {
+                wayland_state.send_key(key, pressed, now_ms);
+            }
+            WaylandEvent::Modifiers {
+                mods_depressed,
+                mods_latched,
+                mods_locked,
+                group,
+            } => {
+                wayland_state.send_modifiers(mods_depressed, mods_latched, mods_locked, group);
+            }
+            WaylandEvent::Keymap { format, fd, size } => {
+                wayland_state.send_keymap(format, fd, size);
+            }
+            WaylandEvent::PointerMotion { x, y } => {
+                wayland_state.send_pointer_motion_absolute(x, y, now_ms);
+            }
+            WaylandEvent::PointerButton { button, pressed } => {
+                wayland_state.send_pointer_button(button, pressed, now_ms);
+            }
+            WaylandEvent::Scroll { dx, dy } => {
+                wayland_state.send_pointer_axis(dx, dy, now_ms);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Propagate host window physical size to Wayland clients and XWM threads.
+fn propagate_host_resolution(
+    host_physical_width: &AtomicU32,
+    host_physical_height: &AtomicU32,
+    wayland_state: &mut wayland::WaylandState,
+    xwayland_servers: &[XWaylandInstance],
+) {
+    let pw = host_physical_width.load(Ordering::Acquire);
+    let ph = host_physical_height.load(Ordering::Acquire);
+    if pw > 0 && ph > 0 {
+        wayland_state.update_output_resolution(pw, ph);
+        for srv in xwayland_servers {
+            let _ = srv
+                .cmd_tx
+                .send(wayland::xwayland::XwmCommand::SetResolution {
+                    width: pw,
+                    height: ph,
+                });
+        }
+    }
+}
 
 /// Check if the wayland backend detected the host display refresh rate and
 /// update the frame pacer and FPS limiter accordingly.
