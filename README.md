@@ -8,11 +8,13 @@ High-performance single-app fullscreen Wayland compositor for gaming and robotic
 - **Zero-copy DMA-BUF forwarding** — Forward client buffers to host compositor without GPU work (Wayland backend)
 - **Vulkan compute compositor** — Fast shader-based composition when overlays or scaling are needed
 - **Aspect-preserving letterboxing** — Subsurface architecture with automatic pillarbox/letterbox
-- **XWayland** — Full X11 application support
+- **XWayland** — Full X11 application support with per-server XWM threads
 - **VRR support** — Variable refresh rate for compatible displays
 - **Wayland backend** — Run inside another Wayland compositor for development/testing
-- **Multi-XWayland** — Multiple XWayland servers (platform + game displays) with per-server XWM threads
-- **Steam integration** — `-e` flag for Steam AppID tracking, `STEAM_GAME_DISPLAY_N` env vars
+- **Multi-XWayland** — Multiple XWayland servers with independent focus tracking and lifecycle management
+- **Steam mode focus gating** — 4-phase cross-server focus arbitration (baselayer → stealer → retention → fallback). Only the focused server's clients receive frame callbacks — zero GPU waste on unfocused servers.
+- **Baselayer control** — `GAMECOMP_BASELAYER_APPID` X11 atom for cross-server focus pinning
+- **Frame pacing** — Adaptive VBlank scheduling with rolling peak draw-time tracking, compositing floor, and FPS limiting
 - **Headless mode** — Offscreen rendering for CI and robotics pipelines
 
 # Roadmap
@@ -41,11 +43,15 @@ High-level feature goals for Gamecomp. No hard dates — contributions welcome.
 - [x] Input routing — keyboard, pointer, scroll forwarding to focused client (DRM evdev + nested host passthrough)
 - [x] Cursor passthrough — client cursor images forwarded to host compositor via SHM
 - [x] XKB keymap and modifier forwarding from host to clients (nested mode)
+- [x] Multi-XWayland server lifecycle — spawn, monitor, respawn with per-server XWM threads
+- [x] Steam mode focus gating — 4-phase cross-server focus arbitration with per-surface commit gating
+- [x] Baselayer focus control — `GAMECOMP_BASELAYER_APPID` atom for cross-server focus pinning
+- [x] Adaptive frame pacing — rolling peak draw-time, compositing floor, VRR mode, FPS limiting
+- [x] XWayland window management — XWM with fullscreen atoms, reparenting, per-server window tracking
+- [x] Runtime resolution control — `GAMECOMP_XWAYLAND_MODE_CONTROL` atom for per-server resolution switching
 
 ## In Progress
 
-- [ ] XWayland window management — core WM works, close/resize/title reading stubbed, input focus set
-- [ ] Adaptive frame pacing — algorithm complete, needs timerfd scheduling integration
 - [ ] VRR (variable refresh rate) — frame pacer support exists, needs per-connector toggle
 - [ ] Multi-plane assignment — overlay/cursor plane offload to reduce GPU work
 
@@ -68,7 +74,7 @@ High-level feature goals for Gamecomp. No hard dates — contributions welcome.
 cargo build --release
 ```
 
-Requires Rust 1.93.1+ and the following system dependencies:
+Requires Rust stable (edition 2024) and the following system dependencies:
 - `libdrm`, `libgbm` — DRM/KMS support
 - `libseat`, `libudev` — Session and device management  
 - `libwayland` — Wayland protocol
@@ -86,8 +92,11 @@ gamecomp --nested -- my-game
 # Headless mode for CI
 gamecomp --backend headless -- my-app
 
-# Steam integration mode (AppIDs from STEAM_GAME atom only)
-gamecomp -e -- steam
+# Steam mode with 2 XWayland servers (focus gating enabled)
+gamecomp -e --xwayland-count 2 -- steam
+
+# Steam mode with baselayer pinning (pin focus to a specific server's app)
+# Set GAMECOMP_BASELAYER_APPID on a server's root window to pin focus
 
 # Multiple XWayland servers (server 0 = platform, 1+ = game)
 gamecomp --xwayland-count 2 -- my-game
@@ -97,7 +106,7 @@ gamecomp --xwayland-count 2 -- my-game
 
 | Flag | Description |
 |------|-------------|
-| `--nested` | Run inside another Wayland compositor |
+| `-n`, `--nested` | Run inside another Wayland compositor (alias: `--wayland`) |
 | `--backend headless` | Offscreen rendering for CI |
 | `-W`, `--output-width` | Output width in pixels |
 | `-H`, `--output-height` | Output height in pixels |
@@ -105,8 +114,8 @@ gamecomp --xwayland-count 2 -- my-game
 | `-h`, `--nested-height` | Game render height (client-side resolution) |
 | `-r`, `--refresh-rate` | Refresh rate in Hz |
 | `-o`, `--output` | Preferred output connector (e.g., `eDP-1`) |
-| `-e`, `--steam` | Steam integration mode — AppIDs come exclusively from the `STEAM_GAME` atom. Without this flag, windows without `STEAM_GAME` get their X11 window ID as a synthetic AppID. |
-| `--xwayland-count N` | Number of XWayland servers to spawn (default: 1). Server 0 is the platform display, servers 1+ are game displays. Sets `STEAM_GAME_DISPLAY_N` env vars for child processes. |
+| `-e`, `--steam` | Steam mode — AppIDs come exclusively from the `STEAM_GAME` atom. Enables 4-phase cross-server focus arbitration and per-surface commit gating (zero GPU waste on unfocused servers). |
+| `--xwayland-count N` | Number of XWayland servers to spawn (default: 1). Sets `STEAM_GAME_DISPLAY_N` env vars for child processes. |
 | `--vrr` / `--no-vrr` | Enable/disable variable refresh rate |
 | `--hdr` / `--no-hdr` | Enable/disable HDR |
 | `--upscale MODE` | Upscaling algorithm: `fsr`, `nis`, `cas`, or `none` |
