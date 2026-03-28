@@ -49,7 +49,7 @@ src/
 │   └── pointer.rs       # Evdev pointer → Wayland forwarding
 └── wayland/
     ├── mod.rs           # Wayland server setup, commit gating
-    ├── atoms.rs         # X11 atom definitions (STEAM_GAME, GAMECOMP_*, etc.)
+    ├── atoms.rs         # X11 atom definitions (STEAM_GAME, GAMESCOPE_*, etc.)
     ├── window_tracker.rs# Per-server window tracking and local focus
     ├── xwayland.rs      # XWM thread, X11 event handling, focus feedback
     └── protocols/       # Wayland protocol implementations

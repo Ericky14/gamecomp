@@ -12,7 +12,7 @@
 //!
 //! Focus determination runs whenever:
 //! - A window is mapped, unmapped, or destroyed
-//! - A property changes on a window or the root (e.g., `GAMECOMP_BASELAYER_APPID`)
+//! - A property changes on a window or the root (e.g., `GAMESCOPECTRL_BASELAYER_APPID`)
 //! - The compositor requests a focus change via `XwmCommand`
 
 use std::collections::HashMap;
@@ -133,10 +133,10 @@ pub struct WindowTracker {
     /// Monotonic counter for ordering window maps.
     next_sequence: u64,
     /// AppID(s) that an external controller (Steam) wants focused.
-    /// Set via `GAMECOMP_BASELAYER_APPID` atom on the root window.
+    /// Set via `GAMESCOPECTRL_BASELAYER_APPID` atom on the root window.
     requested_app_ids: Vec<u32>,
     /// Specific window ID that an external controller wants focused.
-    /// Set via `GAMECOMP_BASELAYER_WINDOW` atom on the root window.
+    /// Set via `GAMESCOPECTRL_BASELAYER_WINDOW` atom on the root window.
     requested_window: Option<u32>,
     /// Whether focus needs re-evaluation.
     focus_dirty: bool,

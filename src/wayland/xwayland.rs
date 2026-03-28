@@ -17,7 +17,7 @@
 //! # Multi-display
 //!
 //! Each XWayland server instance gets a unique `display_id`. The compositor
-//! can spawn additional instances via the `GAMECOMP_CREATE_XWAYLAND_SERVER`
+//! can spawn additional instances via the `GAMESCOPE_CREATE_XWAYLAND_SERVER`
 //! atom or `XwmCommand::CreateXWaylandServer`.
 
 use std::process::Child;
@@ -71,29 +71,29 @@ pub enum XwmEvent {
     FocusChanged(u32, FocusState),
 
     // --- Atom-driven runtime control events ---
-    /// FPS limit changed via `GAMECOMP_FPS_LIMIT` atom.
+    /// FPS limit changed via `GAMESCOPE_FPS_LIMIT` atom.
     FpsLimitChanged(u32),
-    /// VRR enable/disable changed via `GAMECOMP_VRR_ENABLED` atom.
+    /// VRR enable/disable changed via `GAMESCOPE_VRR_ENABLED` atom.
     VrrChanged(bool),
-    /// Low-latency mode changed via `GAMECOMP_LOW_LATENCY` atom.
+    /// Low-latency mode changed via `GAMESCOPE_LOW_LATENCY` atom.
     LowLatencyChanged(bool),
-    /// Allow-tearing changed via `GAMECOMP_ALLOW_TEARING` atom.
+    /// Allow-tearing changed via `GAMESCOPE_ALLOW_TEARING` atom.
     AllowTearingChanged(bool),
-    /// Scaling filter changed via `GAMECOMP_SCALING_FILTER` atom.
+    /// Scaling filter changed via `GAMESCOPE_SCALING_FILTER` atom.
     ScalingFilterChanged(u32),
-    /// FSR sharpness changed via `GAMECOMP_FSR_SHARPNESS` atom.
+    /// FSR sharpness changed via `GAMESCOPE_FSR_SHARPNESS` atom.
     FsrSharpnessChanged(u32),
-    /// HDR enable/disable changed via `GAMECOMP_HDR_ENABLED` atom.
+    /// HDR enable/disable changed via `GAMESCOPE_HDR_ENABLED` atom.
     HdrChanged(bool),
-    /// Force composition mode (no direct scanout) via `GAMECOMP_COMPOSITE_FORCE`.
+    /// Force composition mode (no direct scanout) via `GAMESCOPE_COMPOSITE_FORCE`.
     CompositeForceChanged(bool),
-    /// Screenshot requested via `GAMECOMP_REQUEST_SCREENSHOT` atom.
+    /// Screenshot requested via `GAMESCOPECTRL_REQUEST_SCREENSHOT` atom.
     ScreenshotRequested(u32),
     /// Request to create a new XWayland server via atom.
     CreateXWaylandServerRequested(u32),
     /// Request to destroy an XWayland server via atom.
     DestroyXWaylandServerRequested(u32),
-    /// Resolution change for a specific server via `GAMECOMP_XWAYLAND_MODE_CONTROL`.
+    /// Resolution change for a specific server via `GAMESCOPE_XWAYLAND_MODE_CONTROL`.
     /// Fields: `(target_server_idx, width, height, flags)`.
     XWaylandModeControl {
         target_server: u32,
@@ -101,9 +101,9 @@ pub enum XwmEvent {
         height: u32,
         flags: u32,
     },
-    /// Focus display changed via `GAMECOMP_FOCUS_DISPLAY`.
+    /// Focus display changed via `GAMESCOPE_FOCUS_DISPLAY`.
     FocusDisplayChanged(u32),
-    /// Baselayer AppID list changed via `GAMECOMP_BASELAYER_APPID`.
+    /// Baselayer AppID list changed via `GAMESCOPECTRL_BASELAYER_APPID`.
     /// The main loop uses this to prefer servers whose focused AppID
     /// matches a requested ID (cross-server focus control).
     BaselayerAppIdsChanged(Vec<u32>),
@@ -254,8 +254,8 @@ pub fn run_xwm(
     // Publish our PID on the root window for identification.
     publish_pid(&conn, root, &atoms);
 
-    // Publish the server index on the root window so external clients
-    // (Vulkan WSI layer, Steam) can identify which XWayland server they are on.
+    // Publish the server index on the root window so gamescope-dbus
+    // and other ecosystem tools can discover this XWayland instance.
     {
         use x11rb::protocol::xproto::{AtomEnum, PropMode};
         let _ = conn.change_property32(
@@ -682,7 +682,7 @@ fn handle_property_notify<C: Connection>(
             if val > 0 {
                 tracker.set_role(window, WindowRole::ExternalOverlay);
             }
-            debug!(window, val, "GAMECOMP_EXTERNAL_OVERLAY changed");
+            debug!(window, val, "GAMESCOPE_EXTERNAL_OVERLAY changed");
         } else if atom == atoms.net_wm_opacity {
             let raw = read_u32_prop(conn, window, atoms.net_wm_opacity);
             let opacity = (raw as f64 / u32::MAX as f64) as f32;
@@ -703,56 +703,56 @@ fn handle_property_notify<C: Connection>(
     // --- Root window properties (runtime control atoms) ---
     if atom == atoms.focus_appid {
         let ids = read_u32_list_prop(conn, root, atoms.focus_appid);
-        debug!(?ids, "GAMECOMP_BASELAYER_APPID changed");
+        debug!(?ids, "GAMESCOPECTRL_BASELAYER_APPID changed");
         tracker.set_requested_app_ids(ids.clone());
         let _ = event_tx.send(XwmEvent::BaselayerAppIdsChanged(ids));
     } else if atom == atoms.focus_window {
         let id = read_u32_prop(conn, root, atoms.focus_window);
-        debug!(id, "GAMECOMP_BASELAYER_WINDOW changed");
+        debug!(id, "GAMESCOPECTRL_BASELAYER_WINDOW changed");
         tracker.set_requested_window(if id > 0 { Some(id) } else { None });
     } else if atom == atoms.fps_limit {
         let val = read_u32_prop(conn, root, atoms.fps_limit);
-        debug!(val, "GAMECOMP_FPS_LIMIT changed");
+        debug!(val, "GAMESCOPE_FPS_LIMIT changed");
         let _ = event_tx.send(XwmEvent::FpsLimitChanged(val));
     } else if atom == atoms.vrr_enabled {
         let val = read_u32_prop(conn, root, atoms.vrr_enabled);
-        debug!(val, "GAMECOMP_VRR_ENABLED changed");
+        debug!(val, "GAMESCOPE_VRR_ENABLED changed");
         let _ = event_tx.send(XwmEvent::VrrChanged(val > 0));
     } else if atom == atoms.low_latency {
         let val = read_u32_prop(conn, root, atoms.low_latency);
-        debug!(val, "GAMECOMP_LOW_LATENCY changed");
+        debug!(val, "GAMESCOPE_LOW_LATENCY changed");
         let _ = event_tx.send(XwmEvent::LowLatencyChanged(val > 0));
     } else if atom == atoms.allow_tearing {
         let val = read_u32_prop(conn, root, atoms.allow_tearing);
-        debug!(val, "GAMECOMP_ALLOW_TEARING changed");
+        debug!(val, "GAMESCOPE_ALLOW_TEARING changed");
         let _ = event_tx.send(XwmEvent::AllowTearingChanged(val > 0));
     } else if atom == atoms.scaling_filter {
         let val = read_u32_prop(conn, root, atoms.scaling_filter);
-        debug!(val, "GAMECOMP_SCALING_FILTER changed");
+        debug!(val, "GAMESCOPE_SCALING_FILTER changed");
         let _ = event_tx.send(XwmEvent::ScalingFilterChanged(val));
     } else if atom == atoms.fsr_sharpness {
         let val = read_u32_prop(conn, root, atoms.fsr_sharpness);
-        debug!(val, "GAMECOMP_FSR_SHARPNESS changed");
+        debug!(val, "GAMESCOPE_FSR_SHARPNESS changed");
         let _ = event_tx.send(XwmEvent::FsrSharpnessChanged(val));
     } else if atom == atoms.hdr_enabled {
         let val = read_u32_prop(conn, root, atoms.hdr_enabled);
-        debug!(val, "GAMECOMP_HDR_ENABLED changed");
+        debug!(val, "GAMESCOPE_HDR_ENABLED changed");
         let _ = event_tx.send(XwmEvent::HdrChanged(val > 0));
     } else if atom == atoms.composite_force {
         let val = read_u32_prop(conn, root, atoms.composite_force);
-        debug!(val, "GAMECOMP_COMPOSITE_FORCE changed");
+        debug!(val, "GAMESCOPE_COMPOSITE_FORCE changed");
         let _ = event_tx.send(XwmEvent::CompositeForceChanged(val > 0));
     } else if atom == atoms.request_screenshot {
         let val = read_u32_prop(conn, root, atoms.request_screenshot);
-        debug!(val, "GAMECOMP_REQUEST_SCREENSHOT");
+        debug!(val, "GAMESCOPECTRL_REQUEST_SCREENSHOT");
         let _ = event_tx.send(XwmEvent::ScreenshotRequested(val));
     } else if atom == atoms.create_xwayland_server {
         let val = read_u32_prop(conn, root, atoms.create_xwayland_server);
-        info!(id = val, "GAMECOMP_CREATE_XWAYLAND_SERVER requested");
+        info!(id = val, "GAMESCOPE_CREATE_XWAYLAND_SERVER requested");
         let _ = event_tx.send(XwmEvent::CreateXWaylandServerRequested(val));
     } else if atom == atoms.destroy_xwayland_server {
         let val = read_u32_prop(conn, root, atoms.destroy_xwayland_server);
-        info!(id = val, "GAMECOMP_DESTROY_XWAYLAND_SERVER requested");
+        info!(id = val, "GAMESCOPE_DESTROY_XWAYLAND_SERVER requested");
         let _ = event_tx.send(XwmEvent::DestroyXWaylandServerRequested(val));
     } else if atom == atoms.xwayland_mode_control {
         let vals = read_u32_list_prop(conn, root, atoms.xwayland_mode_control);
@@ -763,7 +763,7 @@ fn handle_property_notify<C: Connection>(
             let flags = vals.get(3).copied().unwrap_or(0);
             info!(
                 target_server = target,
-                width, height, flags, "GAMECOMP_XWAYLAND_MODE_CONTROL changed"
+                width, height, flags, "GAMESCOPE_XWAYLAND_MODE_CONTROL changed"
             );
             let _ = event_tx.send(XwmEvent::XWaylandModeControl {
                 target_server: target,
@@ -774,7 +774,7 @@ fn handle_property_notify<C: Connection>(
         }
     } else if atom == atoms.focus_display {
         let val = read_u32_prop(conn, root, atoms.focus_display);
-        info!(display = val, "GAMECOMP_FOCUS_DISPLAY changed");
+        info!(display = val, "GAMESCOPE_FOCUS_DISPLAY changed");
         let _ = event_tx.send(XwmEvent::FocusDisplayChanged(val));
     }
 }

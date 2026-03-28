@@ -8,7 +8,7 @@
 //! The [`FocusArbiter`] implements a 4-phase strategy modelled after
 //! gamescope's `determine_and_apply_focus`:
 //!
-//! 0. **Baselayer priority** — if `GAMECOMP_BASELAYER_APPID` is set,
+//! 0. **Baselayer priority** — if `GAMESCOPECTRL_BASELAYER_APPID` is set,
 //!    prefer the server whose focused AppID matches.
 //! 1. **Stealer detection** — if a server just received a new
 //!    `STEAM_GAME` atom (app_id changed to non-zero), it steals focus.
@@ -99,7 +99,7 @@ impl FocusArbiter {
         let mut winner_surface: u32 = 0;
         let mut winner_server: u32 = u32::MAX;
 
-        // Phase 0: baselayer priority (GAMECOMP_BASELAYER_APPID).
+        // Phase 0: baselayer priority (GAMESCOPECTRL_BASELAYER_APPID).
         let mut baselayer_matched = false;
         if !self.baselayer_app_ids.is_empty() {
             for srv in servers {

@@ -13,10 +13,11 @@
 //! - **Feedback properties**: written by the compositor back to the root window
 //!   so controllers can read current state
 //!
-//! The naming convention follows gamescope:
-//! - `GAMECOMP_*` — compositor-specific atoms
-//! - `STEAM_*` — Steam compatibility atoms (same names as gamescope for
-//!   drop-in compatibility)
+//! Atom naming uses gamescope-compatible prefixes for ecosystem interop
+//! (gamescope-dbus, playserve, Steam):
+//! - `GAMESCOPE_*` — compositor feedback / display state atoms
+//! - `GAMESCOPECTRL_*` — control atoms (written by external clients)
+//! - `STEAM_*` — Steam classification atoms
 
 use anyhow::Context;
 use tracing::info;
@@ -65,91 +66,91 @@ pub struct Atoms {
     pub steam_bigpicture: u32,
     /// `STEAM_INPUT_FOCUS` — input focus mode (0=normal, 1=overlay grabs).
     pub steam_input_focus: u32,
-    /// `GAMECOMP_EXTERNAL_OVERLAY` — external overlay (MangoHud, etc.).
+    /// `GAMESCOPE_EXTERNAL_OVERLAY` — external overlay (MangoHud, etc.).
     pub external_overlay: u32,
 
-    // --- Focus control atoms (set on root by Steam/controller) ---
-    /// `GAMECOMP_BASELAYER_APPID` — array of AppIDs to focus.
+    // --- Focus control atoms (set on root by gamescope-dbus / Steam) ---
+    /// `GAMESCOPECTRL_BASELAYER_APPID` — array of AppIDs to focus.
     pub focus_appid: u32,
-    /// `GAMECOMP_BASELAYER_WINDOW` — specific window ID to focus.
+    /// `GAMESCOPECTRL_BASELAYER_WINDOW` — specific window ID to focus.
     pub focus_window: u32,
-    /// `GAMECOMP_FOCUS_DISPLAY` — which display receives focus.
+    /// `GAMESCOPE_FOCUS_DISPLAY` — which display receives focus.
     pub focus_display: u32,
 
     // --- Resolution / display atoms (set on root) ---
-    /// `GAMECOMP_XWAYLAND_MODE_CONTROL` — `[server_idx, width, height, flags]`.
+    /// `GAMESCOPE_XWAYLAND_MODE_CONTROL` — `[server_idx, width, height, flags]`.
     pub xwayland_mode_control: u32,
-    /// `GAMECOMP_FORCE_WINDOWS_FULLSCREEN` — force all windows fullscreen.
+    /// `GAMESCOPE_FORCE_WINDOWS_FULLSCREEN` — force all windows fullscreen.
     pub force_windows_fullscreen: u32,
 
     // --- FPS / performance atoms (set on root) ---
-    /// `GAMECOMP_FPS_LIMIT` — runtime FPS cap.
+    /// `GAMESCOPE_FPS_LIMIT` — runtime FPS cap.
     pub fps_limit: u32,
-    /// `GAMECOMP_VRR_ENABLED` — enable variable refresh rate.
+    /// `GAMESCOPE_VRR_ENABLED` — enable variable refresh rate.
     pub vrr_enabled: u32,
-    /// `GAMECOMP_LOW_LATENCY` — enable low-latency mode.
+    /// `GAMESCOPE_LOW_LATENCY` — enable low-latency mode.
     pub low_latency: u32,
-    /// `GAMECOMP_ALLOW_TEARING` — allow tearing for VRR.
+    /// `GAMESCOPE_ALLOW_TEARING` — allow tearing for VRR.
     pub allow_tearing: u32,
 
     // --- Scaling / filter atoms (set on root) ---
-    /// `GAMECOMP_SCALING_FILTER` — scaling filter selection.
+    /// `GAMESCOPE_SCALING_FILTER` — scaling filter selection.
     pub scaling_filter: u32,
-    /// `GAMECOMP_FSR_SHARPNESS` — FSR sharpness (0–20).
+    /// `GAMESCOPE_FSR_SHARPNESS` — FSR sharpness (0–20).
     pub fsr_sharpness: u32,
-    /// `GAMECOMP_SHARPNESS` — general sharpness (0–20).
+    /// `GAMESCOPE_SHARPNESS` — general sharpness (0–20).
     pub sharpness: u32,
 
     // --- HDR atoms (set on root) ---
-    /// `GAMECOMP_HDR_ENABLED` — enable HDR output.
+    /// `GAMESCOPE_HDR_ENABLED` — enable HDR output.
     pub hdr_enabled: u32,
-    /// `GAMECOMP_SDR_ON_HDR_BRIGHTNESS` — SDR content brightness in HDR mode.
+    /// `GAMESCOPE_SDR_ON_HDR_BRIGHTNESS` — SDR content brightness in HDR mode.
     pub sdr_on_hdr_brightness: u32,
 
     // --- Compositor debug atoms (set on root) ---
-    /// `GAMECOMP_COMPOSITE_FORCE` — force full composition (no direct scanout).
+    /// `GAMESCOPE_COMPOSITE_FORCE` — force full composition (no direct scanout).
     pub composite_force: u32,
-    /// `GAMECOMP_COMPOSITE_DEBUG` — debug visualization flags.
+    /// `GAMESCOPE_COMPOSITE_DEBUG` — debug visualization flags.
     pub composite_debug: u32,
 
     // --- Multi-display atoms (set on root) ---
-    /// `GAMECOMP_XWAYLAND_SERVER_ID` — published on each server's root window
-    /// so external clients can identify which XWayland server they are on.
+    /// `GAMESCOPE_XWAYLAND_SERVER_ID` — published on each server's root window
+    /// so gamescope-dbus can discover and manage XWayland instances.
     pub xwayland_server_id: u32,
-    /// `GAMECOMP_CREATE_XWAYLAND_SERVER` — request new XWayland server.
+    /// `GAMESCOPE_CREATE_XWAYLAND_SERVER` — request new XWayland server.
     pub create_xwayland_server: u32,
-    /// `GAMECOMP_CREATE_XWAYLAND_SERVER_FEEDBACK` — feedback after dynamic server
+    /// `GAMESCOPE_CREATE_XWAYLAND_SERVER_FEEDBACK` — feedback after dynamic server
     /// creation. Value is `"<identifier> <server_id> <display_name>"`.
     pub create_xwayland_server_feedback: u32,
-    /// `GAMECOMP_DESTROY_XWAYLAND_SERVER` — destroy XWayland server by ID.
+    /// `GAMESCOPE_DESTROY_XWAYLAND_SERVER` — destroy XWayland server by ID.
     pub destroy_xwayland_server: u32,
 
     // --- Feedback atoms (written by compositor to root for controllers to read) ---
-    /// `GAMECOMP_FOCUSED_APP` — currently focused AppID.
+    /// `GAMESCOPE_FOCUSED_APP` — currently focused AppID.
     pub focused_app: u32,
-    /// `GAMECOMP_FOCUSED_WINDOW` — currently focused window ID.
+    /// `GAMESCOPE_FOCUSED_WINDOW` — currently focused window ID.
     pub focused_window: u32,
-    /// `GAMECOMP_FOCUSABLE_APPS` — list of all focusable AppIDs.
+    /// `GAMESCOPE_FOCUSABLE_APPS` — list of all focusable AppIDs.
     pub focusable_apps: u32,
-    /// `GAMECOMP_FOCUSABLE_WINDOWS` — triplets [windowID, appID, pid].
+    /// `GAMESCOPE_FOCUSABLE_WINDOWS` — triplets [windowID, appID, pid].
     pub focusable_windows: u32,
-    /// `GAMECOMP_VRR_CAPABLE` — whether display supports VRR.
+    /// `GAMESCOPE_VRR_CAPABLE` — whether display supports VRR.
     pub vrr_capable: u32,
-    /// `GAMECOMP_VRR_IN_USE` — whether VRR is currently active.
+    /// `GAMESCOPE_VRR_IN_USE` — whether VRR is currently active.
     pub vrr_in_use: u32,
-    /// `GAMECOMP_HDR_SUPPORTED` — whether display supports HDR.
+    /// `GAMESCOPE_HDR_SUPPORTED` — whether display supports HDR.
     pub hdr_supported: u32,
-    /// `GAMECOMP_FSR_ACTIVE` — whether FSR is currently active.
+    /// `GAMESCOPE_FSR_ACTIVE` — whether FSR is currently active.
     pub fsr_active: u32,
-    /// `GAMECOMP_DISPLAY_REFRESH_RATE` — current display refresh rate.
+    /// `GAMESCOPE_DISPLAY_REFRESH_RATE` — current display refresh rate.
     pub display_refresh_rate: u32,
-    /// `GAMECOMP_CURSOR_VISIBLE` — cursor visibility state.
+    /// `GAMESCOPE_CURSOR_VISIBLE` — cursor visibility state.
     pub cursor_visible: u32,
-    /// `GAMECOMP_PID` — compositor process ID.
+    /// `GAMESCOPE_PID` — compositor process ID.
     pub pid: u32,
 
     // --- Screenshot ---
-    /// `GAMECOMP_REQUEST_SCREENSHOT` — trigger screenshot.
+    /// `GAMESCOPECTRL_REQUEST_SCREENSHOT` — trigger screenshot.
     pub request_screenshot: u32,
 }
 
@@ -180,48 +181,48 @@ impl Atoms {
             "STEAM_OVERLAY",
             "STEAM_BIGPICTURE",
             "STEAM_INPUT_FOCUS",
-            "GAMECOMP_EXTERNAL_OVERLAY",
+            "GAMESCOPE_EXTERNAL_OVERLAY",
             // Focus control
-            "GAMECOMP_BASELAYER_APPID",
-            "GAMECOMP_BASELAYER_WINDOW",
-            "GAMECOMP_FOCUS_DISPLAY",
+            "GAMESCOPECTRL_BASELAYER_APPID",
+            "GAMESCOPECTRL_BASELAYER_WINDOW",
+            "GAMESCOPE_FOCUS_DISPLAY",
             // Resolution / display
-            "GAMECOMP_XWAYLAND_MODE_CONTROL",
-            "GAMECOMP_FORCE_WINDOWS_FULLSCREEN",
+            "GAMESCOPE_XWAYLAND_MODE_CONTROL",
+            "GAMESCOPE_FORCE_WINDOWS_FULLSCREEN",
             // FPS / performance
-            "GAMECOMP_FPS_LIMIT",
-            "GAMECOMP_VRR_ENABLED",
-            "GAMECOMP_LOW_LATENCY",
-            "GAMECOMP_ALLOW_TEARING",
+            "GAMESCOPE_FPS_LIMIT",
+            "GAMESCOPE_VRR_ENABLED",
+            "GAMESCOPE_LOW_LATENCY",
+            "GAMESCOPE_ALLOW_TEARING",
             // Scaling / filter
-            "GAMECOMP_SCALING_FILTER",
-            "GAMECOMP_FSR_SHARPNESS",
-            "GAMECOMP_SHARPNESS",
+            "GAMESCOPE_SCALING_FILTER",
+            "GAMESCOPE_FSR_SHARPNESS",
+            "GAMESCOPE_SHARPNESS",
             // HDR
-            "GAMECOMP_HDR_ENABLED",
-            "GAMECOMP_SDR_ON_HDR_BRIGHTNESS",
+            "GAMESCOPE_HDR_ENABLED",
+            "GAMESCOPE_SDR_ON_HDR_BRIGHTNESS",
             // Debug
-            "GAMECOMP_COMPOSITE_FORCE",
-            "GAMECOMP_COMPOSITE_DEBUG",
+            "GAMESCOPE_COMPOSITE_FORCE",
+            "GAMESCOPE_COMPOSITE_DEBUG",
             // Multi-display
-            "GAMECOMP_XWAYLAND_SERVER_ID",
-            "GAMECOMP_CREATE_XWAYLAND_SERVER",
-            "GAMECOMP_CREATE_XWAYLAND_SERVER_FEEDBACK",
-            "GAMECOMP_DESTROY_XWAYLAND_SERVER",
+            "GAMESCOPE_XWAYLAND_SERVER_ID",
+            "GAMESCOPE_CREATE_XWAYLAND_SERVER",
+            "GAMESCOPE_CREATE_XWAYLAND_SERVER_FEEDBACK",
+            "GAMESCOPE_DESTROY_XWAYLAND_SERVER",
             // Feedback
-            "GAMECOMP_FOCUSED_APP",
-            "GAMECOMP_FOCUSED_WINDOW",
-            "GAMECOMP_FOCUSABLE_APPS",
-            "GAMECOMP_FOCUSABLE_WINDOWS",
-            "GAMECOMP_VRR_CAPABLE",
-            "GAMECOMP_VRR_IN_USE",
-            "GAMECOMP_HDR_SUPPORTED",
-            "GAMECOMP_FSR_ACTIVE",
-            "GAMECOMP_DISPLAY_REFRESH_RATE",
-            "GAMECOMP_CURSOR_VISIBLE",
-            "GAMECOMP_PID",
+            "GAMESCOPE_FOCUSED_APP",
+            "GAMESCOPE_FOCUSED_WINDOW",
+            "GAMESCOPE_FOCUSABLE_APPS",
+            "GAMESCOPE_FOCUSABLE_WINDOWS",
+            "GAMESCOPE_VRR_CAPABLE",
+            "GAMESCOPE_VRR_IN_USE",
+            "GAMESCOPE_HDR_SUPPORTED",
+            "GAMESCOPE_FSR_ACTIVE",
+            "GAMESCOPE_DISPLAY_REFRESH_RATE",
+            "GAMESCOPE_CURSOR_VISIBLE",
+            "GAMESCOPE_PID",
             // Screenshot
-            "GAMECOMP_REQUEST_SCREENSHOT",
+            "GAMESCOPECTRL_REQUEST_SCREENSHOT",
         ];
 
         // Send all requests in one batch (pipelined, single flush).
