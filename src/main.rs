@@ -300,9 +300,8 @@ fn run(config: Config) -> anyhow::Result<()> {
     let focused_wl_surface_id = Arc::new(AtomicU32::new(0));
     let focused_server_index = Arc::new(AtomicU32::new(u32::MAX));
 
-    // Wire steam_mode and focused surface into wayland state so the
-    // commit handler can gate presentation per-surface.
-    wayland_state.steam_mode = config.steam_mode;
+    // Wire focused surface into wayland state so the commit handler
+    // can gate presentation per-surface.
     wayland_state.focused_wl_surface_id = Arc::clone(&focused_wl_surface_id);
     wayland_state.focused_server_index = Arc::clone(&focused_server_index);
 
@@ -337,7 +336,6 @@ fn run(config: Config) -> anyhow::Result<()> {
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<wayland::xwayland::XwmCommand>();
         let evt_tx = xwm_event_tx.clone();
         let xwm_display = display_str.clone();
-        let xwm_steam_mode = config.steam_mode;
         let srv_focused_app = Arc::new(AtomicU32::new(0));
         let srv_focused_surface = Arc::new(AtomicU32::new(0));
         let xwm_focused_app = Arc::clone(&srv_focused_app);
@@ -351,7 +349,6 @@ fn run(config: Config) -> anyhow::Result<()> {
                         &evt_tx,
                         &cmd_rx,
                         server_idx,
-                        xwm_steam_mode,
                         &xwm_focused_app,
                         &xwm_focused_surface,
                         srv_w,
@@ -388,8 +385,7 @@ fn run(config: Config) -> anyhow::Result<()> {
     }
 
     // --- Launch child command ---
-    let mut child_process =
-        launch_child_command(&config, &socket_name, &xwayland_servers, xwayland_count)?;
+    let mut child_process = launch_child_command(&config, &xwayland_servers, xwayland_count)?;
 
     // --- Main event loop ---
     info!("entering main event loop");
@@ -399,7 +395,8 @@ fn run(config: Config) -> anyhow::Result<()> {
     // Track the last-seen detected refresh rate to avoid redundant updates.
     let mut last_detected_hz: u32 = 0;
 
-    // Cross-server focus arbiter for steam mode.
+    // Cross-server focus arbiter — picks the global winning server
+    // and gates commits so only the focused surface gets frame callbacks.
     let mut focus_arbiter = FocusArbiter::new(xwayland_count as usize);
 
     while RUNNING.load(Ordering::Relaxed) {
@@ -456,24 +453,22 @@ fn run(config: Config) -> anyhow::Result<()> {
 
         // Drain XWM events and run the 4-phase focus arbiter. The arbiter
         // picks the global winning server and signals focus changes.
-        if config.steam_mode {
-            focus_arbiter.drain_events(&xwm_event_rx);
-            let focus_states: Vec<_> = xwayland_servers.iter().map(|s| s.focus_state()).collect();
-            let result = focus_arbiter.update(&focus_states);
+        focus_arbiter.drain_events(&xwm_event_rx);
+        let focus_states: Vec<_> = xwayland_servers.iter().map(|s| s.focus_state()).collect();
+        let result = focus_arbiter.update(&focus_states);
 
-            focused_app_id.store(result.app_id, Ordering::Relaxed);
-            focused_wl_surface_id.store(result.surface_id, Ordering::Relaxed);
-            focused_server_index.store(result.server_index, Ordering::Relaxed);
+        focused_app_id.store(result.app_id, Ordering::Relaxed);
+        focused_wl_surface_id.store(result.surface_id, Ordering::Relaxed);
+        focused_server_index.store(result.server_index, Ordering::Relaxed);
 
-            if result.changed && result.surface_id != 0 {
-                wayland_state.fire_frame_callbacks();
-            }
+        if result.changed && result.surface_id != 0 {
+            wayland_state.fire_frame_callbacks();
         }
 
         // Forward staged buffer if the FPS limiter allows it.
-        // In steam mode, suppress presentation when no app has focus
-        // (focused_app_id == 0 means no window has a STEAM_GAME atom).
-        let has_focus = !config.steam_mode || focused_app_id.load(Ordering::Relaxed) != 0;
+        // Suppress presentation when no app has focus (focused_app_id == 0
+        // means no window is mapped or focusable yet).
+        let has_focus = focused_app_id.load(Ordering::Relaxed) != 0;
         forward_staged_frame(&mut wayland_state, &mut fps_limiter, has_focus);
 
         // Dispatch Wayland requests only when the staging slot is empty
@@ -522,10 +517,12 @@ fn run(config: Config) -> anyhow::Result<()> {
 // ─── Event loop helpers ─────────────────────────────────────────────
 
 /// Launch the child process (e.g., Steam, vkcube) with the correct
-/// `WAYLAND_DISPLAY`, `DISPLAY`, and `STEAM_GAME_DISPLAY_N` env vars.
+/// `DISPLAY` and `STEAM_GAME_DISPLAY_N` env vars.
+///
+/// `WAYLAND_DISPLAY` is explicitly removed so all apps route through
+/// XWayland (X11), where window tracking and focus gating operate.
 fn launch_child_command(
     config: &Config,
-    socket_name: &str,
     xwayland_servers: &[XWaylandInstance],
     xwayland_count: u32,
 ) -> anyhow::Result<Option<std::process::Child>> {
@@ -538,7 +535,7 @@ fn launch_child_command(
     child_cmd
         .arg("-c")
         .arg(cmd)
-        .env("WAYLAND_DISPLAY", socket_name)
+        .env_remove("WAYLAND_DISPLAY")
         .env("DISPLAY", &xwayland_servers[0].display);
 
     // Set STEAM_GAME_DISPLAY_N env vars for game servers (1+).
@@ -757,9 +754,9 @@ fn forward_staged_frame(
     let mut did_release = false;
 
     if let Some(buffer) = state.staged_buffer.take() {
-        // Only present if a window actually has focus. In steam mode
-        // without a STEAM_GAME window, buffers are dropped so the
-        // host window stays blank.
+        // Only present if a window actually has focus. Without a
+        // focused window, buffers are dropped so the host window
+        // stays blank.
         if has_focus && let Some(ref tx) = state.frame_channel {
             let _ = tx.send(buffer);
         }

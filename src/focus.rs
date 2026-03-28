@@ -1,4 +1,4 @@
-//! Cross-server focus arbitration for steam mode.
+//! Cross-server focus arbitration.
 //!
 //! When multiple XWayland servers run simultaneously (platform + game),
 //! the compositor must decide which server's surface is the "winner" —

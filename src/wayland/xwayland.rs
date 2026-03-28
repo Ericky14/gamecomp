@@ -198,7 +198,6 @@ pub fn run_xwm(
     event_tx: &calloop::channel::Sender<XwmEvent>,
     cmd_rx: &std::sync::mpsc::Receiver<XwmCommand>,
     server_index: u32,
-    steam_mode: bool,
     focused_app_id: &std::sync::atomic::AtomicU32,
     focused_wl_surface_id: &std::sync::atomic::AtomicU32,
     output_width: u32,
@@ -223,7 +222,7 @@ pub fn run_xwm(
     let atoms = Atoms::intern(&conn).context("failed to intern X11 atoms")?;
 
     // Initialize window tracker.
-    let mut tracker = WindowTracker::new(steam_mode);
+    let mut tracker = WindowTracker::new();
 
     // Register as window manager (SubstructureRedirect on root).
     // Also subscribe to PropertyChangeMask so we receive PropertyNotify
@@ -297,7 +296,6 @@ pub fn run_xwm(
                     root,
                     event,
                     server_index,
-                    steam_mode,
                     output_width,
                     output_height,
                 );
@@ -435,7 +433,6 @@ fn handle_x11_event<C: Connection>(
     root: u32,
     event: x11rb::protocol::Event,
     server_index: u32,
-    steam_mode: bool,
     output_width: u32,
     output_height: u32,
 ) {
@@ -477,17 +474,11 @@ fn handle_x11_event<C: Connection>(
 
             // Read initial properties for classification.
             let role = classify_window(conn, atoms, e.window);
-            let app_id = if steam_mode {
-                // Steam mode: AppID comes exclusively from the STEAM_GAME
-                // atom. Windows without it stay at 0 until Steam sets it.
-                read_u32_prop(conn, e.window, atoms.steam_game)
-            } else {
-                // Standalone mode: use STEAM_GAME if present, otherwise
-                // use the X11 window ID as a synthetic AppID so every
-                // window is always identifiable and focusable.
-                let steam_id = read_u32_prop(conn, e.window, atoms.steam_game);
-                if steam_id != 0 { steam_id } else { e.window }
-            };
+            // Use STEAM_GAME atom if present, otherwise fall back to
+            // the X11 window ID as a synthetic AppID so every window is
+            // always identifiable and focusable.
+            let steam_id = read_u32_prop(conn, e.window, atoms.steam_game);
+            let app_id = if steam_id != 0 { steam_id } else { e.window };
 
             // Register in tracker.
             let win = tracker.add_window(e.window);

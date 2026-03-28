@@ -140,14 +140,11 @@ pub struct WindowTracker {
     requested_window: Option<u32>,
     /// Whether focus needs re-evaluation.
     focus_dirty: bool,
-    /// Steam integration mode. When true, only windows with `app_id > 0`
-    /// (i.e., those with a `STEAM_GAME` atom) are considered for focus.
-    steam_mode: bool,
 }
 
 impl WindowTracker {
     /// Create a new empty window tracker.
-    pub fn new(steam_mode: bool) -> Self {
+    pub fn new() -> Self {
         Self {
             windows: HashMap::new(),
             focus: FocusState::default(),
@@ -155,17 +152,17 @@ impl WindowTracker {
             requested_app_ids: Vec::new(),
             requested_window: None,
             focus_dirty: false,
-            steam_mode,
         }
     }
 
     /// Whether a window is a valid focus candidate.
     ///
-    /// In steam mode, windows must have `app_id > 0` (set via `STEAM_GAME`)
-    /// to be considered. In standalone mode, all focusable windows qualify.
+    /// All focusable, mapped windows qualify. Every window gets an AppID
+    /// (either from `STEAM_GAME` or a synthetic ID from the X11 window ID),
+    /// so `app_id` is always > 0.
     #[inline(always)]
     fn is_focus_candidate(&self, w: &TrackedWindow) -> bool {
-        w.is_focusable() && (!self.steam_mode || w.app_id > 0)
+        w.is_focusable()
     }
 
     /// Register a new window (on MapRequest, before mapping).

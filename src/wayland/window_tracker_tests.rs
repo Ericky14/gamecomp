@@ -2,14 +2,14 @@ use super::*;
 
 #[test]
 fn empty_tracker_has_no_focus() {
-    let mut tracker = WindowTracker::new(false);
+    let mut tracker = WindowTracker::new();
     tracker.determine_focus();
     assert!(tracker.focus().app.is_none());
 }
 
 #[test]
 fn single_mapped_window_gets_focus() {
-    let mut tracker = WindowTracker::new(false);
+    let mut tracker = WindowTracker::new();
     tracker.add_window(42);
     tracker.map_window(42, 1920, 1080);
     tracker.determine_focus();
@@ -18,7 +18,7 @@ fn single_mapped_window_gets_focus() {
 
 #[test]
 fn most_recent_window_wins_focus() {
-    let mut tracker = WindowTracker::new(false);
+    let mut tracker = WindowTracker::new();
     tracker.add_window(1);
     tracker.map_window(1, 1920, 1080);
     tracker.add_window(2);
@@ -29,7 +29,7 @@ fn most_recent_window_wins_focus() {
 
 #[test]
 fn requested_app_id_takes_priority() {
-    let mut tracker = WindowTracker::new(false);
+    let mut tracker = WindowTracker::new();
 
     tracker.add_window(1);
     tracker.map_window(1, 1920, 1080);
@@ -48,7 +48,7 @@ fn requested_app_id_takes_priority() {
 
 #[test]
 fn overlay_classification() {
-    let mut tracker = WindowTracker::new(false);
+    let mut tracker = WindowTracker::new();
 
     // Game window.
     tracker.add_window(1);
@@ -66,7 +66,7 @@ fn overlay_classification() {
 
 #[test]
 fn unmapped_window_loses_focus() {
-    let mut tracker = WindowTracker::new(false);
+    let mut tracker = WindowTracker::new();
     tracker.add_window(1);
     tracker.map_window(1, 1920, 1080);
     tracker.determine_focus();
@@ -79,7 +79,7 @@ fn unmapped_window_loses_focus() {
 
 #[test]
 fn focusable_app_ids_deduped() {
-    let mut tracker = WindowTracker::new(false);
+    let mut tracker = WindowTracker::new();
 
     tracker.add_window(1);
     tracker.map_window(1, 1920, 1080);
@@ -94,41 +94,26 @@ fn focusable_app_ids_deduped() {
 }
 
 #[test]
-fn steam_mode_ignores_zero_app_id() {
-    let mut tracker = WindowTracker::new(true);
+fn window_with_app_id_gets_focus() {
+    let mut tracker = WindowTracker::new();
 
-    // Window without STEAM_GAME (app_id = 0) — not a focus candidate.
+    // Window with STEAM_GAME atom — gets focus.
     tracker.add_window(1);
     tracker.map_window(1, 1920, 1080);
+    tracker.set_app_id(1, 769);
 
     tracker.determine_focus();
-    assert!(tracker.focus().app.is_none());
-    assert_eq!(tracker.focus().focused_app_id, 0);
-}
-
-#[test]
-fn steam_mode_focuses_valid_app_id() {
-    let mut tracker = WindowTracker::new(true);
-
-    // Window without STEAM_GAME — skipped.
-    tracker.add_window(1);
-    tracker.map_window(1, 1920, 1080);
-
-    // Window with STEAM_GAME — gets focus.
-    tracker.add_window(2);
-    tracker.map_window(2, 1920, 1080);
-    tracker.set_app_id(2, 769);
-
-    tracker.determine_focus();
-    assert_eq!(tracker.focus().app, Some(2));
+    assert_eq!(tracker.focus().app, Some(1));
     assert_eq!(tracker.focus().focused_app_id, 769);
 }
 
 #[test]
-fn standalone_mode_focuses_zero_app_id() {
-    let mut tracker = WindowTracker::new(false);
+fn window_without_app_id_is_focusable() {
+    let mut tracker = WindowTracker::new();
 
-    // In standalone mode, app_id=0 windows are still focusable.
+    // Window without STEAM_GAME — still focusable (app_id assigned
+    // from X11 window ID by the XWM, but tracker sees app_id=0
+    // for windows that haven't been classified yet).
     tracker.add_window(1);
     tracker.map_window(1, 1920, 1080);
 

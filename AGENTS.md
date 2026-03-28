@@ -4,7 +4,7 @@
 
 Gamecomp is a high-performance, single-app Wayland compositor purpose-built for gaming.
 It composites client surfaces via Vulkan, presents through DRM/KMS (direct) or a host Wayland compositor (nested), and manages one or more XWayland servers for X11 game compatibility.
-Steam mode (`-e`/`--steam`) enables multi-server focus gating with zero GPU waste — only the focused server's clients receive frame callbacks.
+Multi-server focus gating ensures zero GPU waste — only the focused server's clients receive frame callbacks.
 
 ## Language & Toolchain
 
@@ -137,5 +137,5 @@ src/
 ## Debugging
 
 - Use `Taskfile.yml` for common debug commands: `task x11:atoms`, `task x11:focus`, `task x11:windows`, `task x11:servers`.
-- Steam mode control: `task x11:set-steam-game`, `task x11:set-baselayer-appid`.
+- Focus control: `task x11:set-steam-game`, `task x11:set-baselayer-appid`.
 - Resolution control: `task x11:set-resolution`.

@@ -135,12 +135,9 @@ pub struct WaylandState {
     pub toplevels: Vec<XdgToplevel>,
     /// Channel to send cursor image updates to the host compositor thread.
     pub cursor_tx: Option<std::sync::mpsc::Sender<CursorUpdate>>,
-    /// Steam integration mode. When true, only the focused window's
-    /// surface is allowed to present (gated by `focused_wl_surface_id`).
-    pub steam_mode: bool,
     /// Wayland protocol object ID of the focused window's surface. Written
     /// by XWM threads, read by the commit handler to gate presentation.
-    /// 0 means no surface is focused (all commits rejected in steam mode).
+    /// 0 means no surface is focused (all commits rejected).
     pub focused_wl_surface_id: std::sync::Arc<std::sync::atomic::AtomicU32>,
     /// XWayland server index of the focused surface. Used together with
     /// `focused_wl_surface_id` to uniquely identify the focused surface
@@ -182,7 +179,6 @@ impl WaylandState {
             bound_outputs: Vec::new(),
             toplevels: Vec::new(),
             cursor_tx: None,
-            steam_mode: false,
             focused_wl_surface_id: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             focused_server_index: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX)),
             xwayland_client_map: std::collections::HashMap::new(),

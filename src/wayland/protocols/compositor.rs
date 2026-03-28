@@ -129,7 +129,7 @@ impl Dispatch<WlSurface, SurfaceData> for WaylandState {
                 // Compare both server_index and protocol_id because
                 // protocol_id is per-Wayland-client — two XWayland servers
                 // can allocate the same numeric ID for different surfaces.
-                if state.steam_mode {
+                {
                     let focused_id = state.focused_wl_surface_id.load(Ordering::Relaxed);
                     let focused_srv = state.focused_server_index.load(Ordering::Relaxed);
                     let surface_id = _surface.id().protocol_id();
