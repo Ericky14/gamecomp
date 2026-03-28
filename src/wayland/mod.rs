@@ -135,6 +135,21 @@ pub struct WaylandState {
     pub toplevels: Vec<XdgToplevel>,
     /// Channel to send cursor image updates to the host compositor thread.
     pub cursor_tx: Option<std::sync::mpsc::Sender<CursorUpdate>>,
+    /// Steam integration mode. When true, only the focused window's
+    /// surface is allowed to present (gated by `focused_wl_surface_id`).
+    pub steam_mode: bool,
+    /// Wayland protocol object ID of the focused window's surface. Written
+    /// by XWM threads, read by the commit handler to gate presentation.
+    /// 0 means no surface is focused (all commits rejected in steam mode).
+    pub focused_wl_surface_id: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// XWayland server index of the focused surface. Used together with
+    /// `focused_wl_surface_id` to uniquely identify the focused surface
+    /// across multiple XWayland servers (protocol_id is per-client).
+    pub focused_server_index: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// Maps Wayland ClientId → XWayland server index. Populated during
+    /// XWayland spawn so the commit handler can determine which server
+    /// a surface belongs to.
+    pub xwayland_client_map: std::collections::HashMap<wayland_server::backend::ClientId, u32>,
 }
 
 impl WaylandState {
@@ -167,6 +182,10 @@ impl WaylandState {
             bound_outputs: Vec::new(),
             toplevels: Vec::new(),
             cursor_tx: None,
+            steam_mode: false,
+            focused_wl_surface_id: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            focused_server_index: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX)),
+            xwayland_client_map: std::collections::HashMap::new(),
         }
     }
 
@@ -645,16 +664,21 @@ impl WaylandServer {
     }
 
     /// Insert an accepted client stream into the display.
+    ///
+    /// Returns the `ClientId` of the newly inserted client so the caller
+    /// can associate it with an XWayland server index.
     pub fn insert_client(
         &mut self,
         stream: std::os::unix::net::UnixStream,
         _state: &mut WaylandState,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<wayland_server::backend::ClientId> {
         let mut dh = self.display.handle();
-        dh.insert_client(stream, std::sync::Arc::new(ClientData))
+        let client = dh
+            .insert_client(stream, std::sync::Arc::new(ClientData))
             .context("failed to insert Wayland client")?;
+        let client_id = client.id();
         info!("accepted new Wayland client");
-        Ok(())
+        Ok(client_id)
     }
 }
 

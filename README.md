@@ -11,6 +11,8 @@ High-performance single-app fullscreen Wayland compositor for gaming and robotic
 - **XWayland** — Full X11 application support
 - **VRR support** — Variable refresh rate for compatible displays
 - **Wayland backend** — Run inside another Wayland compositor for development/testing
+- **Multi-XWayland** — Multiple XWayland servers (platform + game displays) with per-server XWM threads
+- **Steam integration** — `-e` flag for Steam AppID tracking, `STEAM_GAME_DISPLAY_N` env vars
 - **Headless mode** — Offscreen rendering for CI and robotics pipelines
 
 # Roadmap
@@ -58,7 +60,7 @@ High-level feature goals for Gamecomp. No hard dates — contributions welcome.
 - [ ] **Gamepad input** — evdev gamepad passthrough to client
 - [ ] **Color management** — ICC/LUT loading, color-blind filters
 - [ ] **Touch input** — touchscreen support for handheld devices
-- [ ] **Multi-display** — span or mirror across multiple connected outputs
+- [ ] **Multi-display** — span or mirror across multiple connected outputs (multi-XWayland spawning done, display routing in progress)
 
 ## Building
 
@@ -83,9 +85,34 @@ gamecomp --nested -- my-game
 
 # Headless mode for CI
 gamecomp --backend headless -- my-app
+
+# Steam integration mode (AppIDs from STEAM_GAME atom only)
+gamecomp -e -- steam
+
+# Multiple XWayland servers (server 0 = platform, 1+ = game)
+gamecomp --xwayland-count 2 -- my-game
 ```
 
-See `gamecomp --help` for all options.
+### Options
+
+| Flag | Description |
+|------|-------------|
+| `--nested` | Run inside another Wayland compositor |
+| `--backend headless` | Offscreen rendering for CI |
+| `-W`, `--output-width` | Output width in pixels |
+| `-H`, `--output-height` | Output height in pixels |
+| `-w`, `--nested-width` | Game render width (client-side resolution) |
+| `-h`, `--nested-height` | Game render height (client-side resolution) |
+| `-r`, `--refresh-rate` | Refresh rate in Hz |
+| `-o`, `--output` | Preferred output connector (e.g., `eDP-1`) |
+| `-e`, `--steam` | Steam integration mode — AppIDs come exclusively from the `STEAM_GAME` atom. Without this flag, windows without `STEAM_GAME` get their X11 window ID as a synthetic AppID. |
+| `--xwayland-count N` | Number of XWayland servers to spawn (default: 1). Server 0 is the platform display, servers 1+ are game displays. Sets `STEAM_GAME_DISPLAY_N` env vars for child processes. |
+| `--vrr` / `--no-vrr` | Enable/disable variable refresh rate |
+| `--hdr` / `--no-hdr` | Enable/disable HDR |
+| `--upscale MODE` | Upscaling algorithm: `fsr`, `nis`, `cas`, or `none` |
+| `--fps-limit N` | FPS cap (0 = match display refresh rate) |
+| `--stats-pipe PATH` | Write per-frame stats to a named pipe |
+| `--log LEVEL` | Log level (`trace`, `debug`, `info`, `warn`, `error`) |
 
 ## Configuration
 

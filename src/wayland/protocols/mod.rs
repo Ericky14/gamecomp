@@ -66,6 +66,11 @@ pub struct SurfaceData {
     pub hotspot_x: AtomicI32,
     /// Cursor hotspot Y, set by `wl_pointer.set_cursor`.
     pub hotspot_y: AtomicI32,
+    /// XWayland server index that owns this surface. `u32::MAX` for
+    /// non-XWayland surfaces. Set at creation time from the client→server
+    /// mapping so the commit handler can disambiguate surfaces with the
+    /// same protocol_id across different XWayland servers.
+    pub server_index: u32,
 }
 
 /// Wrapper enum for `WlBuffer` user data — either SHM or DMA-BUF.

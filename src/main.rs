@@ -158,10 +158,6 @@ fn run(config: Config) -> anyhow::Result<()> {
     let socket_name = wayland_server.socket_name().to_string();
     info!(socket = %socket_name, "Wayland socket ready");
 
-    // Determine the XWayland display number early so we can set both
-    // WAYLAND_DISPLAY and DISPLAY before spawning any threads.
-    let xwayland_display = find_free_x11_display()?;
-
     // --- Spawn render thread FIRST ---
     // The render thread starts the wayland backend event loop, which connects
     // to the host compositor and collects DMA-BUF format/modifier information
@@ -280,65 +276,154 @@ fn run(config: Config) -> anyhow::Result<()> {
         }
     }
 
-    // --- Launch XWayland ---
-    // Spawned after the render thread so that when XWayland connects and binds
-    // zwp_linux_dmabuf_v1, the host format map is already populated.
-    let mut xwayland_child = spawn_xwayland(
-        &xwayland_display,
-        &socket_name,
-        &mut wayland_server,
-        &mut wayland_state,
-    )?;
-    info!(display = %xwayland_display, "XWayland ready");
+    // --- Launch XWayland servers ---
+    // Spawn `xwayland_count` instances. Server 0 is the platform display
+    // (Steam client, etc.) and gets the full output resolution. Servers 1+
+    // are game displays and get the game resolution.
+    //
+    // Following gamescope's convention:
+    //   DISPLAY        = server 0 (platform)
+    //   STEAM_GAME_DISPLAY_0 = server 1 (first game)
+    //   STEAM_GAME_DISPLAY_1 = server 2 (second game)
+    //   ...etc.
+    let xwayland_count = config.xwayland_count.max(1);
 
-    // --- Spawn XWM thread ---
-    // The XWM thread owns the channels and runs a retry loop: if the X11
-    // connection drops (e.g., XWayland restart), it reconnects with
-    // exponential backoff instead of silently dying.
-    let (xwm_event_tx, _xwm_event_rx) = calloop::channel::channel::<wayland::xwayland::XwmEvent>();
-    let (xwm_cmd_tx, xwm_cmd_rx) = std::sync::mpsc::channel::<wayland::xwayland::XwmCommand>();
-    let xwm_display = xwayland_display.clone();
-    let xwm_thread = thread::Builder::new()
-        .name("gamecomp-xwm".to_string())
-        .spawn({
-            // Use host physical dims if available, otherwise fall back to
-            // game_w/game_h. After wait_for_host_configure, the atomics
-            // should be set for the Wayland backend.
-            let xwm_w = {
-                let v = host_physical_width.load(Ordering::Acquire);
-                if v > 0 { v } else { game_w }
-            };
-            let xwm_h = {
-                let v = host_physical_height.load(Ordering::Acquire);
-                if v > 0 { v } else { game_h }
-            };
-            move || {
+    /// Per-XWayland server state managed by the main thread.
+    struct XWaylandInstance {
+        /// X11 display string (e.g., ":1").
+        display: String,
+        /// XWayland child process.
+        child: std::process::Child,
+        /// Command sender to the XWM thread.
+        cmd_tx: std::sync::mpsc::Sender<wayland::xwayland::XwmCommand>,
+        /// XWM thread handle.
+        thread: std::thread::JoinHandle<()>,
+        /// Server index (0 = platform, 1+ = game).
+        index: u32,
+        /// Per-server focused app ID (XWM thread writes, main loop reads).
+        focused_app_id: Arc<AtomicU32>,
+        /// Per-server focused surface protocol ID (XWM thread writes, main loop reads).
+        focused_wl_surface_id: Arc<AtomicU32>,
+    }
+
+    let (xwm_event_tx, xwm_event_rx) = calloop::channel::channel::<wayland::xwayland::XwmEvent>();
+
+    // Global "winning" focus state — the main loop aggregates per-server
+    // atomics and writes the winner here for the commit handler to read.
+    let focused_app_id = Arc::new(AtomicU32::new(0));
+    let focused_wl_surface_id = Arc::new(AtomicU32::new(0));
+    let focused_server_index = Arc::new(AtomicU32::new(u32::MAX));
+
+    // Wire steam_mode and focused surface into wayland state so the
+    // commit handler can gate presentation per-surface.
+    wayland_state.steam_mode = config.steam_mode;
+    wayland_state.focused_wl_surface_id = Arc::clone(&focused_wl_surface_id);
+    wayland_state.focused_server_index = Arc::clone(&focused_server_index);
+
+    let mut xwayland_servers: Vec<XWaylandInstance> = Vec::with_capacity(xwayland_count as usize);
+
+    for server_idx in 0..xwayland_count {
+        let display_str = find_free_x11_display()?;
+
+        let child = spawn_xwayland(
+            &display_str,
+            &socket_name,
+            &mut wayland_server,
+            &mut wayland_state,
+            server_idx,
+        )?;
+
+        // Server 0 gets the full output resolution (platform client).
+        // Servers 1+ get the game resolution.
+        let (srv_w, srv_h) = if xwayland_count > 1 && server_idx == 0 {
+            (output_w, output_h)
+        } else {
+            // Use host physical dims if available, otherwise game resolution.
+            let pw = host_physical_width.load(Ordering::Acquire);
+            let ph = host_physical_height.load(Ordering::Acquire);
+            if pw > 0 && ph > 0 {
+                (pw, ph)
+            } else {
+                (game_w, game_h)
+            }
+        };
+
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<wayland::xwayland::XwmCommand>();
+        let evt_tx = xwm_event_tx.clone();
+        let xwm_display = display_str.clone();
+        let xwm_steam_mode = config.steam_mode;
+        let srv_focused_app = Arc::new(AtomicU32::new(0));
+        let srv_focused_surface = Arc::new(AtomicU32::new(0));
+        let xwm_focused_app = Arc::clone(&srv_focused_app);
+        let xwm_focused_surface = Arc::clone(&srv_focused_surface);
+        let thread = thread::Builder::new()
+            .name(format!("gamecomp-xwm-{server_idx}"))
+            .spawn(move || {
                 let result = retry_with_backoff("XWM", &RetryPolicy::DEFAULT, &RUNNING, || {
                     wayland::xwayland::run_xwm(
                         &xwm_display,
-                        &xwm_event_tx,
-                        &xwm_cmd_rx,
-                        xwm_w,
-                        xwm_h,
+                        &evt_tx,
+                        &cmd_rx,
+                        server_idx,
+                        xwm_steam_mode,
+                        &xwm_focused_app,
+                        &xwm_focused_surface,
+                        srv_w,
+                        srv_h,
                     )
                 });
                 if let Err(e) = result {
-                    error!(?e, "XWM thread exiting after exhausting retries");
+                    error!(
+                        server_idx,
+                        ?e,
+                        "XWM thread exiting after exhausting retries"
+                    );
                 }
-            }
-        })
-        .context("failed to spawn XWM thread")?;
+            })
+            .context("failed to spawn XWM thread")?;
+
+        info!(
+            server_idx,
+            display = %display_str,
+            width = srv_w,
+            height = srv_h,
+            "XWayland server ready"
+        );
+
+        xwayland_servers.push(XWaylandInstance {
+            display: display_str,
+            child,
+            cmd_tx,
+            thread,
+            index: server_idx,
+            focused_app_id: srv_focused_app,
+            focused_wl_surface_id: srv_focused_surface,
+        });
+    }
 
     // --- Launch child command ---
     let mut child_process: Option<std::process::Child> = None;
     if let Some(ref cmd) = config.child_command {
         info!(command = %cmd, "launching child process");
+        let mut child_cmd = std::process::Command::new("sh");
+        child_cmd
+            .arg("-c")
+            .arg(cmd)
+            .env("WAYLAND_DISPLAY", &socket_name)
+            .env("DISPLAY", &xwayland_servers[0].display);
+
+        // Set STEAM_GAME_DISPLAY_N env vars for game servers (1+).
+        // This matches gamescope's convention so Steam can direct games
+        // to specific XWayland servers.
+        if xwayland_count > 1 {
+            for server in xwayland_servers.iter().skip(1) {
+                let env_name = format!("STEAM_GAME_DISPLAY_{}", server.index - 1);
+                child_cmd.env(&env_name, &server.display);
+            }
+        }
+
         child_process = Some(
-            std::process::Command::new("sh")
-                .arg("-c")
-                .arg(cmd)
-                .env("WAYLAND_DISPLAY", &socket_name)
-                .env("DISPLAY", &xwayland_display)
+            child_cmd
                 .spawn()
                 .context("failed to launch child command")?,
         );
@@ -351,6 +436,16 @@ fn run(config: Config) -> anyhow::Result<()> {
 
     // Track the last-seen detected refresh rate to avoid redundant updates.
     let mut last_detected_hz: u32 = 0;
+
+    // Track the last-seen focused surface for steam mode wakeup.
+    let mut prev_focused_wl_surface_id: u32 = 0;
+    let mut prev_focused_server_index: u32 = u32::MAX;
+    // Per-server app_id snapshots for detecting *changes*.
+    let mut prev_server_app_ids: Vec<u32> = vec![0; xwayland_count as usize];
+    // Baselayer AppIDs requested by an external controller (Steam) via
+    // the `GAMECOMP_BASELAYER_APPID` atom. The arbiter prefers servers
+    // whose focused AppID matches one of these.
+    let mut baselayer_app_ids: Vec<u32> = Vec::new();
 
     while RUNNING.load(Ordering::Relaxed) {
         // Dispatch libseat events (VT switch notifications) for DRM sessions.
@@ -482,21 +577,31 @@ fn run(config: Config) -> anyhow::Result<()> {
             let ph = host_physical_height.load(Ordering::Acquire);
             if pw > 0 && ph > 0 {
                 wayland_state.update_output_resolution(pw, ph);
-                let _ = xwm_cmd_tx.send(wayland::xwayland::XwmCommand::SetResolution {
-                    width: pw,
-                    height: ph,
-                });
+                // Send SetResolution to all XWM threads so each updates
+                // its output tracking. For multi-server mode, server 0
+                // gets the output resolution; game servers keep theirs.
+                for srv in &xwayland_servers {
+                    let _ = srv
+                        .cmd_tx
+                        .send(wayland::xwayland::XwmCommand::SetResolution {
+                            width: pw,
+                            height: ph,
+                        });
+                }
             }
         }
 
-        // Monitor XWayland and respawn if it crashed.
-        monitor_xwayland(
-            &mut xwayland_child,
-            &xwayland_display,
-            &socket_name,
-            &mut wayland_server,
-            &mut wayland_state,
-        );
+        // Monitor all XWayland instances and respawn crashed ones.
+        for srv in &mut xwayland_servers {
+            monitor_xwayland(
+                &mut srv.child,
+                &srv.display,
+                &socket_name,
+                &mut wayland_server,
+                &mut wayland_state,
+                srv.index,
+            );
+        }
 
         // Accept new Wayland client connections.
         if let Some(stream) = wayland_server.accept()
@@ -505,8 +610,128 @@ fn run(config: Config) -> anyhow::Result<()> {
             warn!(?e, "failed to insert Wayland client");
         }
 
+        // Drain XWM events — pick up baselayer changes and other control atoms.
+        while let Ok(evt) = xwm_event_rx.try_recv() {
+            if let wayland::xwayland::XwmEvent::BaselayerAppIdsChanged(ids) = evt {
+                debug!(?ids, "main loop: baselayer app IDs updated");
+                baselayer_app_ids = ids;
+                // Reset stealer detection so all servers re-compete for
+                // focus. Without this, clearing baselayer would leave the
+                // Phase-0 winner stuck in Phase 2 ("keep current winner")
+                // because no server's app_id actually changed.
+                prev_server_app_ids.fill(0);
+            }
+        }
+
+        // Aggregate per-server focus state in steam mode.
+        //
+        // Like gamescope's `determine_and_apply_focus`, we collect focus
+        // from all XWayland servers and pick a global winner. Strategy:
+        //   0. If baselayer AppIDs are set, prefer a server whose focused
+        //      AppID matches (cross-server explicit focus control, like
+        //      gamescope's `GAMESCOPECTRL_BASELAYER_APPID`).
+        //   1. If a server just changed its app_id to non-zero, it steals focus
+        //      (most recent state change wins — matches gamescope's
+        //      `map_sequence` / `damage_sequence` priority for newest window).
+        //   2. Otherwise keep the current winner while it still has focus.
+        //   3. If the current winner lost focus (app_id → 0), fall back to
+        //      any other server that still has a non-zero app_id.
+        if config.steam_mode {
+            let mut winner_app: u32 = 0;
+            let mut winner_surface: u32 = 0;
+            let mut winner_server: u32 = u32::MAX;
+
+            // Phase 0: if baselayer AppIDs are set (via GAMECOMP_BASELAYER_APPID),
+            // prefer the server whose focused app_id matches one. This is the
+            // cross-server equivalent of gamescope's GAMESCOPECTRL_BASELAYER_APPID:
+            // Steam writes a list of AppIDs that should be focused, and we honour
+            // that over any implicit stealer/fallback logic.
+            let mut baselayer_matched = false;
+            if !baselayer_app_ids.is_empty() {
+                for srv in &xwayland_servers {
+                    let app = srv.focused_app_id.load(Ordering::Relaxed);
+                    if app != 0 && baselayer_app_ids.contains(&app) {
+                        winner_app = app;
+                        winner_surface = srv.focused_wl_surface_id.load(Ordering::Relaxed);
+                        winner_server = srv.index;
+                        baselayer_matched = true;
+                        break;
+                    }
+                }
+            }
+
+            // Update prev_server_app_ids for stealer detection regardless
+            // of whether baselayer matched — we always want accurate history.
+            let mut stealer: Option<usize> = None;
+            for (i, srv) in xwayland_servers.iter().enumerate() {
+                let app = srv.focused_app_id.load(Ordering::Relaxed);
+                let prev = prev_server_app_ids[i];
+                if app != prev && app != 0 {
+                    stealer = Some(i);
+                }
+                prev_server_app_ids[i] = app;
+            }
+
+            if !baselayer_matched {
+                // Phase 1: detect any server whose app_id just changed to non-zero
+                // (this server is stealing focus).
+                if let Some(i) = stealer {
+                    // A server just got a new STEAM_GAME — it takes focus.
+                    let srv = &xwayland_servers[i];
+                    winner_app = srv.focused_app_id.load(Ordering::Relaxed);
+                    winner_surface = srv.focused_wl_surface_id.load(Ordering::Relaxed);
+                    winner_server = srv.index;
+                } else {
+                    // Phase 2: no new stealer — keep current winner if still valid.
+                    let cur_srv = prev_focused_server_index;
+                    if cur_srv != u32::MAX
+                        && let Some(srv) = xwayland_servers.iter().find(|s| s.index == cur_srv)
+                    {
+                        let app = srv.focused_app_id.load(Ordering::Relaxed);
+                        if app != 0 {
+                            winner_app = app;
+                            winner_surface = srv.focused_wl_surface_id.load(Ordering::Relaxed);
+                            winner_server = cur_srv;
+                        }
+                    }
+                    // Phase 3: fallback — pick any server with non-zero app_id.
+                    if winner_app == 0 {
+                        for srv in &xwayland_servers {
+                            let app = srv.focused_app_id.load(Ordering::Relaxed);
+                            if app != 0 {
+                                winner_app = app;
+                                winner_surface = srv.focused_wl_surface_id.load(Ordering::Relaxed);
+                                winner_server = srv.index;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            focused_app_id.store(winner_app, Ordering::Relaxed);
+            focused_wl_surface_id.store(winner_surface, Ordering::Relaxed);
+            focused_server_index.store(winner_server, Ordering::Relaxed);
+
+            // Detect focus changes and wake the newly-focused client
+            // by firing pending frame callbacks. Until this fires,
+            // the client is stalled at vkAcquireNextImage (zero GPU waste).
+            if winner_surface != prev_focused_wl_surface_id
+                || winner_server != prev_focused_server_index
+            {
+                prev_focused_wl_surface_id = winner_surface;
+                prev_focused_server_index = winner_server;
+                if winner_surface != 0 {
+                    wayland_state.fire_frame_callbacks();
+                }
+            }
+        }
+
         // Forward staged buffer if the FPS limiter allows it.
-        forward_staged_frame(&mut wayland_state, &mut fps_limiter);
+        // In steam mode, suppress presentation when no app has focus
+        // (focused_app_id == 0 means no window has a STEAM_GAME atom).
+        let has_focus = !config.steam_mode || focused_app_id.load(Ordering::Relaxed) != 0;
+        forward_staged_frame(&mut wayland_state, &mut fps_limiter, has_focus);
 
         // Dispatch Wayland requests only when the staging slot is empty
         // (backpressure: don't accept new commits while one is pending).
@@ -535,13 +760,14 @@ fn run(config: Config) -> anyhow::Result<()> {
         let _ = child.wait();
     }
 
-    // Shut down XWM.
-    let _ = xwm_cmd_tx.send(wayland::xwayland::XwmCommand::Shutdown);
-    let _ = xwm_thread.join();
-
-    // Shut down XWayland.
-    let _ = xwayland_child.kill();
-    let _ = xwayland_child.wait();
+    // Shut down all XWM threads and XWayland instances.
+    for srv in xwayland_servers.into_iter().rev() {
+        let _ = srv.cmd_tx.send(wayland::xwayland::XwmCommand::Shutdown);
+        let _ = srv.thread.join();
+        let mut child = srv.child;
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 
     // Wait for render thread to finish.
     drop(calloop_frame_tx);
@@ -601,11 +827,12 @@ fn monitor_xwayland(
     socket: &str,
     server: &mut WaylandServer,
     state: &mut wayland::WaylandState,
+    server_index: u32,
 ) {
     match child.try_wait() {
         Ok(Some(status)) => {
             warn!(?status, "XWayland exited, respawning");
-            match spawn_xwayland(display, socket, server, state) {
+            match spawn_xwayland(display, socket, server, state, server_index) {
                 Ok(new_child) => {
                     *child = new_child;
                     info!("XWayland respawned successfully");
@@ -630,7 +857,11 @@ fn monitor_xwayland(
 ///
 /// Must be called BEFORE Wayland dispatch so the staged slot is empty when we
 /// accept new commits.
-fn forward_staged_frame(state: &mut wayland::WaylandState, limiter: &mut FpsLimiter) {
+fn forward_staged_frame(
+    state: &mut wayland::WaylandState,
+    limiter: &mut FpsLimiter,
+    has_focus: bool,
+) {
     let now_ns = wayland::monotonic_ns();
     if !limiter.should_release(now_ns) {
         return;
@@ -639,7 +870,10 @@ fn forward_staged_frame(state: &mut wayland::WaylandState, limiter: &mut FpsLimi
     let mut did_release = false;
 
     if let Some(buffer) = state.staged_buffer.take() {
-        if let Some(ref tx) = state.frame_channel {
+        // Only present if a window actually has focus. In steam mode
+        // without a STEAM_GAME window, buffers are dropped so the
+        // host window stays blank.
+        if has_focus && let Some(ref tx) = state.frame_channel {
             let _ = tx.send(buffer);
         }
         did_release = true;
@@ -811,6 +1045,7 @@ fn spawn_xwayland(
     wayland_socket: &str,
     wayland_server: &mut WaylandServer,
     wayland_state: &mut wayland::WaylandState,
+    server_index: u32,
 ) -> anyhow::Result<std::process::Child> {
     // Create a pipe for readiness notification. XWayland writes to the write-end
     // when it's ready to accept connections (replaces SIGUSR1 in modern Xwayland).
@@ -859,10 +1094,19 @@ fn spawn_xwayland(
 
     loop {
         // Accept any pending client connections (XWayland connecting to us).
-        if let Some(stream) = wayland_server.accept()
-            && let Err(e) = wayland_server.insert_client(stream, wayland_state)
-        {
-            warn!(?e, "failed to insert Wayland client during XWayland launch");
+        if let Some(stream) = wayland_server.accept() {
+            match wayland_server.insert_client(stream, wayland_state) {
+                Ok(client_id) => {
+                    // Tag this client as belonging to this XWayland server
+                    // so the commit handler can disambiguate surfaces.
+                    wayland_state
+                        .xwayland_client_map
+                        .insert(client_id, server_index);
+                }
+                Err(e) => {
+                    warn!(?e, "failed to insert Wayland client during XWayland launch");
+                }
+            }
         }
 
         // Dispatch Wayland events so XWayland can complete its handshake.

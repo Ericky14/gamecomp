@@ -34,10 +34,15 @@ use super::window_tracker::{FocusState, WindowRole, WindowTracker};
 type X11Atom = u32;
 
 /// Events sent from the XWM thread to the main thread.
+///
+/// Each event carries its `server_index` so the main thread knows which
+/// XWayland server produced it.
 #[derive(Debug)]
 pub enum XwmEvent {
     /// A window has been mapped (made visible).
     WindowMapped {
+        /// XWayland server index (0 = platform, 1+ = game).
+        server_index: u32,
         /// X11 window ID.
         window_id: u32,
         /// Window title.
@@ -51,15 +56,19 @@ pub enum XwmEvent {
         app_id: u32,
     },
     /// A window has been unmapped (hidden or destroyed).
-    WindowUnmapped { window_id: u32 },
+    WindowUnmapped { server_index: u32, window_id: u32 },
     /// A window has been destroyed.
-    WindowDestroyed { window_id: u32 },
+    WindowDestroyed { server_index: u32, window_id: u32 },
     /// A window requests fullscreen mode.
-    WindowFullscreen { window_id: u32 },
+    WindowFullscreen { server_index: u32, window_id: u32 },
     /// A window's title has changed.
-    TitleChanged { window_id: u32, title: String },
+    TitleChanged {
+        server_index: u32,
+        window_id: u32,
+        title: String,
+    },
     /// Focus has changed — includes the full focus state for the compositor.
-    FocusChanged(FocusState),
+    FocusChanged(u32, FocusState),
 
     // --- Atom-driven runtime control events ---
     /// FPS limit changed via `GAMECOMP_FPS_LIMIT` atom.
@@ -84,6 +93,20 @@ pub enum XwmEvent {
     CreateXWaylandServerRequested(u32),
     /// Request to destroy an XWayland server via atom.
     DestroyXWaylandServerRequested(u32),
+    /// Resolution change for a specific server via `GAMECOMP_XWAYLAND_MODE_CONTROL`.
+    /// Fields: `(target_server_idx, width, height, flags)`.
+    XWaylandModeControl {
+        target_server: u32,
+        width: u32,
+        height: u32,
+        flags: u32,
+    },
+    /// Focus display changed via `GAMECOMP_FOCUS_DISPLAY`.
+    FocusDisplayChanged(u32),
+    /// Baselayer AppID list changed via `GAMECOMP_BASELAYER_APPID`.
+    /// The main loop uses this to prefer servers whose focused AppID
+    /// matches a requested ID (cross-server focus control).
+    BaselayerAppIdsChanged(Vec<u32>),
 }
 
 /// Commands sent from the main thread to the XWM thread.
@@ -169,17 +192,22 @@ impl Drop for XWaylandServer {
 /// * `display` — X11 display string (e.g., ":1")
 /// * `event_tx` — Channel sender for XWM events to the main thread
 /// * `cmd_rx` — Channel receiver for commands from the main thread
+#[allow(clippy::too_many_arguments)]
 pub fn run_xwm(
     display: &str,
     event_tx: &calloop::channel::Sender<XwmEvent>,
     cmd_rx: &std::sync::mpsc::Receiver<XwmCommand>,
+    server_index: u32,
+    steam_mode: bool,
+    focused_app_id: &std::sync::atomic::AtomicU32,
+    focused_wl_surface_id: &std::sync::atomic::AtomicU32,
     output_width: u32,
     output_height: u32,
 ) -> anyhow::Result<()> {
     let x11_display = display;
     info!(
         x11_display,
-        output_width, output_height, "starting X11 window manager"
+        server_index, output_width, output_height, "starting X11 window manager"
     );
 
     // Connect to XWayland.
@@ -195,7 +223,7 @@ pub fn run_xwm(
     let atoms = Atoms::intern(&conn).context("failed to intern X11 atoms")?;
 
     // Initialize window tracker.
-    let mut tracker = WindowTracker::new();
+    let mut tracker = WindowTracker::new(steam_mode);
 
     // Register as window manager (SubstructureRedirect on root).
     // Also subscribe to PropertyChangeMask so we receive PropertyNotify
@@ -227,6 +255,20 @@ pub fn run_xwm(
     // Publish our PID on the root window for identification.
     publish_pid(&conn, root, &atoms);
 
+    // Publish the server index on the root window so external clients
+    // (Vulkan WSI layer, Steam) can identify which XWayland server they are on.
+    {
+        use x11rb::protocol::xproto::{AtomEnum, PropMode};
+        let _ = conn.change_property32(
+            PropMode::REPLACE,
+            root,
+            atoms.xwayland_server_id,
+            AtomEnum::CARDINAL,
+            &[server_index],
+        );
+        let _ = conn.flush();
+    }
+
     info!("XWM registered as window manager with atom support");
 
     // Mutable output dimensions — updated via SetResolution commands
@@ -254,6 +296,8 @@ pub fn run_xwm(
                     event_tx,
                     root,
                     event,
+                    server_index,
+                    steam_mode,
                     output_width,
                     output_height,
                 );
@@ -270,7 +314,16 @@ pub fn run_xwm(
 
         // --- Re-evaluate focus if dirty ---
         if tracker.is_focus_dirty() && tracker.determine_focus() {
-            publish_focus_feedback(&conn, root, &atoms, &tracker, event_tx);
+            publish_focus_feedback(
+                &conn,
+                root,
+                &atoms,
+                &tracker,
+                event_tx,
+                server_index,
+                focused_app_id,
+                focused_wl_surface_id,
+            );
         }
     }
 
@@ -381,6 +434,8 @@ fn handle_x11_event<C: Connection>(
     event_tx: &calloop::channel::Sender<XwmEvent>,
     root: u32,
     event: x11rb::protocol::Event,
+    server_index: u32,
+    steam_mode: bool,
     output_width: u32,
     output_height: u32,
 ) {
@@ -422,7 +477,17 @@ fn handle_x11_event<C: Connection>(
 
             // Read initial properties for classification.
             let role = classify_window(conn, atoms, e.window);
-            let app_id = read_u32_prop(conn, e.window, atoms.steam_game);
+            let app_id = if steam_mode {
+                // Steam mode: AppID comes exclusively from the STEAM_GAME
+                // atom. Windows without it stay at 0 until Steam sets it.
+                read_u32_prop(conn, e.window, atoms.steam_game)
+            } else {
+                // Standalone mode: use STEAM_GAME if present, otherwise
+                // use the X11 window ID as a synthetic AppID so every
+                // window is always identifiable and focusable.
+                let steam_id = read_u32_prop(conn, e.window, atoms.steam_game);
+                if steam_id != 0 { steam_id } else { e.window }
+            };
 
             // Register in tracker.
             let win = tracker.add_window(e.window);
@@ -442,6 +507,7 @@ fn handle_x11_event<C: Connection>(
             );
 
             let _ = event_tx.send(XwmEvent::WindowMapped {
+                server_index,
                 window_id: e.window,
                 title: String::new(), // TODO: Read _NET_WM_NAME.
                 width: w,
@@ -455,6 +521,7 @@ fn handle_x11_event<C: Connection>(
             debug!(window = e.window, "UnmapNotify");
             tracker.unmap_window(e.window);
             let _ = event_tx.send(XwmEvent::WindowUnmapped {
+                server_index,
                 window_id: e.window,
             });
         }
@@ -463,6 +530,7 @@ fn handle_x11_event<C: Connection>(
             debug!(window = e.window, "DestroyNotify");
             tracker.remove_window(e.window);
             let _ = event_tx.send(XwmEvent::WindowDestroyed {
+                server_index,
                 window_id: e.window,
             });
         }
@@ -497,6 +565,16 @@ fn handle_x11_event<C: Connection>(
             handle_property_notify(conn, atoms, tracker, event_tx, root, e.window, e.atom);
         }
 
+        x11rb::protocol::Event::ClientMessage(e) => {
+            // XWayland sends WL_SURFACE_ID as a ClientMessage to associate
+            // an X11 window with its Wayland wl_surface protocol object ID.
+            if e.type_ == atoms.wl_surface_id {
+                let wl_id = e.data.as_data32()[0];
+                debug!(window = e.window, wl_id, "WL_SURFACE_ID ClientMessage");
+                tracker.set_wl_surface_id(e.window, wl_id);
+            }
+        }
+
         _ => {
             // Ignore other events for now.
         }
@@ -505,16 +583,28 @@ fn handle_x11_event<C: Connection>(
 
 /// Write focus feedback atoms to the root window, set X11 input focus,
 /// and notify the main thread.
+#[allow(clippy::too_many_arguments)]
 fn publish_focus_feedback<C: Connection>(
     conn: &C,
     root: u32,
     atoms: &Atoms,
     tracker: &WindowTracker,
     event_tx: &calloop::channel::Sender<XwmEvent>,
+    server_index: u32,
+    focused_app_id: &std::sync::atomic::AtomicU32,
+    focused_wl_surface_id: &std::sync::atomic::AtomicU32,
 ) {
     use x11rb::protocol::xproto::{AtomEnum, ConnectionExt, InputFocus, PropMode};
     let focus = *tracker.focus();
     debug!(?focus, "focus changed");
+
+    // Update per-server atomics. The main loop aggregates all servers
+    // and picks the winner (first with app_id != 0).
+    focused_app_id.store(focus.focused_app_id, std::sync::atomic::Ordering::Relaxed);
+    focused_wl_surface_id.store(
+        focus.focused_wl_surface_id,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     // Set X11 input focus so XWayland forwards keyboard events to the
     // focused window. Without this, key events are discarded.
@@ -560,7 +650,7 @@ fn publish_focus_feedback<C: Connection>(
     );
 
     let _ = conn.flush();
-    let _ = event_tx.send(XwmEvent::FocusChanged(focus));
+    let _ = event_tx.send(XwmEvent::FocusChanged(server_index, focus));
 }
 
 /// Handle a PropertyNotify event on a window or the root.
@@ -611,6 +701,10 @@ fn handle_property_notify<C: Connection>(
             if let Some(win) = tracker.get_mut(window) {
                 win.input_focus_mode = mode;
             }
+        } else if atom == atoms.wl_surface_id {
+            let wl_id = read_u32_prop(conn, window, atoms.wl_surface_id);
+            debug!(window, wl_id, "WL_SURFACE_ID set");
+            tracker.set_wl_surface_id(window, wl_id);
         }
         return;
     }
@@ -619,7 +713,8 @@ fn handle_property_notify<C: Connection>(
     if atom == atoms.focus_appid {
         let ids = read_u32_list_prop(conn, root, atoms.focus_appid);
         debug!(?ids, "GAMECOMP_BASELAYER_APPID changed");
-        tracker.set_requested_app_ids(ids);
+        tracker.set_requested_app_ids(ids.clone());
+        let _ = event_tx.send(XwmEvent::BaselayerAppIdsChanged(ids));
     } else if atom == atoms.focus_window {
         let id = read_u32_prop(conn, root, atoms.focus_window);
         debug!(id, "GAMECOMP_BASELAYER_WINDOW changed");
@@ -668,6 +763,28 @@ fn handle_property_notify<C: Connection>(
         let val = read_u32_prop(conn, root, atoms.destroy_xwayland_server);
         info!(id = val, "GAMECOMP_DESTROY_XWAYLAND_SERVER requested");
         let _ = event_tx.send(XwmEvent::DestroyXWaylandServerRequested(val));
+    } else if atom == atoms.xwayland_mode_control {
+        let vals = read_u32_list_prop(conn, root, atoms.xwayland_mode_control);
+        if vals.len() >= 3 {
+            let target = vals[0];
+            let width = vals[1];
+            let height = vals[2];
+            let flags = vals.get(3).copied().unwrap_or(0);
+            info!(
+                target_server = target,
+                width, height, flags, "GAMECOMP_XWAYLAND_MODE_CONTROL changed"
+            );
+            let _ = event_tx.send(XwmEvent::XWaylandModeControl {
+                target_server: target,
+                width,
+                height,
+                flags,
+            });
+        }
+    } else if atom == atoms.focus_display {
+        let val = read_u32_prop(conn, root, atoms.focus_display);
+        info!(display = val, "GAMECOMP_FOCUS_DISPLAY changed");
+        let _ = event_tx.send(XwmEvent::FocusDisplayChanged(val));
     }
 }
 

@@ -12,6 +12,18 @@ vars:
   IMAGE_NAME: "{{.NAME}}-builder"
   IMAGE_TAG:
     sh: sha256sum Dockerfile | cut -d' ' -f1
+  # Auto-detect the first X11 display owned by a running gamecomp instance.
+  # Scans /tmp/.X11-unix/X* and checks for GAMECOMP_PID on the root window.
+  GAMECOMP_DISPLAY:
+    sh: |
+      for sock in /tmp/.X11-unix/X*; do
+        num="${sock##*/tmp/.X11-unix/X}"
+        if DISPLAY=":${num}" xprop -root GAMECOMP_PID 2>/dev/null | grep -q '= '; then
+          echo ":${num}"
+          exit 0
+        fi
+      done
+      echo ""
 
 tasks:
   default:
@@ -67,21 +79,21 @@ tasks:
     requires:
       vars: [APP]
     cmds:
-      - cargo run -- -W {{.WIDTH}} -H {{.HEIGHT}} -- {{.APP}} {{.CLI_ARGS}}
+      - cargo run -- --xwayland-count 2 -W {{.WIDTH}} -H {{.HEIGHT}} -- {{.APP}} {{.CLI_ARGS}}
 
   run:headless:
     desc: "Build and run in headless mode (APP=program)"
     requires:
       vars: [APP]
     cmds:
-      - cargo run -- --backend headless -W {{.WIDTH}} -H {{.HEIGHT}} -- {{.APP}} {{.CLI_ARGS}}
+      - cargo run -- --xwayland-count 2 --backend headless -W {{.WIDTH}} -H {{.HEIGHT}} -- {{.APP}} {{.CLI_ARGS}}
 
   run:release:
     desc: "Build and run release binary (APP=program)"
     requires:
       vars: [APP]
     cmds:
-      - cargo run --release -- -W {{.WIDTH}} -H {{.HEIGHT}} -- {{.APP}} {{.CLI_ARGS}}
+      - cargo run -- --xwayland-count 2 release -W {{.WIDTH}} -H {{.HEIGHT}} -- {{.APP}} {{.CLI_ARGS}}
 
   install:
     desc: Build release binary and install to /usr/bin
@@ -98,6 +110,169 @@ tasks:
     desc: Build and open documentation
     cmds:
       - cargo doc --open --no-deps
+
+  # ─── XWayland debug commands ────────────────────────────────────────
+  # These use xprop/xdotool to inspect and control gamecomp's XWayland
+  # servers at runtime. Set DISPLAY to the target server (e.g., :1).
+
+  x11:servers:
+    desc: "List running gamecomp XWayland servers and their properties"
+    cmds:
+      - |
+        echo "=== Gamecomp XWayland Servers ==="
+        found=0
+        for sock in /tmp/.X11-unix/X*; do
+          num="${sock##*/tmp/.X11-unix/X}"
+          sid=$(DISPLAY=":${num}" xprop -root GAMECOMP_XWAYLAND_SERVER_ID 2>/dev/null | grep -oP '= \K\d+') || true
+          if [ -n "$sid" ]; then
+            pid=$(DISPLAY=":${num}" xprop -root GAMECOMP_PID 2>/dev/null | grep -oP '= \K\d+') || true
+            printf "  :%-4s  server_id=%-4s  compositor_pid=%s\n" "$num" "$sid" "${pid:-?}"
+            found=1
+          fi
+        done
+        if [ "$found" -eq 0 ]; then
+          echo "  (no gamecomp servers running)"
+        fi
+
+  x11:focus:
+    desc: "Show current focus state (X11_DISPLAY=:N)"
+    vars:
+      X_DISPLAY: '{{.X11_DISPLAY | default .GAMECOMP_DISPLAY}}'
+    cmds:
+      - |
+        echo "=== Focus State on {{.X_DISPLAY}} ==="
+        DISPLAY={{.X_DISPLAY}} xprop -root \
+          GAMECOMP_FOCUSED_APP \
+          GAMECOMP_FOCUSED_WINDOW \
+          GAMECOMP_FOCUSABLE_APPS \
+          GAMECOMP_FOCUSABLE_WINDOWS \
+          GAMECOMP_FOCUS_DISPLAY \
+          2>/dev/null || echo "(no gamecomp server on {{.X_DISPLAY}})"
+
+  x11:windows:
+    desc: "List all X11 windows on a display (X11_DISPLAY=:N)"
+    vars:
+      X_DISPLAY: '{{.X11_DISPLAY | default .GAMECOMP_DISPLAY}}'
+    cmds:
+      - |
+        echo "=== X11 Windows on {{.X_DISPLAY}} ==="
+        DISPLAY={{.X_DISPLAY}} xwininfo -root -children 2>/dev/null || echo "(xwininfo not available or no server on {{.X_DISPLAY}})"
+
+  x11:focus-app:
+    desc: "Focus a Steam AppID (X11_DISPLAY=:N APP_ID=NNN)"
+    requires:
+      vars: [APP_ID]
+    vars:
+      X_DISPLAY: '{{.X11_DISPLAY | default .GAMECOMP_DISPLAY}}'
+    cmds:
+      - |
+        echo "Requesting focus on AppID {{.APP_ID}} via {{.X_DISPLAY}}"
+        DISPLAY={{.X_DISPLAY}} xprop -root -format GAMECOMP_BASELAYER_APPID 32c \
+          -set GAMECOMP_BASELAYER_APPID {{.APP_ID}}
+
+  x11:focus-window:
+    desc: "Focus a specific window ID (X11_DISPLAY=:N WIN_ID=NNN)"
+    requires:
+      vars: [WIN_ID]
+    vars:
+      X_DISPLAY: '{{.X11_DISPLAY | default .GAMECOMP_DISPLAY}}'
+    cmds:
+      - |
+        echo "Requesting focus on window {{.WIN_ID}} via {{.X_DISPLAY}}"
+        DISPLAY={{.X_DISPLAY}} xprop -root -format GAMECOMP_BASELAYER_WINDOW 32c \
+          -set GAMECOMP_BASELAYER_WINDOW {{.WIN_ID}}
+
+  x11:focus-display:
+    desc: "Set which display receives input focus (X11_DISPLAY=:N TARGET=server_idx)"
+    requires:
+      vars: [TARGET]
+    vars:
+      X_DISPLAY: '{{.X11_DISPLAY | default .GAMECOMP_DISPLAY}}'
+    cmds:
+      - |
+        echo "Setting focus display to server {{.TARGET}} via {{.X_DISPLAY}}"
+        DISPLAY={{.X_DISPLAY}} xprop -root -format GAMECOMP_FOCUS_DISPLAY 32c \
+          -set GAMECOMP_FOCUS_DISPLAY {{.TARGET}}
+
+  x11:set-fps:
+    desc: "Set FPS limit at runtime (X11_DISPLAY=:N FPS=NNN)"
+    requires:
+      vars: [FPS]
+    vars:
+      X_DISPLAY: '{{.X11_DISPLAY | default .GAMECOMP_DISPLAY}}'
+    cmds:
+      - |
+        echo "Setting FPS limit to {{.FPS}} via {{.X_DISPLAY}}"
+        DISPLAY={{.X_DISPLAY}} xprop -root -format GAMECOMP_FPS_LIMIT 32c \
+          -set GAMECOMP_FPS_LIMIT {{.FPS}}
+
+  x11:set-resolution:
+    desc: "Set resolution for a server (X11_DISPLAY=:N SERVER=idx W=width H=height)"
+    requires:
+      vars: [SERVER, W, H]
+    vars:
+      X_DISPLAY: '{{.X11_DISPLAY | default .GAMECOMP_DISPLAY}}'
+    cmds:
+      - |
+        echo "Setting server {{.SERVER}} to {{.W}}x{{.H}} via {{.X_DISPLAY}}"
+        DISPLAY={{.X_DISPLAY}} xprop -root -format GAMECOMP_XWAYLAND_MODE_CONTROL 32c \
+          -set GAMECOMP_XWAYLAND_MODE_CONTROL {{.SERVER}},{{.W}},{{.H}},0
+
+  x11:atoms:
+    desc: "Dump all GAMECOMP_* atoms from root window (X11_DISPLAY=:N)"
+    vars:
+      X_DISPLAY: '{{.X11_DISPLAY | default .GAMECOMP_DISPLAY}}'
+    cmds:
+      - |
+        echo "=== GAMECOMP atoms on {{.X_DISPLAY}} ==="
+        DISPLAY={{.X_DISPLAY}} xprop -root 2>/dev/null | grep -E '^(GAMECOMP_|STEAM_)' || \
+          echo "(no gamecomp server on {{.X_DISPLAY}})"
+
+  x11:set-steam-game:
+    desc: "Set STEAM_GAME on a window (X11_DISPLAY=:N WIN_ID=0xNNN APP_ID=NNN)"
+    requires:
+      vars: [WIN_ID, APP_ID]
+    vars:
+      X_DISPLAY: '{{.X11_DISPLAY | default .GAMECOMP_DISPLAY}}'
+    cmds:
+      - |
+        echo "Setting STEAM_GAME={{.APP_ID}} on window {{.WIN_ID}} via {{.X_DISPLAY}}"
+        DISPLAY={{.X_DISPLAY}} xprop -id {{.WIN_ID}} -format STEAM_GAME 32c \
+          -set STEAM_GAME {{.APP_ID}}
+
+  x11:remove-steam-game:
+    desc: "Remove STEAM_GAME from a window (X11_DISPLAY=:N WIN_ID=0xNNN)"
+    requires:
+      vars: [WIN_ID]
+    vars:
+      X_DISPLAY: '{{.X11_DISPLAY | default .GAMECOMP_DISPLAY}}'
+    cmds:
+      - |
+        echo "Removing STEAM_GAME from window {{.WIN_ID}} via {{.X_DISPLAY}}"
+        DISPLAY={{.X_DISPLAY}} xprop -id {{.WIN_ID}} -format STEAM_GAME 32c \
+          -remove STEAM_GAME
+
+  x11:set-baselayer-appid:
+    desc: "Set GAMECOMP_BASELAYER_APPID on root window (X11_DISPLAY=:N APP_IDS='769,770')"
+    requires:
+      vars: [APP_IDS]
+    vars:
+      X_DISPLAY: '{{.X11_DISPLAY | default .GAMECOMP_DISPLAY}}'
+    cmds:
+      - |
+        echo "Setting GAMECOMP_BASELAYER_APPID={{.APP_IDS}} on root window via {{.X_DISPLAY}}"
+        DISPLAY={{.X_DISPLAY}} xprop -root -format GAMECOMP_BASELAYER_APPID 32c \
+          -set GAMECOMP_BASELAYER_APPID {{.APP_IDS}}
+
+  x11:remove-baselayer-appid:
+    desc: "Remove GAMECOMP_BASELAYER_APPID from root window (X11_DISPLAY=:N)"
+    vars:
+      X_DISPLAY: '{{.X11_DISPLAY | default .GAMECOMP_DISPLAY}}'
+    cmds:
+      - |
+        echo "Removing GAMECOMP_BASELAYER_APPID from root window via {{.X_DISPLAY}}"
+        DISPLAY={{.X_DISPLAY}} xprop -root -format GAMECOMP_BASELAYER_APPID 32c \
+          -remove GAMECOMP_BASELAYER_APPID
 
   loc:
     desc: Count lines of Rust source code

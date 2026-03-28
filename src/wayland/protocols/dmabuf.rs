@@ -4,7 +4,7 @@
 use parking_lot::Mutex;
 use std::os::unix::io::OwnedFd;
 
-use tracing::{info, warn};
+use tracing::{info, warn, trace};
 use wayland_protocols::wp::linux_dmabuf::zv1::server::{
     zwp_linux_buffer_params_v1::{self, ZwpLinuxBufferParamsV1},
     zwp_linux_dmabuf_v1::{self, ZwpLinuxDmabufV1},
@@ -218,7 +218,7 @@ impl Dispatch<ZwpLinuxBufferParamsV1, DmaBufParamsData> for WaylandState {
                 let mut planes = data.planes.lock();
                 let taken = std::mem::take(&mut *planes);
                 let modifier = taken.first().map(|p| p.modifier).unwrap_or(0);
-                info!(
+                trace!(
                     width,
                     height,
                     format = format!("0x{:08x}", format),

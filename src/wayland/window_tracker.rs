@@ -66,6 +66,10 @@ pub struct TrackedWindow {
     /// Input focus mode (from `STEAM_INPUT_FOCUS`).
     /// 0 = normal, 1 = overlay grabs input, 2 = overlay grabs but keyboard stays.
     pub input_focus_mode: u32,
+    /// Wayland surface protocol ID (from `WL_SURFACE_ID` X11 property).
+    /// Set by XWayland when mapping an X11 window to a wl_surface.
+    /// 0 = not yet associated.
+    pub wl_surface_id: u32,
 }
 
 impl TrackedWindow {
@@ -87,6 +91,7 @@ impl TrackedWindow {
             map_sequence: 0,
             wants_fullscreen: false,
             input_focus_mode: 0,
+            wl_surface_id: 0,
         }
     }
 
@@ -114,6 +119,9 @@ pub struct FocusState {
     pub popup: Option<u32>,
     /// The AppID of the currently focused game.
     pub focused_app_id: u32,
+    /// Wayland surface protocol ID of the focused app window.
+    /// Used by the compositor to gate buffer presentation.
+    pub focused_wl_surface_id: u32,
 }
 
 /// Tracks all X11 windows and determines focus.
@@ -132,11 +140,14 @@ pub struct WindowTracker {
     requested_window: Option<u32>,
     /// Whether focus needs re-evaluation.
     focus_dirty: bool,
+    /// Steam integration mode. When true, only windows with `app_id > 0`
+    /// (i.e., those with a `STEAM_GAME` atom) are considered for focus.
+    steam_mode: bool,
 }
 
 impl WindowTracker {
     /// Create a new empty window tracker.
-    pub fn new() -> Self {
+    pub fn new(steam_mode: bool) -> Self {
         Self {
             windows: HashMap::new(),
             focus: FocusState::default(),
@@ -144,7 +155,17 @@ impl WindowTracker {
             requested_app_ids: Vec::new(),
             requested_window: None,
             focus_dirty: false,
+            steam_mode,
         }
+    }
+
+    /// Whether a window is a valid focus candidate.
+    ///
+    /// In steam mode, windows must have `app_id > 0` (set via `STEAM_GAME`)
+    /// to be considered. In standalone mode, all focusable windows qualify.
+    #[inline(always)]
+    fn is_focus_candidate(&self, w: &TrackedWindow) -> bool {
+        w.is_focusable() && (!self.steam_mode || w.app_id > 0)
     }
 
     /// Register a new window (on MapRequest, before mapping).
@@ -217,6 +238,14 @@ impl WindowTracker {
         }
     }
 
+    /// Set the Wayland surface protocol ID (from `WL_SURFACE_ID` X11 property).
+    pub fn set_wl_surface_id(&mut self, id: u32, wl_surface_id: u32) {
+        if let Some(win) = self.windows.get_mut(&id) {
+            win.wl_surface_id = wl_surface_id;
+            self.focus_dirty = true;
+        }
+    }
+
     /// Set the externally requested focus target(s).
     pub fn set_requested_app_ids(&mut self, app_ids: Vec<u32>) {
         self.requested_app_ids = app_ids;
@@ -280,27 +309,27 @@ impl WindowTracker {
             self.focus.app = self
                 .windows
                 .values()
-                .filter(|w| w.is_focusable() && self.requested_app_ids.contains(&w.app_id))
+                .filter(|w| {
+                    self.is_focus_candidate(w) && self.requested_app_ids.contains(&w.app_id)
+                })
                 .max_by_key(|w| w.map_sequence)
                 .map(|w| w.id);
         }
 
-        // Fallback: most recently mapped focusable window.
+        // Fallback: most recently mapped focus candidate.
         if self.focus.app.is_none() {
             self.focus.app = self
                 .windows
                 .values()
-                .filter(|w| w.is_focusable())
+                .filter(|w| self.is_focus_candidate(w))
                 .max_by_key(|w| w.map_sequence)
                 .map(|w| w.id);
         }
 
-        // Update focused AppID.
-        self.focus.focused_app_id = self
-            .focus
-            .app
-            .and_then(|id| self.windows.get(&id))
-            .map_or(0, |w| w.app_id);
+        // Update focused AppID and Wayland surface ID.
+        let focused_win = self.focus.app.and_then(|id| self.windows.get(&id));
+        self.focus.focused_app_id = focused_win.map_or(0, |w| w.app_id);
+        self.focus.focused_wl_surface_id = focused_win.map_or(0, |w| w.wl_surface_id);
 
         // --- Pick overlay window (highest opacity mapped overlay) ---
         self.focus.overlay = self
@@ -342,7 +371,7 @@ impl WindowTracker {
         let mut ids: Vec<u32> = self
             .windows
             .values()
-            .filter(|w| w.is_focusable() && w.app_id > 0)
+            .filter(|w| self.is_focus_candidate(w) && w.app_id > 0)
             .map(|w| w.app_id)
             .collect();
         ids.sort_unstable();
@@ -353,7 +382,7 @@ impl WindowTracker {
     /// Build focusable window triplets `[windowID, appID, pid]` (for feedback atom).
     pub fn focusable_window_triplets(&self) -> Vec<u32> {
         let mut triplets = Vec::new();
-        for w in self.windows.values().filter(|w| w.is_focusable()) {
+        for w in self.windows.values().filter(|w| self.is_focus_candidate(w)) {
             triplets.push(w.id);
             triplets.push(w.app_id);
             triplets.push(w.pid);
@@ -368,14 +397,14 @@ mod tests {
 
     #[test]
     fn empty_tracker_has_no_focus() {
-        let mut tracker = WindowTracker::new();
+        let mut tracker = WindowTracker::new(false);
         tracker.determine_focus();
         assert!(tracker.focus().app.is_none());
     }
 
     #[test]
     fn single_mapped_window_gets_focus() {
-        let mut tracker = WindowTracker::new();
+        let mut tracker = WindowTracker::new(false);
         tracker.add_window(42);
         tracker.map_window(42, 1920, 1080);
         tracker.determine_focus();
@@ -384,7 +413,7 @@ mod tests {
 
     #[test]
     fn most_recent_window_wins_focus() {
-        let mut tracker = WindowTracker::new();
+        let mut tracker = WindowTracker::new(false);
         tracker.add_window(1);
         tracker.map_window(1, 1920, 1080);
         tracker.add_window(2);
@@ -395,7 +424,7 @@ mod tests {
 
     #[test]
     fn requested_app_id_takes_priority() {
-        let mut tracker = WindowTracker::new();
+        let mut tracker = WindowTracker::new(false);
 
         tracker.add_window(1);
         tracker.map_window(1, 1920, 1080);
@@ -414,7 +443,7 @@ mod tests {
 
     #[test]
     fn overlay_classification() {
-        let mut tracker = WindowTracker::new();
+        let mut tracker = WindowTracker::new(false);
 
         // Game window.
         tracker.add_window(1);
@@ -432,7 +461,7 @@ mod tests {
 
     #[test]
     fn unmapped_window_loses_focus() {
-        let mut tracker = WindowTracker::new();
+        let mut tracker = WindowTracker::new(false);
         tracker.add_window(1);
         tracker.map_window(1, 1920, 1080);
         tracker.determine_focus();
@@ -445,7 +474,7 @@ mod tests {
 
     #[test]
     fn focusable_app_ids_deduped() {
-        let mut tracker = WindowTracker::new();
+        let mut tracker = WindowTracker::new(false);
 
         tracker.add_window(1);
         tracker.map_window(1, 1920, 1080);
@@ -457,5 +486,48 @@ mod tests {
 
         let ids = tracker.focusable_app_ids();
         assert_eq!(ids, vec![100]);
+    }
+
+    #[test]
+    fn steam_mode_ignores_zero_app_id() {
+        let mut tracker = WindowTracker::new(true);
+
+        // Window without STEAM_GAME (app_id = 0) — not a focus candidate.
+        tracker.add_window(1);
+        tracker.map_window(1, 1920, 1080);
+
+        tracker.determine_focus();
+        assert!(tracker.focus().app.is_none());
+        assert_eq!(tracker.focus().focused_app_id, 0);
+    }
+
+    #[test]
+    fn steam_mode_focuses_valid_app_id() {
+        let mut tracker = WindowTracker::new(true);
+
+        // Window without STEAM_GAME — skipped.
+        tracker.add_window(1);
+        tracker.map_window(1, 1920, 1080);
+
+        // Window with STEAM_GAME — gets focus.
+        tracker.add_window(2);
+        tracker.map_window(2, 1920, 1080);
+        tracker.set_app_id(2, 769);
+
+        tracker.determine_focus();
+        assert_eq!(tracker.focus().app, Some(2));
+        assert_eq!(tracker.focus().focused_app_id, 769);
+    }
+
+    #[test]
+    fn standalone_mode_focuses_zero_app_id() {
+        let mut tracker = WindowTracker::new(false);
+
+        // In standalone mode, app_id=0 windows are still focusable.
+        tracker.add_window(1);
+        tracker.map_window(1, 1920, 1080);
+
+        tracker.determine_focus();
+        assert_eq!(tracker.focus().app, Some(1));
     }
 }

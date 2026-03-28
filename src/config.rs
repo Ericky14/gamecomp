@@ -31,6 +31,13 @@ pub struct Config {
     pub upscale: UpscaleMode,
     /// Number of XWayland instances to spawn.
     pub xwayland_count: u32,
+    /// Enable Steam integration mode (`-e` / `--steam`).
+    ///
+    /// When enabled, window AppIDs come exclusively from the `STEAM_GAME`
+    /// atom (set by Steam). When disabled (standalone mode), windows
+    /// without `STEAM_GAME` get their X11 window ID as a synthetic AppID
+    /// so every window is always identifiable and focusable by ID.
+    pub steam_mode: bool,
     /// Frame pacer red zone in microseconds.
     pub red_zone_us: u64,
     /// Game render resolution (`-w`×`-h`). This is the resolution
@@ -88,6 +95,7 @@ impl Default for Config {
             hdr: false,
             upscale: UpscaleMode::None,
             xwayland_count: 1,
+            steam_mode: false,
             red_zone_us: 1500,
             game_resolution: None,
             fps_limit: 0,
@@ -243,6 +251,7 @@ impl Config {
                         i += 1;
                     }
                 }
+                "--steam" | "-e" => config.steam_mode = true,
                 "--vrr" => config.vrr = true,
                 "--no-vrr" => config.vrr = false,
                 "--hdr" => config.hdr = true,

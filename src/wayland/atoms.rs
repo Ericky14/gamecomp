@@ -113,8 +113,14 @@ pub struct Atoms {
     pub composite_debug: u32,
 
     // --- Multi-display atoms (set on root) ---
+    /// `GAMECOMP_XWAYLAND_SERVER_ID` — published on each server's root window
+    /// so external clients can identify which XWayland server they are on.
+    pub xwayland_server_id: u32,
     /// `GAMECOMP_CREATE_XWAYLAND_SERVER` — request new XWayland server.
     pub create_xwayland_server: u32,
+    /// `GAMECOMP_CREATE_XWAYLAND_SERVER_FEEDBACK` — feedback after dynamic server
+    /// creation. Value is `"<identifier> <server_id> <display_name>"`.
+    pub create_xwayland_server_feedback: u32,
     /// `GAMECOMP_DESTROY_XWAYLAND_SERVER` — destroy XWayland server by ID.
     pub destroy_xwayland_server: u32,
 
@@ -198,7 +204,9 @@ impl Atoms {
             "GAMECOMP_COMPOSITE_FORCE",
             "GAMECOMP_COMPOSITE_DEBUG",
             // Multi-display
+            "GAMECOMP_XWAYLAND_SERVER_ID",
             "GAMECOMP_CREATE_XWAYLAND_SERVER",
+            "GAMECOMP_CREATE_XWAYLAND_SERVER_FEEDBACK",
             "GAMECOMP_DESTROY_XWAYLAND_SERVER",
             // Feedback
             "GAMECOMP_FOCUSED_APP",
@@ -276,22 +284,24 @@ impl Atoms {
             composite_force: atoms[32],
             composite_debug: atoms[33],
             // Multi-display
-            create_xwayland_server: atoms[34],
-            destroy_xwayland_server: atoms[35],
+            xwayland_server_id: atoms[34],
+            create_xwayland_server: atoms[35],
+            create_xwayland_server_feedback: atoms[36],
+            destroy_xwayland_server: atoms[37],
             // Feedback
-            focused_app: atoms[36],
-            focused_window: atoms[37],
-            focusable_apps: atoms[38],
-            focusable_windows: atoms[39],
-            vrr_capable: atoms[40],
-            vrr_in_use: atoms[41],
-            hdr_supported: atoms[42],
-            fsr_active: atoms[43],
-            display_refresh_rate: atoms[44],
-            cursor_visible: atoms[45],
-            pid: atoms[46],
+            focused_app: atoms[38],
+            focused_window: atoms[39],
+            focusable_apps: atoms[40],
+            focusable_windows: atoms[41],
+            vrr_capable: atoms[42],
+            vrr_in_use: atoms[43],
+            hdr_supported: atoms[44],
+            fsr_active: atoms[45],
+            display_refresh_rate: atoms[46],
+            cursor_visible: atoms[47],
+            pid: atoms[48],
             // Screenshot
-            request_screenshot: atoms[47],
+            request_screenshot: atoms[49],
         })
     }
 }

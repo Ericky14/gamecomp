@@ -42,6 +42,11 @@ impl Dispatch<WlCompositor, ()> for WaylandState {
         match request {
             wl_compositor::Request::CreateSurface { id } => {
                 info!("wl_compositor: create_surface");
+                let server_index = state
+                    .xwayland_client_map
+                    .get(&_client.id())
+                    .copied()
+                    .unwrap_or(u32::MAX);
                 let surface = data_init.init(
                     id,
                     SurfaceData {
@@ -49,6 +54,7 @@ impl Dispatch<WlCompositor, ()> for WaylandState {
                         is_cursor: std::sync::atomic::AtomicBool::new(false),
                         hotspot_x: std::sync::atomic::AtomicI32::new(0),
                         hotspot_y: std::sync::atomic::AtomicI32::new(0),
+                        server_index,
                     },
                 );
                 // Track all client surfaces for per-client focus enter.
@@ -113,6 +119,26 @@ impl Dispatch<WlSurface, SurfaceData> for WaylandState {
                     state.fire_frame_callbacks();
                     return;
                 }
+
+                // In steam mode, only the focused window's surface may
+                // present. Reject commits from other surfaces and withhold
+                // frame callbacks so the client stalls at vkAcquireNextImage
+                // — zero GPU waste. When focus changes, the main loop fires
+                // pending callbacks to wake the newly-focused client.
+                //
+                // Compare both server_index and protocol_id because
+                // protocol_id is per-Wayland-client — two XWayland servers
+                // can allocate the same numeric ID for different surfaces.
+                if state.steam_mode {
+                    let focused_id = state.focused_wl_surface_id.load(Ordering::Relaxed);
+                    let focused_srv = state.focused_server_index.load(Ordering::Relaxed);
+                    let surface_id = _surface.id().protocol_id();
+                    let surface_srv = data.server_index;
+                    if focused_id == 0 || surface_id != focused_id || surface_srv != focused_srv {
+                        return;
+                    }
+                }
+
                 state.frame_seq += 1;
 
                 // Read pixels from the attached buffer and send to presenter.
