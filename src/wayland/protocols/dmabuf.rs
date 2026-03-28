@@ -4,7 +4,7 @@
 use parking_lot::Mutex;
 use std::os::unix::io::OwnedFd;
 
-use tracing::{info, warn, trace};
+use tracing::{info, trace, warn};
 use wayland_protocols::wp::linux_dmabuf::zv1::server::{
     zwp_linux_buffer_params_v1::{self, ZwpLinuxBufferParamsV1},
     zwp_linux_dmabuf_v1::{self, ZwpLinuxDmabufV1},

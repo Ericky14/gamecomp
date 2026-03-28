@@ -19,26 +19,29 @@ static GLOBAL: MiMalloc = MiMalloc;
 mod backend;
 mod compositor;
 mod config;
+mod focus;
 mod frame_pacer;
 mod input;
 mod render;
+mod render_thread;
 mod retry;
 mod stats;
 #[cfg(test)]
 mod test_harness;
 mod wayland;
+mod xwayland_mgr;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread;
 
 use anyhow::Context;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use crate::backend::Backend;
 use crate::compositor::scene::FrameInfo;
 use crate::config::Config;
+use crate::focus::FocusArbiter;
 use crate::frame_pacer::{FpsLimiter, FramePacer};
 use crate::input::InputHandler;
 use crate::input::keyboard::{KeyAction, KeyboardMonitor};
@@ -46,6 +49,7 @@ use crate::input::pointer::PointerMonitor;
 use crate::retry::{RetryPolicy, retry_with_backoff};
 use crate::stats::StatsTracker;
 use crate::wayland::WaylandServer;
+use crate::xwayland_mgr::XWaylandInstance;
 
 /// Global shutdown flag. Set by signal handlers or error paths.
 /// Ordering: Relaxed is sufficient — all threads poll this periodically.
@@ -238,7 +242,7 @@ fn run(config: Config) -> anyhow::Result<()> {
     let render_thread = thread::Builder::new()
         .name("gamecomp-render".to_string())
         .spawn(move || {
-            render_thread_main(
+            render_thread::render_thread_main(
                 &config_clone,
                 host_display_clone,
                 frame_rx,
@@ -261,14 +265,14 @@ fn run(config: Config) -> anyhow::Result<()> {
     // XWayland (and all subsequent clients) will then be advertised the real
     // host formats, enabling zero-copy DMA-BUF forwarding.
     if matches!(config.backend, crate::config::BackendKind::Wayland) {
-        wait_for_host_formats(&host_dmabuf_formats);
+        xwayland_mgr::wait_for_host_formats(&host_dmabuf_formats);
 
         // Also wait for the host window configure so we know the actual
         // window dimensions before launching XWayland. Without this,
         // clients start at the CLI-supplied resolution (e.g., 2560×1440)
         // instead of the host-constrained physical dimensions, causing
         // buffer size mismatches on the first frames.
-        wait_for_host_configure(&host_physical_width, &host_physical_height);
+        xwayland_mgr::wait_for_host_configure(&host_physical_width, &host_physical_height);
         let pw = host_physical_width.load(Ordering::Acquire);
         let ph = host_physical_height.load(Ordering::Acquire);
         if pw > 0 && ph > 0 {
@@ -288,24 +292,6 @@ fn run(config: Config) -> anyhow::Result<()> {
     //   ...etc.
     let xwayland_count = config.xwayland_count.max(1);
 
-    /// Per-XWayland server state managed by the main thread.
-    struct XWaylandInstance {
-        /// X11 display string (e.g., ":1").
-        display: String,
-        /// XWayland child process.
-        child: std::process::Child,
-        /// Command sender to the XWM thread.
-        cmd_tx: std::sync::mpsc::Sender<wayland::xwayland::XwmCommand>,
-        /// XWM thread handle.
-        thread: std::thread::JoinHandle<()>,
-        /// Server index (0 = platform, 1+ = game).
-        index: u32,
-        /// Per-server focused app ID (XWM thread writes, main loop reads).
-        focused_app_id: Arc<AtomicU32>,
-        /// Per-server focused surface protocol ID (XWM thread writes, main loop reads).
-        focused_wl_surface_id: Arc<AtomicU32>,
-    }
-
     let (xwm_event_tx, xwm_event_rx) = calloop::channel::channel::<wayland::xwayland::XwmEvent>();
 
     // Global "winning" focus state — the main loop aggregates per-server
@@ -323,9 +309,9 @@ fn run(config: Config) -> anyhow::Result<()> {
     let mut xwayland_servers: Vec<XWaylandInstance> = Vec::with_capacity(xwayland_count as usize);
 
     for server_idx in 0..xwayland_count {
-        let display_str = find_free_x11_display()?;
+        let display_str = xwayland_mgr::find_free_x11_display()?;
 
-        let child = spawn_xwayland(
+        let child = xwayland_mgr::spawn_xwayland(
             &display_str,
             &socket_name,
             &mut wayland_server,
@@ -437,15 +423,8 @@ fn run(config: Config) -> anyhow::Result<()> {
     // Track the last-seen detected refresh rate to avoid redundant updates.
     let mut last_detected_hz: u32 = 0;
 
-    // Track the last-seen focused surface for steam mode wakeup.
-    let mut prev_focused_wl_surface_id: u32 = 0;
-    let mut prev_focused_server_index: u32 = u32::MAX;
-    // Per-server app_id snapshots for detecting *changes*.
-    let mut prev_server_app_ids: Vec<u32> = vec![0; xwayland_count as usize];
-    // Baselayer AppIDs requested by an external controller (Steam) via
-    // the `GAMECOMP_BASELAYER_APPID` atom. The arbiter prefers servers
-    // whose focused AppID matches one of these.
-    let mut baselayer_app_ids: Vec<u32> = Vec::new();
+    // Cross-server focus arbiter for steam mode.
+    let mut focus_arbiter = FocusArbiter::new(xwayland_count as usize);
 
     while RUNNING.load(Ordering::Relaxed) {
         // Dispatch libseat events (VT switch notifications) for DRM sessions.
@@ -593,7 +572,7 @@ fn run(config: Config) -> anyhow::Result<()> {
 
         // Monitor all XWayland instances and respawn crashed ones.
         for srv in &mut xwayland_servers {
-            monitor_xwayland(
+            xwayland_mgr::monitor_xwayland(
                 &mut srv.child,
                 &srv.display,
                 &socket_name,
@@ -610,120 +589,19 @@ fn run(config: Config) -> anyhow::Result<()> {
             warn!(?e, "failed to insert Wayland client");
         }
 
-        // Drain XWM events — pick up baselayer changes and other control atoms.
-        while let Ok(evt) = xwm_event_rx.try_recv() {
-            if let wayland::xwayland::XwmEvent::BaselayerAppIdsChanged(ids) = evt {
-                debug!(?ids, "main loop: baselayer app IDs updated");
-                baselayer_app_ids = ids;
-                // Reset stealer detection so all servers re-compete for
-                // focus. Without this, clearing baselayer would leave the
-                // Phase-0 winner stuck in Phase 2 ("keep current winner")
-                // because no server's app_id actually changed.
-                prev_server_app_ids.fill(0);
-            }
-        }
-
-        // Aggregate per-server focus state in steam mode.
-        //
-        // Like gamescope's `determine_and_apply_focus`, we collect focus
-        // from all XWayland servers and pick a global winner. Strategy:
-        //   0. If baselayer AppIDs are set, prefer a server whose focused
-        //      AppID matches (cross-server explicit focus control, like
-        //      gamescope's `GAMESCOPECTRL_BASELAYER_APPID`).
-        //   1. If a server just changed its app_id to non-zero, it steals focus
-        //      (most recent state change wins — matches gamescope's
-        //      `map_sequence` / `damage_sequence` priority for newest window).
-        //   2. Otherwise keep the current winner while it still has focus.
-        //   3. If the current winner lost focus (app_id → 0), fall back to
-        //      any other server that still has a non-zero app_id.
+        // Drain XWM events and run the 4-phase focus arbiter. The arbiter
+        // picks the global winning server and signals focus changes.
         if config.steam_mode {
-            let mut winner_app: u32 = 0;
-            let mut winner_surface: u32 = 0;
-            let mut winner_server: u32 = u32::MAX;
+            focus_arbiter.drain_events(&xwm_event_rx);
+            let focus_states: Vec<_> = xwayland_servers.iter().map(|s| s.focus_state()).collect();
+            let result = focus_arbiter.update(&focus_states);
 
-            // Phase 0: if baselayer AppIDs are set (via GAMECOMP_BASELAYER_APPID),
-            // prefer the server whose focused app_id matches one. This is the
-            // cross-server equivalent of gamescope's GAMESCOPECTRL_BASELAYER_APPID:
-            // Steam writes a list of AppIDs that should be focused, and we honour
-            // that over any implicit stealer/fallback logic.
-            let mut baselayer_matched = false;
-            if !baselayer_app_ids.is_empty() {
-                for srv in &xwayland_servers {
-                    let app = srv.focused_app_id.load(Ordering::Relaxed);
-                    if app != 0 && baselayer_app_ids.contains(&app) {
-                        winner_app = app;
-                        winner_surface = srv.focused_wl_surface_id.load(Ordering::Relaxed);
-                        winner_server = srv.index;
-                        baselayer_matched = true;
-                        break;
-                    }
-                }
-            }
+            focused_app_id.store(result.app_id, Ordering::Relaxed);
+            focused_wl_surface_id.store(result.surface_id, Ordering::Relaxed);
+            focused_server_index.store(result.server_index, Ordering::Relaxed);
 
-            // Update prev_server_app_ids for stealer detection regardless
-            // of whether baselayer matched — we always want accurate history.
-            let mut stealer: Option<usize> = None;
-            for (i, srv) in xwayland_servers.iter().enumerate() {
-                let app = srv.focused_app_id.load(Ordering::Relaxed);
-                let prev = prev_server_app_ids[i];
-                if app != prev && app != 0 {
-                    stealer = Some(i);
-                }
-                prev_server_app_ids[i] = app;
-            }
-
-            if !baselayer_matched {
-                // Phase 1: detect any server whose app_id just changed to non-zero
-                // (this server is stealing focus).
-                if let Some(i) = stealer {
-                    // A server just got a new STEAM_GAME — it takes focus.
-                    let srv = &xwayland_servers[i];
-                    winner_app = srv.focused_app_id.load(Ordering::Relaxed);
-                    winner_surface = srv.focused_wl_surface_id.load(Ordering::Relaxed);
-                    winner_server = srv.index;
-                } else {
-                    // Phase 2: no new stealer — keep current winner if still valid.
-                    let cur_srv = prev_focused_server_index;
-                    if cur_srv != u32::MAX
-                        && let Some(srv) = xwayland_servers.iter().find(|s| s.index == cur_srv)
-                    {
-                        let app = srv.focused_app_id.load(Ordering::Relaxed);
-                        if app != 0 {
-                            winner_app = app;
-                            winner_surface = srv.focused_wl_surface_id.load(Ordering::Relaxed);
-                            winner_server = cur_srv;
-                        }
-                    }
-                    // Phase 3: fallback — pick any server with non-zero app_id.
-                    if winner_app == 0 {
-                        for srv in &xwayland_servers {
-                            let app = srv.focused_app_id.load(Ordering::Relaxed);
-                            if app != 0 {
-                                winner_app = app;
-                                winner_surface = srv.focused_wl_surface_id.load(Ordering::Relaxed);
-                                winner_server = srv.index;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-
-            focused_app_id.store(winner_app, Ordering::Relaxed);
-            focused_wl_surface_id.store(winner_surface, Ordering::Relaxed);
-            focused_server_index.store(winner_server, Ordering::Relaxed);
-
-            // Detect focus changes and wake the newly-focused client
-            // by firing pending frame callbacks. Until this fires,
-            // the client is stalled at vkAcquireNextImage (zero GPU waste).
-            if winner_surface != prev_focused_wl_surface_id
-                || winner_server != prev_focused_server_index
-            {
-                prev_focused_wl_surface_id = winner_surface;
-                prev_focused_server_index = winner_server;
-                if winner_surface != 0 {
-                    wayland_state.fire_frame_callbacks();
-                }
+            if result.changed && result.surface_id != 0 {
+                wayland_state.fire_frame_callbacks();
             }
         }
 
@@ -816,39 +694,6 @@ fn update_refresh_rate(
     limiter.set_display_refresh(hz);
 }
 
-/// Check if XWayland exited and respawn it if necessary.
-///
-/// If XWayland crashed or was terminated, spawns a fresh instance.
-/// The XWM thread's retry loop will re-establish the window manager
-/// connection automatically.
-fn monitor_xwayland(
-    child: &mut std::process::Child,
-    display: &str,
-    socket: &str,
-    server: &mut WaylandServer,
-    state: &mut wayland::WaylandState,
-    server_index: u32,
-) {
-    match child.try_wait() {
-        Ok(Some(status)) => {
-            warn!(?status, "XWayland exited, respawning");
-            match spawn_xwayland(display, socket, server, state, server_index) {
-                Ok(new_child) => {
-                    *child = new_child;
-                    info!("XWayland respawned successfully");
-                }
-                Err(e) => {
-                    error!(?e, "failed to respawn XWayland");
-                }
-            }
-        }
-        Ok(None) => {} // Still running.
-        Err(e) => {
-            warn!(?e, "error checking XWayland status");
-        }
-    }
-}
-
 /// Forward the staged buffer to the render thread if the FPS limiter allows it.
 ///
 /// This is the throttle valve: it releases held wl_buffers back to the client,
@@ -938,701 +783,6 @@ fn poll_or_sleep(wayland_fd: i32, state: &wayland::WaylandState, limiter: &FpsLi
         let err = std::io::Error::last_os_error();
         if err.kind() != std::io::ErrorKind::Interrupted {
             warn!(?err, "ppoll error");
-        }
-    }
-}
-
-// ─── Host format readiness ──────────────────────────────────────────
-
-/// Wait for the wayland backend's event thread to populate host DMA-BUF
-/// format/modifier pairs.
-///
-/// The render thread starts the wayland backend event loop, which performs
-/// two roundtrips to the host compositor to discover DMA-BUF formats.
-/// We block here so that XWayland (and subsequent clients) can be
-/// advertised the real host formats when they bind `zwp_linux_dmabuf_v1`,
-/// enabling zero-copy DMA-BUF forwarding.
-///
-/// Times out after 5 s — if the host compositor doesn't support DMA-BUF,
-/// clients fall back to the hardcoded format list.
-fn wait_for_host_formats(
-    host_formats: &Arc<parking_lot::Mutex<std::collections::HashMap<u32, Vec<u64>>>>,
-) {
-    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
-
-    info!("waiting for host DMA-BUF formats before launching XWayland");
-
-    let start = std::time::Instant::now();
-    loop {
-        let formats = host_formats.lock();
-        if !formats.is_empty() {
-            let elapsed = start.elapsed();
-            info!(
-                formats = formats.len(),
-                elapsed_ms = elapsed.as_millis(),
-                "host DMA-BUF formats ready, proceeding with XWayland launch"
-            );
-            return;
-        }
-        if start.elapsed() >= TIMEOUT {
-            warn!(
-                "timeout waiting for host DMA-BUF formats — \
-                 clients will use fallback format list"
-            );
-            return;
-        }
-        std::thread::sleep(POLL_INTERVAL);
-    }
-}
-
-/// Wait for the host compositor to send its first `xdg_toplevel.configure`
-/// so that `host_physical_width` / `host_physical_height` are non-zero.
-///
-/// Without this, XWayland and the game start with the CLI-supplied
-/// resolution instead of the host-constrained size, causing buffer
-/// dimensions to mismatch the first viewport commit.
-fn wait_for_host_configure(
-    host_physical_width: &Arc<AtomicU32>,
-    host_physical_height: &Arc<AtomicU32>,
-) {
-    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
-
-    info!("waiting for host window configure before launching XWayland");
-
-    let start = std::time::Instant::now();
-    loop {
-        let pw = host_physical_width.load(Ordering::Acquire);
-        let ph = host_physical_height.load(Ordering::Acquire);
-        if pw > 0 && ph > 0 {
-            info!(
-                physical_w = pw,
-                physical_h = ph,
-                elapsed_ms = start.elapsed().as_millis(),
-                "host configure received, proceeding with XWayland launch"
-            );
-            return;
-        }
-        if start.elapsed() >= TIMEOUT {
-            warn!(
-                "timeout waiting for host configure — \
-                 XWayland will start with CLI resolution"
-            );
-            return;
-        }
-        std::thread::sleep(POLL_INTERVAL);
-    }
-}
-
-// ─── XWayland management ────────────────────────────────────────────
-
-/// Find a free X11 display number and return the display string (e.g., ":1").
-fn find_free_x11_display() -> anyhow::Result<String> {
-    let display_num = (0..33)
-        .find(|n| !std::path::Path::new(&format!("/tmp/.X11-unix/X{n}")).exists())
-        .context("no free X11 display number found")?;
-    Ok(format!(":{display_num}"))
-}
-
-/// Spawn XWayland on the given display and wait for readiness.
-///
-/// Dispatches the Wayland server while waiting so XWayland can complete
-/// its connection handshake. Returns the child process handle for
-/// lifecycle monitoring.
-fn spawn_xwayland(
-    display_str: &str,
-    wayland_socket: &str,
-    wayland_server: &mut WaylandServer,
-    wayland_state: &mut wayland::WaylandState,
-    server_index: u32,
-) -> anyhow::Result<std::process::Child> {
-    // Create a pipe for readiness notification. XWayland writes to the write-end
-    // when it's ready to accept connections (replaces SIGUSR1 in modern Xwayland).
-    let (read_fd, write_fd) = rustix::pipe::pipe().context("failed to create readiness pipe")?;
-
-    info!(display = %display_str, "launching XWayland");
-
-    let mut cmd = std::process::Command::new("Xwayland");
-    cmd.arg(display_str)
-        .arg("-rootless")
-        .arg("-terminate")
-        .arg("-displayfd")
-        .arg(format!("{}", rustix::fd::AsRawFd::as_raw_fd(&write_fd)))
-        .env("WAYLAND_DISPLAY", wayland_socket);
-
-    // Keep the write-fd open in the child; close read-fd.
-    use std::os::unix::process::CommandExt;
-    let write_raw = rustix::fd::AsRawFd::as_raw_fd(&write_fd);
-    // SAFETY: Called after fork() in the child process. Only async-signal-safe
-    // functions (fcntl) are used. No heap allocation or mutex interaction.
-    unsafe {
-        cmd.pre_exec(move || {
-            // Unset CLOEXEC on the write fd so the child inherits it.
-            let flags = libc::fcntl(write_raw, libc::F_GETFD);
-            libc::fcntl(write_raw, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
-            Ok(())
-        });
-    }
-
-    let child = cmd
-        .spawn()
-        .context("failed to launch Xwayland \u{2014} is it installed?")?;
-
-    // Close the write end in the parent.
-    drop(write_fd);
-
-    // Wait for XWayland to signal readiness while dispatching Wayland events.
-    // XWayland connects to our server during startup, so we must accept and
-    // dispatch for it to complete initialization.
-    use std::io::Read;
-    let mut read_file = std::fs::File::from(read_fd);
-    let mut buf = [0u8; 64];
-    let raw_fd = std::os::unix::io::AsRawFd::as_raw_fd(&read_file);
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-
-    loop {
-        // Accept any pending client connections (XWayland connecting to us).
-        if let Some(stream) = wayland_server.accept() {
-            match wayland_server.insert_client(stream, wayland_state) {
-                Ok(client_id) => {
-                    // Tag this client as belonging to this XWayland server
-                    // so the commit handler can disambiguate surfaces.
-                    wayland_state
-                        .xwayland_client_map
-                        .insert(client_id, server_index);
-                }
-                Err(e) => {
-                    warn!(?e, "failed to insert Wayland client during XWayland launch");
-                }
-            }
-        }
-
-        // Dispatch Wayland events so XWayland can complete its handshake.
-        let _ = wayland_server.dispatch(wayland_state);
-        wayland_server.flush();
-
-        // Poll the readiness pipe with a short timeout.
-        let mut fds = [libc::pollfd {
-            fd: raw_fd,
-            events: libc::POLLIN,
-            revents: 0,
-        }];
-        // SAFETY: Valid pollfd, single fd, short timeout.
-        let poll_ret = unsafe { libc::poll(fds.as_mut_ptr(), 1, 50) };
-
-        if poll_ret > 0 {
-            // XWayland wrote its display number.
-            let n = read_file.read(&mut buf).unwrap_or(0);
-            if n > 0 {
-                let reported = std::str::from_utf8(&buf[..n]).unwrap_or("").trim();
-                info!(reported_display = reported, "XWayland reported ready");
-            }
-            return Ok(child);
-        }
-
-        if std::time::Instant::now() >= deadline {
-            warn!("XWayland readiness timeout -- proceeding anyway");
-            return Ok(child);
-        }
-    }
-}
-
-/// Render thread entry point.
-///
-/// Owns the Vulkan compositor and DRM backend exclusively.
-/// Receives FrameInfo from the main thread, composites or performs direct
-/// scanout, and signals flip completion back.
-#[allow(clippy::too_many_arguments)]
-fn render_thread_main(
-    config: &Config,
-    host_wayland_display: Option<String>,
-    committed_frames: std::sync::mpsc::Receiver<wayland::protocols::CommittedBuffer>,
-    cursor_updates: std::sync::mpsc::Receiver<crate::backend::wayland::CursorUpdate>,
-    detected_refresh_mhz: Arc<AtomicU32>,
-    host_dmabuf_formats: Arc<parking_lot::Mutex<std::collections::HashMap<u32, Vec<u64>>>>,
-    drm_device: Option<(std::path::PathBuf, std::os::unix::io::OwnedFd)>,
-    vblank_tx: std::sync::mpsc::Sender<u64>,
-    session_active: Option<Arc<AtomicBool>>,
-    host_physical_width: Arc<AtomicU32>,
-    host_physical_height: Arc<AtomicU32>,
-    host_input_tx: std::sync::mpsc::Sender<crate::backend::wayland::WaylandEvent>,
-) {
-    info!("render thread started");
-
-    // Initialize Vulkan compositor.
-    match crate::compositor::VulkanCompositor::new() {
-        Ok(_c) => {
-            info!("Vulkan compositor ready");
-        }
-        Err(e) => {
-            warn!(
-                ?e,
-                "Vulkan compositor init failed, will use direct scanout only"
-            );
-        }
-    };
-
-    // Initialize backend based on config.
-    // The backend must stay alive for the entire render loop — dropping it
-    // signals the event thread to shut down.
-    let mut _backend: Option<crate::backend::wayland::WaylandBackend> = None;
-    let mut _drm_backend: Option<crate::backend::drm::DrmBackend> = None;
-    let mut committed_frames = Some(committed_frames);
-    let mut cursor_updates = Some(cursor_updates);
-
-    match config.backend {
-        crate::config::BackendKind::Wayland => {
-            let mut wayland_config = config.to_wayland_config();
-            wayland_config.host_wayland_display = host_wayland_display;
-            wayland_config.committed_frame_rx = committed_frames.take();
-            wayland_config.cursor_rx = cursor_updates.take();
-            wayland_config.detected_refresh_mhz = detected_refresh_mhz;
-            wayland_config.host_dmabuf_formats = host_dmabuf_formats;
-            let mut backend = crate::backend::wayland::WaylandBackend::new(wayland_config);
-            if let Err(e) = backend.init() {
-                error!(?e, "failed to initialize wayland backend");
-                return;
-            }
-            info!(
-                width = backend.window_size().0,
-                height = backend.window_size().1,
-                "wayland backend initialized"
-            );
-            _backend = Some(backend);
-        }
-        crate::config::BackendKind::Drm => {
-            if let Some((path, fd)) = drm_device {
-                let mut drm = crate::backend::drm::DrmBackend::new(path.clone(), fd);
-                if let Err(e) = drm.init() {
-                    error!(?e, path = %path.display(), "failed to initialize DRM backend");
-                    return;
-                }
-                let connectors = drm.connectors();
-                if let Some(conn) = connectors.first() {
-                    let mode = conn.mode;
-                    info!(
-                        connector = %conn.name,
-                        mode_w = mode.size().0,
-                        mode_h = mode.size().1,
-                        vrr = drm.capabilities().vrr,
-                        "DRM backend initialized"
-                    );
-                }
-                _drm_backend = Some(drm);
-            } else {
-                error!("DRM backend selected but no device fd received");
-                return;
-            }
-        }
-        _ => {
-            // TODO: Initialize headless backend.
-        }
-    }
-    // --- DRM event loop ---
-    // For the DRM backend, set up a calloop event loop on the render thread
-    // that polls the DRM fd for page flip events.
-    if let Some(ref mut drm) = _drm_backend {
-        let rx = committed_frames
-            .take()
-            .expect("committed_frames receiver missing for DRM path");
-        if let Err(e) = run_drm_event_loop(drm, rx, &vblank_tx, session_active.clone()) {
-            error!(?e, "DRM event loop exited with error");
-        }
-        info!("render thread exited");
-        return;
-    }
-
-    // Wayland / headless: monitor the backend until shutdown.
-    while RUNNING.load(Ordering::Relaxed) {
-        if let Some(ref mut backend) = _backend {
-            if !backend.is_alive() {
-                info!("wayland backend closed, initiating shutdown");
-                RUNNING.store(false, Ordering::Relaxed);
-                break;
-            }
-            // Drain events and publish host window size changes to the main
-            // thread so it can update the Wayland output resolution.
-            // Forward input events so they reach Wayland clients.
-            for event in backend.drain_events() {
-                match event {
-                    crate::backend::wayland::WaylandEvent::Resized {
-                        width: _,
-                        height: _,
-                        physical_width,
-                        physical_height,
-                    } => {
-                        host_physical_width.store(physical_width, Ordering::Release);
-                        host_physical_height.store(physical_height, Ordering::Release);
-                    }
-                    crate::backend::wayland::WaylandEvent::FrameCallback => {
-                        // Handled by the backend internally.
-                    }
-                    crate::backend::wayland::WaylandEvent::CloseRequested => {
-                        // Handled by is_alive() check above.
-                    }
-                    other => {
-                        // Forward all input events (Key, Modifiers, Keymap,
-                        // PointerMotion, PointerButton, Scroll, FocusIn,
-                        // FocusOut) to the main thread.
-                        let _ = host_input_tx.send(other);
-                    }
-                }
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_millis(16));
-    }
-
-    info!("render thread exited");
-}
-
-/// Run the DRM event loop on the render thread.
-///
-/// Registers the DRM fd as a calloop event source so page flip completions
-/// are handled promptly. Drains the committed frame channel each iteration,
-/// imports the latest DMA-BUF, and presents it via atomic commit.
-///
-/// The loop runs until [`RUNNING`] is cleared.
-fn run_drm_event_loop(
-    drm: &mut crate::backend::drm::DrmBackend,
-    committed_frames: std::sync::mpsc::Receiver<wayland::protocols::CommittedBuffer>,
-    vblank_tx: &std::sync::mpsc::Sender<u64>,
-    session_active: Option<Arc<AtomicBool>>,
-) -> anyhow::Result<()> {
-    let drm_raw_fd = drm.drm_fd().context("DRM backend has no fd")?;
-
-    // Get display resolution for blitter initialization.
-    let (display_w, display_h) = drm
-        .connectors()
-        .first()
-        .map(|c| (c.mode.size().0 as u32, c.mode.size().1 as u32))
-        .context("no connected display")?;
-
-    // Create Vulkan blitter for GPU composition. The GBM-backed path
-    // allocates output buffers via GBM (native GEM handles), imports
-    // them into Vulkan for rendering, and creates DRM FBs directly
-    // from GBM — bypassing PRIME_FD_TO_HANDLE which causes tiling
-    // metadata corruption on NVIDIA.
-    let scanout_modifiers = drm.query_primary_plane_modifiers(drm_fourcc::DrmFourcc::Xrgb8888);
-    let mut blitter = crate::backend::gpu::vulkan_blitter::VulkanBlitter::new_for_import()
-        .context("failed to create Vulkan blitter for DRM composition")?;
-
-    // Compute the intersection of DRM plane modifiers and Vulkan importable
-    // modifiers, then allocate GBM buffers with those modifiers.
-    let importable_modifiers = blitter
-        .compute_importable_modifiers(&scanout_modifiers, display_w, display_h)
-        .context("failed to compute importable modifiers")?;
-
-    let gbm_outputs = drm
-        .allocate_gbm_output_buffers(3, display_w, display_h, &importable_modifiers)
-        .context("failed to allocate GBM output buffers")?;
-
-    // Import GBM DMA-BUFs into Vulkan as output images.
-    let gbm_dmabufs: Vec<crate::backend::DmaBuf> =
-        gbm_outputs.iter().map(|o| o.dmabuf.clone()).collect();
-    blitter
-        .import_output_images(&gbm_dmabufs)
-        .context("failed to import GBM output images into Vulkan")?;
-
-    info!(
-        display_w,
-        display_h,
-        output_count = gbm_outputs.len(),
-        "Vulkan blitter ready with GBM-backed output buffers"
-    );
-
-    let mut event_loop =
-        calloop::EventLoop::<bool>::try_new().context("failed to create DRM event loop")?;
-    let handle = event_loop.handle();
-
-    // SAFETY: The DRM fd is owned by DrmBackend which outlives this event
-    // loop. The fd remains valid until DrmBackend is dropped after this
-    // function returns.
-    let wrapper = unsafe { calloop::generic::FdWrapper::new(drm_raw_fd) };
-    let source =
-        calloop::generic::Generic::new(wrapper, calloop::Interest::READ, calloop::Mode::Level);
-
-    handle
-        .insert_source(source, |_readiness, _fd, flip_ready| {
-            *flip_ready = true;
-            Ok(calloop::PostAction::Continue)
-        })
-        .context("failed to register DRM fd with event loop")?;
-
-    info!("DRM event loop started");
-
-    let mut flip_pending = false;
-    let mut flip_ready = false;
-    let mut frame_count: u64 = 0;
-    /// Maximum consecutive present failures before giving up.
-    const MAX_CONSECUTIVE_FAILURES: u32 = 10;
-    let mut consecutive_failures: u32 = 0;
-
-    // Pending buffer awaiting async DMA-BUF sync (client GPU not done yet).
-    let mut pending_buffer: Option<wayland::protocols::CommittedBuffer> = None;
-
-    // FB cache is pre-populated from GBM allocation — no PRIME import.
-    // Each GBM buffer already has a DRM framebuffer created from its
-    // native GEM handle at allocation time.
-    let mut output_fb_cache: Vec<Option<crate::backend::Framebuffer>> =
-        gbm_outputs.iter().map(|o| Some(o.fb)).collect();
-
-    // Keep GBM output buffers alive — they own the DMA-BUF fds that
-    // back the Vulkan output images and DRM framebuffers.
-    let _gbm_outputs = gbm_outputs;
-
-    // Track the previous direct-scanout FB so we can destroy it after
-    // the page flip completes. Unlike the blit path (where output FBs
-    // are cached forever), the direct-scanout path creates a new FB
-    // every frame from different client DMA-BUFs.
-    let mut prev_scanout_fb: Option<drm::control::framebuffer::Handle> = None;
-
-    let mut was_active = true;
-
-    while RUNNING.load(Ordering::Relaxed) {
-        // --- Session pause: stop presenting while VT-switched away ---
-        // When the session is disabled (VT switch), the kernel revokes
-        // DRM master, so all atomic commits would fail with EACCES.
-        // Sleep instead of burning CPU on doomed commits.
-        if let Some(ref active) = session_active {
-            let is_active = active.load(Ordering::Acquire);
-            if !is_active {
-                if was_active {
-                    info!("session inactive, pausing DRM presents");
-                    was_active = false;
-                }
-                // Drain stale frames so we don't replay old content on resume.
-                while committed_frames.try_recv().is_ok() {}
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                continue;
-            } else if !was_active {
-                info!("session re-enabled, forcing modeset");
-                drm.force_modeset();
-                flip_pending = false;
-                was_active = true;
-            }
-        }
-
-        // Block up to 16ms for DRM events.
-        event_loop
-            .dispatch(std::time::Duration::from_millis(16), &mut flip_ready)
-            .context("DRM event loop dispatch failed")?;
-
-        // Process page flip completion.
-        if flip_ready {
-            if let Some(vblank_ns) = drm.handle_page_flip()? {
-                // Send vblank timestamp to the main thread for frame pacing.
-                let _ = vblank_tx.send(vblank_ns);
-            }
-            // The previous scanout FB is safe to destroy now that the
-            // display has flipped to the new one.
-            if let Some(old_fb) = prev_scanout_fb.take() {
-                drm.destroy_framebuffer(old_fb);
-            }
-            flip_pending = false;
-            flip_ready = false;
-        }
-
-        // Don't submit a new frame while a flip is pending — the display
-        // hardware can only queue one flip at a time.
-        if flip_pending {
-            continue;
-        }
-
-        // Drain the channel, keeping only the latest buffer (drop stale frames).
-        let mut latest: Option<wayland::protocols::CommittedBuffer> = None;
-        while let Ok(buf) = committed_frames.try_recv() {
-            latest = Some(buf);
-        }
-
-        // --- Async DMA-BUF implicit sync ---
-        //
-        // Instead of blocking inside blit() waiting for the client's GPU
-        // to finish, we do a non-blocking poll(0) here. If the buffer
-        // isn't ready yet, we defer it to the next event loop iteration
-        // (calloop re-dispatches every 16ms).
-        //
-        // Fast path (>99% of frames): client GPU finished before commit
-        //   → poll(0) returns instantly → blit + present on this iteration.
-        //
-        // Slow path (rare): client GPU still rendering at commit time
-        //   → store as pending_buffer → retry on next iteration.
-        if latest.is_some() {
-            pending_buffer = latest;
-        }
-
-        if let Some(ref buffer) = pending_buffer {
-            let ready = match buffer {
-                wayland::protocols::CommittedBuffer::DmaBuf { planes, .. } => {
-                    use std::os::unix::io::AsFd;
-                    crate::backend::gpu::vulkan_blitter::VulkanBlitter::poll_dmabuf_ready(
-                        planes[0].fd.as_fd(),
-                        0, // Non-blocking
-                    )
-                }
-                // SHM buffers are CPU-side — always ready.
-                wayland::protocols::CommittedBuffer::Shm { .. } => true,
-            };
-
-            if !ready {
-                trace!("DMA-BUF not ready, deferring to next iteration");
-                continue;
-            }
-        }
-
-        if let Some(buffer) = pending_buffer.take() {
-            match present_committed_buffer(
-                drm,
-                buffer,
-                &mut blitter,
-                display_w,
-                display_h,
-                &mut output_fb_cache,
-                &mut prev_scanout_fb,
-            ) {
-                Ok(is_async) => {
-                    flip_pending = is_async;
-                    frame_count += 1;
-                    consecutive_failures = 0;
-                    if frame_count % 300 == 1 {
-                        tracing::debug!(frame_count, "DRM frame presented");
-                    }
-                }
-                Err(e) => {
-                    consecutive_failures += 1;
-                    warn!(
-                        ?e,
-                        consecutive_failures,
-                        max = MAX_CONSECUTIVE_FAILURES,
-                        "DRM present failed"
-                    );
-                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                        error!(
-                            consecutive_failures,
-                            "too many consecutive DRM present failures, exiting"
-                        );
-                        RUNNING.store(false, Ordering::Relaxed);
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    info!(frame_count, "DRM event loop exiting");
-    Ok(())
-}
-
-/// Convert a [`CommittedBuffer`] to a backend [`DmaBuf`], import it, and
-/// present it to the display.
-///
-/// Flow:
-/// 1. If the client buffer matches the display resolution, try direct
-///    scanout (zero-copy — no GPU work).
-/// 2. Otherwise, blit the client buffer to a display-resolution output
-///    image via [`VulkanBlitter`], then import and present that.
-///
-/// The blitter solves the NVIDIA primary-plane limitation: the DRM plane
-/// cannot scale, so the framebuffer MUST match the CRTC mode dimensions.
-/// Returns `true` if a page flip is pending (async), `false` if the
-/// commit was synchronous (first modeset frame).
-fn present_committed_buffer(
-    drm: &mut crate::backend::drm::DrmBackend,
-    buffer: wayland::protocols::CommittedBuffer,
-    blitter: &mut crate::backend::gpu::vulkan_blitter::VulkanBlitter,
-    display_w: u32,
-    display_h: u32,
-    output_fb_cache: &mut [Option<crate::backend::Framebuffer>],
-    prev_scanout_fb: &mut Option<drm::control::framebuffer::Handle>,
-) -> anyhow::Result<bool> {
-    use std::os::unix::io::{AsFd, AsRawFd};
-
-    match buffer {
-        wayland::protocols::CommittedBuffer::DmaBuf {
-            planes,
-            width,
-            height,
-            format,
-            modifier,
-        } => {
-            // --- Direct scanout fast path ---
-            // If the client buffer already matches the display resolution,
-            // skip GPU composition entirely (zero-copy).
-            if width == display_w && height == display_h {
-                let fourcc = drm_fourcc::DrmFourcc::try_from(format)
-                    .map_err(|_| anyhow::anyhow!("unknown DRM format 0x{format:08x}"))?;
-                let dmabuf = crate::backend::DmaBuf {
-                    width,
-                    height,
-                    format: fourcc,
-                    modifier: drm_fourcc::DrmModifier::from(modifier),
-                    planes: planes
-                        .iter()
-                        .map(|p| crate::backend::DmaBufPlane {
-                            fd: p.fd.as_raw_fd(),
-                            offset: p.offset,
-                            stride: p.stride,
-                        })
-                        .collect(),
-                };
-                let fb = drm.import_dmabuf(&dmabuf)?;
-                if drm.try_direct_scanout(&fb)? {
-                    // Track the previous scanout FB for deferred destruction.
-                    // The display controller may still be scanning it out
-                    // until our page flip completes.
-                    *prev_scanout_fb = Some(fb.handle);
-                    match drm.present(&fb)? {
-                        crate::backend::FlipResult::Queued => return Ok(true),
-                        crate::backend::FlipResult::DirectScanout => return Ok(false),
-                        crate::backend::FlipResult::Failed(e) => {
-                            return Err(e.context("direct scanout flip failed"));
-                        }
-                    }
-                }
-                // TEST_ONLY failed (format/modifier mismatch) — fall through to blit.
-            }
-
-            // --- GPU composition path ---
-            // Blit the client buffer to a display-resolution output image.
-            let first_plane = &planes[0];
-            let exported = blitter
-                .blit(
-                    first_plane.fd.as_fd(),
-                    width,
-                    height,
-                    format,
-                    modifier,
-                    first_plane.offset,
-                    first_plane.stride,
-                )
-                .context("Vulkan blit failed")?;
-
-            // Use the pre-created DRM framebuffer for this output image.
-            // FBs were created at startup,
-            // so we just look up by buffer index.
-            let out_fb = output_fb_cache[exported.buffer_index]
-                .as_ref()
-                .expect("output FB must be pre-created at startup");
-
-            debug!(
-                buffer_index = exported.buffer_index,
-                fb = ?out_fb.handle,
-                "present: using DRM framebuffer"
-            );
-
-            match drm.present(out_fb)? {
-                crate::backend::FlipResult::Queued => Ok(true),
-                crate::backend::FlipResult::DirectScanout => Ok(false),
-                crate::backend::FlipResult::Failed(e) => {
-                    Err(e.context("blitted frame flip failed"))
-                }
-            }
-        }
-        wayland::protocols::CommittedBuffer::Shm { .. } => {
-            // TODO: SHM buffers require GPU-side blit (Vulkan compositor).
-            tracing::trace!("skipping SHM buffer on DRM path (not yet supported)");
-            Ok(false)
         }
     }
 }

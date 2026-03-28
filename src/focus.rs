@@ -1,0 +1,290 @@
+//! Cross-server focus arbitration for steam mode.
+//!
+//! When multiple XWayland servers run simultaneously (platform + game),
+//! the compositor must decide which server's surface is the "winner" —
+//! the one whose commits are presented and whose client receives frame
+//! callbacks.
+//!
+//! The [`FocusArbiter`] implements a 4-phase strategy modelled after
+//! gamescope's `determine_and_apply_focus`:
+//!
+//! 0. **Baselayer priority** — if `GAMECOMP_BASELAYER_APPID` is set,
+//!    prefer the server whose focused AppID matches.
+//! 1. **Stealer detection** — if a server just received a new
+//!    `STEAM_GAME` atom (app_id changed to non-zero), it steals focus.
+//! 2. **Current winner retention** — keep the current winner while it
+//!    still has a non-zero app_id.
+//! 3. **Fallback** — pick any server with a non-zero app_id.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use tracing::debug;
+
+use crate::wayland::xwayland::XwmEvent;
+
+/// Per-XWayland server focus state visible to the arbiter.
+///
+/// The XWM thread writes these atomics; the main loop reads them.
+pub struct ServerFocusState {
+    /// Server index (0 = platform, 1+ = game).
+    pub index: u32,
+    /// Focused app ID for this server (0 = no focused game window).
+    pub focused_app_id: Arc<AtomicU32>,
+    /// Focused surface protocol ID for this server (0 = none).
+    pub focused_wl_surface_id: Arc<AtomicU32>,
+}
+
+/// Result of a single arbitration tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FocusResult {
+    /// Winning app ID (0 = no focus).
+    pub app_id: u32,
+    /// Winning surface protocol ID (0 = no focus).
+    pub surface_id: u32,
+    /// Winning server index (`u32::MAX` = no focus).
+    pub server_index: u32,
+    /// Whether the focus target changed since last tick.
+    pub changed: bool,
+}
+
+/// Encapsulates all cross-server focus arbitration state.
+pub struct FocusArbiter {
+    /// Previous per-server app_id snapshots for change detection.
+    prev_server_app_ids: Vec<u32>,
+    /// Last winning surface protocol ID.
+    prev_surface_id: u32,
+    /// Last winning server index.
+    prev_server_index: u32,
+    /// Baselayer AppIDs requested by an external controller (Steam).
+    baselayer_app_ids: Vec<u32>,
+}
+
+impl FocusArbiter {
+    /// Create a new arbiter for `server_count` XWayland servers.
+    pub fn new(server_count: usize) -> Self {
+        Self {
+            prev_server_app_ids: vec![0; server_count],
+            prev_surface_id: 0,
+            prev_server_index: u32::MAX,
+            baselayer_app_ids: Vec::new(),
+        }
+    }
+
+    /// Drain the XWM event channel and update internal state.
+    ///
+    /// Must be called before [`update`] each tick.
+    pub fn drain_events(&mut self, event_rx: &calloop::channel::Channel<XwmEvent>) {
+        while let Ok(evt) = event_rx.try_recv() {
+            if let XwmEvent::BaselayerAppIdsChanged(ids) = evt {
+                debug!(?ids, "focus arbiter: baselayer app IDs updated");
+                self.baselayer_app_ids = ids;
+                // Reset stealer detection so all servers re-compete.
+                // Without this, clearing baselayer would leave the
+                // Phase-0 winner stuck in Phase 2 ("keep current winner")
+                // because no server's app_id actually changed.
+                self.prev_server_app_ids.fill(0);
+            }
+        }
+    }
+
+    /// Run one tick of the 4-phase focus arbitration.
+    ///
+    /// Reads per-server atomics, applies the priority strategy, and
+    /// returns the winning focus target. The caller is responsible for
+    /// storing the result into the global shared atomics and firing
+    /// frame callbacks on focus changes.
+    pub fn update(&mut self, servers: &[ServerFocusState]) -> FocusResult {
+        let mut winner_app: u32 = 0;
+        let mut winner_surface: u32 = 0;
+        let mut winner_server: u32 = u32::MAX;
+
+        // Phase 0: baselayer priority (GAMECOMP_BASELAYER_APPID).
+        let mut baselayer_matched = false;
+        if !self.baselayer_app_ids.is_empty() {
+            for srv in servers {
+                let app = srv.focused_app_id.load(Ordering::Relaxed);
+                if app != 0 && self.baselayer_app_ids.contains(&app) {
+                    winner_app = app;
+                    winner_surface = srv.focused_wl_surface_id.load(Ordering::Relaxed);
+                    winner_server = srv.index;
+                    baselayer_matched = true;
+                    break;
+                }
+            }
+        }
+
+        // Update prev_server_app_ids for stealer detection regardless
+        // of whether baselayer matched — we always want accurate history.
+        let mut stealer: Option<usize> = None;
+        for (i, srv) in servers.iter().enumerate() {
+            let app = srv.focused_app_id.load(Ordering::Relaxed);
+            let prev = self.prev_server_app_ids[i];
+            if app != prev && app != 0 {
+                stealer = Some(i);
+            }
+            self.prev_server_app_ids[i] = app;
+        }
+
+        if !baselayer_matched {
+            // Phase 1: stealer detection.
+            if let Some(i) = stealer {
+                let srv = &servers[i];
+                winner_app = srv.focused_app_id.load(Ordering::Relaxed);
+                winner_surface = srv.focused_wl_surface_id.load(Ordering::Relaxed);
+                winner_server = srv.index;
+            } else {
+                // Phase 2: keep current winner if still valid.
+                let cur_srv = self.prev_server_index;
+                if cur_srv != u32::MAX
+                    && let Some(srv) = servers.iter().find(|s| s.index == cur_srv)
+                {
+                    let app = srv.focused_app_id.load(Ordering::Relaxed);
+                    if app != 0 {
+                        winner_app = app;
+                        winner_surface = srv.focused_wl_surface_id.load(Ordering::Relaxed);
+                        winner_server = cur_srv;
+                    }
+                }
+                // Phase 3: fallback — any server with non-zero app_id.
+                if winner_app == 0 {
+                    for srv in servers {
+                        let app = srv.focused_app_id.load(Ordering::Relaxed);
+                        if app != 0 {
+                            winner_app = app;
+                            winner_surface = srv.focused_wl_surface_id.load(Ordering::Relaxed);
+                            winner_server = srv.index;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        let changed =
+            winner_surface != self.prev_surface_id || winner_server != self.prev_server_index;
+
+        self.prev_surface_id = winner_surface;
+        self.prev_server_index = winner_server;
+
+        FocusResult {
+            app_id: winner_app,
+            surface_id: winner_surface,
+            server_index: winner_server,
+            changed,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_server(index: u32, app_id: u32, surface_id: u32) -> ServerFocusState {
+        ServerFocusState {
+            index,
+            focused_app_id: Arc::new(AtomicU32::new(app_id)),
+            focused_wl_surface_id: Arc::new(AtomicU32::new(surface_id)),
+        }
+    }
+
+    #[test]
+    fn no_servers_yields_no_focus() {
+        let mut arbiter = FocusArbiter::new(0);
+        let result = arbiter.update(&[]);
+        assert_eq!(result.app_id, 0);
+        assert_eq!(result.server_index, u32::MAX);
+    }
+
+    #[test]
+    fn single_server_with_app_gets_focus() {
+        let servers = [make_server(0, 769, 10)];
+        let mut arbiter = FocusArbiter::new(1);
+        let result = arbiter.update(&servers);
+        assert_eq!(result.app_id, 769);
+        assert_eq!(result.surface_id, 10);
+        assert_eq!(result.server_index, 0);
+        assert!(result.changed);
+    }
+
+    #[test]
+    fn stealer_wins_over_existing() {
+        let servers = [make_server(0, 769, 10), make_server(1, 0, 0)];
+        let mut arbiter = FocusArbiter::new(2);
+
+        // First tick: server 0 wins.
+        let r = arbiter.update(&servers);
+        assert_eq!(r.server_index, 0);
+
+        // Server 1 gets a new app — it steals focus.
+        servers[1].focused_app_id.store(100, Ordering::Relaxed);
+        servers[1]
+            .focused_wl_surface_id
+            .store(20, Ordering::Relaxed);
+        let r = arbiter.update(&servers);
+        assert_eq!(r.app_id, 100);
+        assert_eq!(r.server_index, 1);
+        assert!(r.changed);
+    }
+
+    #[test]
+    fn current_winner_retained_when_no_stealer() {
+        let servers = [make_server(0, 769, 10), make_server(1, 100, 20)];
+        let mut arbiter = FocusArbiter::new(2);
+
+        // First tick: both are new, last stealer (server 1) wins.
+        let r = arbiter.update(&servers);
+        assert_eq!(r.server_index, 1);
+
+        // No changes — server 1 retained.
+        let r = arbiter.update(&servers);
+        assert_eq!(r.server_index, 1);
+        assert!(!r.changed);
+    }
+
+    #[test]
+    fn fallback_when_winner_loses_focus() {
+        let servers = [make_server(0, 769, 10), make_server(1, 100, 20)];
+        let mut arbiter = FocusArbiter::new(2);
+        arbiter.update(&servers);
+
+        // Server 1 loses focus.
+        servers[1].focused_app_id.store(0, Ordering::Relaxed);
+        let r = arbiter.update(&servers);
+        assert_eq!(r.server_index, 0);
+        assert_eq!(r.app_id, 769);
+        assert!(r.changed);
+    }
+
+    #[test]
+    fn baselayer_overrides_stealer() {
+        let servers = [make_server(0, 769, 10), make_server(1, 100, 20)];
+        let mut arbiter = FocusArbiter::new(2);
+        arbiter.update(&servers);
+
+        // Set baselayer to prefer app 769 (server 0).
+        arbiter.baselayer_app_ids = vec![769];
+        let r = arbiter.update(&servers);
+        assert_eq!(r.server_index, 0);
+        assert_eq!(r.app_id, 769);
+    }
+
+    #[test]
+    fn clearing_baselayer_triggers_recompete() {
+        let servers = [make_server(0, 769, 10), make_server(1, 100, 20)];
+        let mut arbiter = FocusArbiter::new(2);
+
+        // Baselayer pins server 0.
+        arbiter.baselayer_app_ids = vec![769];
+        arbiter.update(&servers);
+        assert_eq!(arbiter.prev_server_index, 0);
+
+        // Clear baselayer — prev_server_app_ids reset forces recompete.
+        arbiter.baselayer_app_ids.clear();
+        arbiter.prev_server_app_ids.fill(0);
+        let r = arbiter.update(&servers);
+        // Both servers look "new" — last stealer (server 1) wins.
+        assert_eq!(r.server_index, 1);
+        assert!(r.changed);
+    }
+}
