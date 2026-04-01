@@ -1,3 +1,10 @@
+## [1.1.1](https://github.com/Ericky14/gamecomp/compare/v1.1.0...v1.1.1) (2026-04-01)
+
+
+### Bug Fixes
+
+* remove steam_mode arg, no use having that ([eb1295c](https://github.com/Ericky14/gamecomp/commit/eb1295c2d194e8ba6bc970bd738ae0460b32b0e3))
+
 # [1.1.0](https://github.com/Ericky14/gamecomp/compare/v1.0.0...v1.1.0) (2026-03-25)
 
 
