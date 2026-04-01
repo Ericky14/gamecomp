@@ -1,6 +1,8 @@
 //! `xdg_wm_base`, `xdg_surface`, `xdg_toplevel`, `xdg_positioner`,
 //! and `xdg_popup` dispatch.
 
+use std::sync::atomic::Ordering;
+
 use tracing::debug;
 use wayland_protocols::xdg::shell::server::{
     xdg_popup::{self, XdgPopup},
@@ -10,9 +12,14 @@ use wayland_protocols::xdg::shell::server::{
     xdg_wm_base::{self, XdgWmBase},
 };
 use wayland_server::protocol::wl_surface::WlSurface;
-use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New};
+use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource};
 
 use crate::wayland::WaylandState;
+
+/// Default AppID assigned to native Wayland clients (non-XWayland).
+/// as the platform client and can control focus via
+/// `GAMESCOPECTRL_BASELAYER_APPID`.
+const NATIVE_CLIENT_APP_ID: u32 = 769;
 
 /// Per-xdg_surface data: remembers the associated `wl_surface` so that
 /// `get_toplevel` can register the correct surface for focus enter.
@@ -101,6 +108,25 @@ impl Dispatch<XdgSurface, XdgSurfaceData> for WaylandState {
                 state.toplevel_surfaces.push(data.wl_surface.clone());
                 // Track the toplevel for re-configure on resize.
                 state.toplevels.push(toplevel.clone());
+
+                // If this is a native Wayland client (not XWayland), register
+                // it in the native focus system so it participates in focus
+                // arbitration and passes the commit gate.
+                if !state.xwayland_client_map.contains_key(&_client.id()) {
+                    let surface_id = data.wl_surface.id().protocol_id();
+                    state
+                        .native_focused_surface_id
+                        .store(surface_id, Ordering::Relaxed);
+                    state
+                        .native_focused_app_id
+                        .store(NATIVE_CLIENT_APP_ID, Ordering::Relaxed);
+                    debug!(
+                        surface_id,
+                        app_id = NATIVE_CLIENT_APP_ID,
+                        "native Wayland toplevel registered for focus"
+                    );
+                }
+
                 // Send initial configure with Activated so clients accept input.
                 let (w, h) = state.output_resolution();
                 let states = crate::wayland::protocols::xdg_shell::activated_fullscreen_states();

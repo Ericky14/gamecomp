@@ -106,6 +106,14 @@ pub fn spawn_xwayland(
     let mut buf = [0u8; 64];
     let raw_fd = std::os::unix::io::AsRawFd::as_raw_fd(&read_file);
 
+    // Remove stale client map entries for this server index. On respawn,
+    // the old XWayland's client ID may still be in the map; if wayland-server
+    // recycles that ID for a new client, it would incorrectly
+    // appear as belonging to this XWayland server.
+    wayland_state
+        .xwayland_client_map
+        .retain(|_, idx| *idx != server_index);
+
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
 
     loop {

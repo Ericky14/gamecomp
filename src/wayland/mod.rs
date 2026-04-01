@@ -21,7 +21,7 @@ pub mod xwayland;
 use std::os::unix::io::RawFd;
 
 use anyhow::Context;
-use tracing::info;
+use tracing::{debug, info};
 use wayland_server::protocol::wl_callback::WlCallback;
 use wayland_server::protocol::wl_keyboard::WlKeyboard;
 use wayland_server::protocol::wl_output::WlOutput;
@@ -45,7 +45,7 @@ impl wayland_server::backend::ClientData for ClientData {
         _client_id: wayland_server::backend::ClientId,
         _reason: wayland_server::backend::DisconnectReason,
     ) {
-        info!("Wayland client disconnected");
+        debug!("Wayland client disconnected");
     }
 }
 
@@ -101,6 +101,10 @@ pub struct WaylandState {
     /// target FPS, intermediate frames are dropped (overwritten) — only the
     /// most recent buffer is ever forwarded.
     pub staged_buffer: Option<CommittedBuffer>,
+    /// Server index of the client that staged `staged_buffer`.
+    /// Used by the main loop to detect when the newly-focused client
+    /// has committed its first frame (commit-based presentation switch).
+    pub staged_buffer_server_index: u32,
     /// Held `wl_buffer` objects that have NOT been released back to the client.
     ///
     /// By withholding `wl_buffer.release`, we prevent the client from
@@ -147,6 +151,13 @@ pub struct WaylandState {
     /// XWayland spawn so the commit handler can determine which server
     /// a surface belongs to.
     pub xwayland_client_map: std::collections::HashMap<wayland_server::backend::ClientId, u32>,
+    /// Focused app ID for native Wayland clients (non-XWayland).
+    /// Set when a non-XWayland client creates an xdg_toplevel.
+    /// Uses 769 (STEAMAPP_PLAYTRON_APP_ID) by default for Grid compatibility.
+    pub native_focused_app_id: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// Focused surface protocol ID for native Wayland clients.
+    /// Set to the wl_surface protocol_id when a non-XWayland toplevel is created.
+    pub native_focused_surface_id: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl WaylandState {
@@ -166,6 +177,7 @@ impl WaylandState {
             has_pending_commit: false,
             frame_channel: None,
             staged_buffer: None,
+            staged_buffer_server_index: u32::MAX,
             held_buffers: Vec::new(),
             host_dmabuf_formats: std::sync::Arc::new(parking_lot::Mutex::new(
                 std::collections::HashMap::new(),
@@ -182,6 +194,8 @@ impl WaylandState {
             focused_wl_surface_id: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             focused_server_index: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX)),
             xwayland_client_map: std::collections::HashMap::new(),
+            native_focused_app_id: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            native_focused_surface_id: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         }
     }
 
@@ -223,11 +237,26 @@ impl WaylandState {
         }
 
         // Re-configure all toplevels so clients resize their buffers.
+        self.reconfigure_toplevels();
+    }
+
+    /// Re-configure all toplevels (Activated + Fullscreen).
+    ///
+    /// Called when focus changes so the newly-focused client receives a
+    /// `configure` event and responds with a `commit`, restarting its
+    /// frame callback cycle. Without this, a client that lost focus and
+    /// had its frame callbacks drained by cursor commits would never
+    /// learn it should start rendering again.
+    pub fn reconfigure_toplevels(&mut self) {
         self.toplevels.retain(|t| t.is_alive());
         let states = protocols::xdg_shell::activated_fullscreen_states();
         let serial = self.next_serial();
         for toplevel in &self.toplevels {
-            toplevel.configure(width as i32, height as i32, states.clone());
+            toplevel.configure(
+                self.output_width as i32,
+                self.output_height as i32,
+                states.clone(),
+            );
             if let Some(td) = toplevel.data::<protocols::xdg_shell::XdgToplevelData>() {
                 td.xdg_surface.configure(serial);
             }
@@ -673,7 +702,7 @@ impl WaylandServer {
             .insert_client(stream, std::sync::Arc::new(ClientData))
             .context("failed to insert Wayland client")?;
         let client_id = client.id();
-        info!("accepted new Wayland client");
+        debug!("accepted new Wayland client");
         Ok(client_id)
     }
 }

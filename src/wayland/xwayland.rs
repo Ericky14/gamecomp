@@ -23,7 +23,7 @@
 use std::process::Child;
 
 use anyhow::Context;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, trace};
 use x11rb::connection::Connection;
 use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
 
@@ -122,6 +122,8 @@ pub enum XwmCommand {
     FocusAppId { app_id: u32 },
     /// Update a feedback atom value on the root window.
     SetFeedback { atom_name: FeedbackAtom, value: u32 },
+    /// Update the global focused app/window on this server's root window.
+    SetGlobalFocus { app_id: u32 },
     /// Shutdown the XWM.
     Shutdown,
 }
@@ -202,6 +204,7 @@ pub fn run_xwm(
     focused_wl_surface_id: &std::sync::atomic::AtomicU32,
     output_width: u32,
     output_height: u32,
+    steam_mode: bool,
 ) -> anyhow::Result<()> {
     let x11_display = display;
     info!(
@@ -265,6 +268,18 @@ pub fn run_xwm(
             AtomEnum::CARDINAL,
             &[server_index],
         );
+
+        // Mark the primary server (index 0) with GAMESCOPE_KEYBOARD_FOCUS_DISPLAY
+        if server_index == 0 {
+            let _ = conn.change_property32(
+                PropMode::REPLACE,
+                root,
+                atoms.keyboard_focus_display,
+                AtomEnum::CARDINAL,
+                &[server_index],
+            );
+        }
+
         let _ = conn.flush();
     }
 
@@ -298,6 +313,7 @@ pub fn run_xwm(
                     server_index,
                     output_width,
                     output_height,
+                    steam_mode,
                 );
             }
             Ok(None) => {
@@ -414,6 +430,19 @@ fn process_command<C: Connection>(
             );
             let _ = conn.flush();
         }
+        Ok(XwmCommand::SetGlobalFocus { app_id }) => {
+            // Override the root window's GAMESCOPE_FOCUSED_APP with the
+            // global arbiter result. This is needed when a native Wayland
+            // client wins focus — the local XWM has no X11 window for it.
+            let _ = conn.change_property32(
+                PropMode::REPLACE,
+                root,
+                atoms.focused_app,
+                AtomEnum::CARDINAL,
+                &[app_id],
+            );
+            let _ = conn.flush();
+        }
         Err(std::sync::mpsc::TryRecvError::Empty) => {}
         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
             info!("XWM command channel disconnected, shutting down");
@@ -435,6 +464,7 @@ fn handle_x11_event<C: Connection>(
     server_index: u32,
     output_width: u32,
     output_height: u32,
+    steam_mode: bool,
 ) {
     use x11rb::protocol::xproto::{
         ChangeWindowAttributesAux, ConfigureWindowAux, ConnectionExt, EventMask,
@@ -474,11 +504,31 @@ fn handle_x11_event<C: Connection>(
 
             // Read initial properties for classification.
             let role = classify_window(conn, atoms, e.window);
-            // Use STEAM_GAME atom if present, otherwise fall back to
-            // the X11 window ID as a synthetic AppID so every window is
-            // always identifiable and focusable.
+            // Resolve AppID:
+            // 1. STEAM_GAME atom is authoritative if set.
+            // 2. In steam mode, walk the process tree to find the AppID
+            // 3. In non-steam mode, use the window ID as a synthetic AppID
+            //    so every window is always identifiable and focusable.
             let steam_id = read_u32_prop(conn, e.window, atoms.steam_game);
-            let app_id = if steam_id != 0 { steam_id } else { e.window };
+            let app_id = if steam_id != 0 {
+                steam_id
+            } else if steam_mode {
+                let pid = get_client_pid(conn, e.window);
+                if pid != 0 {
+                    let resolved = get_appid_from_pid(pid);
+                    debug!(
+                        window = e.window,
+                        pid,
+                        resolved_app_id = resolved,
+                        "PID-based AppID resolution"
+                    );
+                    resolved
+                } else {
+                    0
+                }
+            } else {
+                e.window
+            };
 
             // Register in tracker.
             let win = tracker.add_window(e.window);
@@ -487,6 +537,14 @@ fn handle_x11_event<C: Connection>(
             win.height = h;
             win.role = role;
             win.app_id = app_id;
+
+            // Read initial _NET_WM_STATE flags.
+            let states = read_atom_list_prop(conn, e.window, atoms.net_wm_state);
+            win.skip_taskbar = states.contains(&atoms.net_wm_state_skip_taskbar);
+            win.skip_pager = states.contains(&atoms.net_wm_state_skip_pager);
+
+            // Read WM_TRANSIENT_FOR parent.
+            win.transient_for = read_window_prop(conn, e.window, atoms.wm_transient_for);
 
             info!(
                 window = e.window,
@@ -561,8 +619,37 @@ fn handle_x11_event<C: Connection>(
             // an X11 window with its Wayland wl_surface protocol object ID.
             if e.type_ == atoms.wl_surface_id {
                 let wl_id = e.data.as_data32()[0];
-                debug!(window = e.window, wl_id, "WL_SURFACE_ID ClientMessage");
+                trace!(window = e.window, wl_id, "WL_SURFACE_ID ClientMessage");
                 tracker.set_wl_surface_id(e.window, wl_id);
+            } else if e.type_ == atoms.net_wm_state {
+                // EWMH _NET_WM_STATE change request.
+                // data32: [action, first_atom, second_atom, source, 0]
+                // action: 0=Remove, 1=Add, 2=Toggle
+                let d = e.data.as_data32();
+                let action = d[0];
+                let prop_atoms = [d[1], d[2]];
+                if let Some(win) = tracker.get_mut(e.window) {
+                    for &pa in &prop_atoms {
+                        if pa == 0 {
+                            continue;
+                        }
+                        let flag = if pa == atoms.net_wm_state_skip_taskbar {
+                            Some(&mut win.skip_taskbar)
+                        } else if pa == atoms.net_wm_state_skip_pager {
+                            Some(&mut win.skip_pager)
+                        } else {
+                            None
+                        };
+                        if let Some(f) = flag {
+                            match action {
+                                0 => *f = false, // Remove
+                                1 => *f = true,  // Add
+                                2 => *f = !*f,   // Toggle
+                                _ => {}
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -694,8 +781,17 @@ fn handle_property_notify<C: Connection>(
             }
         } else if atom == atoms.wl_surface_id {
             let wl_id = read_u32_prop(conn, window, atoms.wl_surface_id);
-            debug!(window, wl_id, "WL_SURFACE_ID set");
+            trace!(window, wl_id, "WL_SURFACE_ID set");
             tracker.set_wl_surface_id(window, wl_id);
+        } else if atom == atoms.net_wm_state {
+            // Read _NET_WM_STATE list and update skip_taskbar/skip_pager.
+            update_net_wm_state_flags(conn, atoms, tracker, window);
+        } else if atom == atoms.wm_transient_for {
+            // Read WM_TRANSIENT_FOR (window type atom, stored as WINDOW).
+            let parent = read_window_prop(conn, window, atoms.wm_transient_for);
+            if let Some(win) = tracker.get_mut(window) {
+                win.transient_for = parent;
+            }
         }
         return;
     }
@@ -838,4 +934,142 @@ fn bytemuck_or_manual_u32(bytes: &[u8]) -> &[u32] {
     // SAFETY: bytes slice length is a multiple of 4, and X11 properties
     // with format=32 are always properly aligned by the X server.
     unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<u32>(), bytes.len() / 4) }
+}
+
+/// Read an atom-list property (type ATOM, format 32) from an X11 window.
+fn read_atom_list_prop<C: Connection>(conn: &C, window: u32, atom: X11Atom) -> Vec<u32> {
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt};
+    let reply = conn.get_property(false, window, atom, AtomEnum::ATOM, 0, 256);
+    match reply {
+        Ok(cookie) => match cookie.reply() {
+            Ok(prop) if prop.format == 32 && !prop.value.is_empty() => {
+                bytemuck_or_manual_u32(&prop.value).to_vec()
+            }
+            _ => Vec::new(),
+        },
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Read a WINDOW-type property (format 32, single value) from an X11 window.
+fn read_window_prop<C: Connection>(conn: &C, window: u32, atom: X11Atom) -> u32 {
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt};
+    let reply = conn.get_property(false, window, atom, AtomEnum::WINDOW, 0, 1);
+    match reply {
+        Ok(cookie) => match cookie.reply() {
+            Ok(prop) if prop.value_len == 1 && prop.format == 32 => {
+                let vals: &[u32] = bytemuck_or_manual_u32(&prop.value);
+                vals.first().copied().unwrap_or(0)
+            }
+            _ => 0,
+        },
+        Err(_) => 0,
+    }
+}
+
+/// Query the PID of the client that created an X11 window via XRes.
+///
+/// Returns `0` if the PID cannot be determined.
+fn get_client_pid<C: Connection>(conn: &C, window: u32) -> u32 {
+    use x11rb::protocol::res::{ClientIdMask, ClientIdSpec, ConnectionExt as ResExt};
+    let spec = ClientIdSpec {
+        client: window,
+        mask: ClientIdMask::LOCAL_CLIENT_PID,
+    };
+    let Ok(cookie) = conn.res_query_client_ids(&[spec]) else {
+        return 0;
+    };
+    let Ok(reply) = cookie.reply() else {
+        return 0;
+    };
+    for id_value in &reply.ids {
+        if let Some(&pid) = id_value.value.first()
+            && pid > 0
+        {
+            return pid;
+        }
+    }
+    0
+}
+
+/// Read `_NET_WM_STATE` and update skip_taskbar / skip_pager on the tracked window.
+fn update_net_wm_state_flags<C: Connection>(
+    conn: &C,
+    atoms: &super::atoms::Atoms,
+    tracker: &mut super::window_tracker::WindowTracker,
+    window: u32,
+) {
+    let states = read_atom_list_prop(conn, window, atoms.net_wm_state);
+    let skip_taskbar = states.contains(&atoms.net_wm_state_skip_taskbar);
+    let skip_pager = states.contains(&atoms.net_wm_state_skip_pager);
+    if let Some(win) = tracker.get_mut(window) {
+        win.skip_taskbar = skip_taskbar;
+        win.skip_pager = skip_pager;
+    }
+}
+
+/// Resolve an AppID from a process ID by walking the parent chain.
+///
+/// Looks for a `reaper` process with `SteamLaunch AppId=<N>` in its
+/// command line (Steam's convention). Returns the numeric `<N>`.
+///
+/// Returns 0 if no reaper is found in the ancestry.
+fn get_appid_from_pid(pid: u32) -> u32 {
+    let mut next_pid = pid;
+
+    loop {
+        // Read /proc/<pid>/stat to get the process name and parent PID.
+        let stat_path = format!("/proc/{next_pid}/stat");
+        let stat_contents = match std::fs::read_to_string(&stat_path) {
+            Ok(s) => s,
+            Err(_) => break,
+        };
+
+        // Parse process name (between parentheses) and parent PID.
+        let open_paren = match stat_contents.find('(') {
+            Some(i) => i,
+            None => break,
+        };
+        let close_paren = match stat_contents.rfind(')') {
+            Some(i) => i,
+            None => break,
+        };
+        let proc_name = &stat_contents[open_paren + 1..close_paren];
+
+        // Parse parent PID: field after ") <state> <ppid>"
+        let after_paren = &stat_contents[close_paren + 1..];
+        let fields: Vec<&str> = after_paren.split_whitespace().collect();
+        // fields[0] = state, fields[1] = ppid
+        let parent_pid: u32 = fields.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+
+        if proc_name == "reaper" {
+            // Read cmdline for Steam's reaper convention.
+            let cmdline_path = format!("/proc/{next_pid}/cmdline");
+            if let Ok(cmdline_bytes) = std::fs::read(&cmdline_path) {
+                let mut steam_launch = false;
+                for arg in cmdline_bytes.split(|b| *b == 0) {
+                    let arg_str = std::str::from_utf8(arg).unwrap_or("");
+                    if arg_str == "SteamLaunch" {
+                        steam_launch = true;
+                    } else if let Some(rest) = arg_str.strip_prefix("AppId=")
+                        && steam_launch
+                        && let Ok(app_id) = rest.parse::<u32>()
+                        && app_id != 0
+                    {
+                        return app_id;
+                    }
+                    if arg_str == "--" {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if parent_pid == 0 {
+            break;
+        }
+        next_pid = parent_pid;
+    }
+
+    0
 }

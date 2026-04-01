@@ -4,7 +4,7 @@ use parking_lot::Mutex;
 use std::os::unix::io::AsFd;
 use std::sync::atomic::Ordering;
 
-use tracing::{info, trace};
+use tracing::{debug, trace};
 use wayland_server::protocol::{
     wl_callback::{self, WlCallback},
     wl_compositor::{self, WlCompositor},
@@ -41,7 +41,7 @@ impl Dispatch<WlCompositor, ()> for WaylandState {
     ) {
         match request {
             wl_compositor::Request::CreateSurface { id } => {
-                info!("wl_compositor: create_surface");
+                debug!("wl_compositor: create_surface");
                 let server_index = state
                     .xwayland_client_map
                     .get(&_client.id())
@@ -120,26 +120,37 @@ impl Dispatch<WlSurface, SurfaceData> for WaylandState {
                     return;
                 }
 
-                // In steam mode, only the focused window's surface may
-                // present. Reject commits from other surfaces and withhold
-                // frame callbacks so the client stalls at vkAcquireNextImage
-                // — zero GPU waste. When focus changes, the main loop fires
-                // pending callbacks to wake the newly-focused client.
-                //
-                // Compare both server_index and protocol_id because
-                // protocol_id is per-Wayland-client — two XWayland servers
-                // can allocate the same numeric ID for different surfaces.
+                // Only the focused window's surface may present. Reject
+                // commits from other surfaces. Release their attached
+                // buffer immediately so the client can recycle it —
+                // otherwise the client exhausts all swapchain images
+                // and blocks permanently on vkAcquireNextImage.
                 {
                     let focused_id = state.focused_wl_surface_id.load(Ordering::Relaxed);
                     let focused_srv = state.focused_server_index.load(Ordering::Relaxed);
                     let surface_id = _surface.id().protocol_id();
                     let surface_srv = data.server_index;
                     if focused_id == 0 || surface_id != focused_id || surface_srv != focused_srv {
+                        trace!(
+                            surface_id,
+                            surface_srv, focused_id, focused_srv, "commit gate: rejected"
+                        );
+                        // Release the buffer so the client doesn't starve.
+                        let attached = data.attached_buffer.lock();
+                        if let Some(ref buffer) = *attached {
+                            buffer.release();
+                        }
                         return;
                     }
                 }
 
                 state.frame_seq += 1;
+                trace!(
+                    frame_seq = state.frame_seq,
+                    surface_id = _surface.id().protocol_id(),
+                    server_index = data.server_index,
+                    "commit gate: accepted"
+                );
 
                 // Read pixels from the attached buffer and send to presenter.
                 let attached = data.attached_buffer.lock();
@@ -183,6 +194,7 @@ impl Dispatch<WlSurface, SurfaceData> for WaylandState {
                                 // target FPS, the previous staged buffer is
                                 // silently dropped (its dup'd fds are closed).
                                 state.staged_buffer = Some(committed);
+                                state.staged_buffer_server_index = data.server_index;
                                 state.defer_frame_callbacks();
                                 // Hold the wl_buffer — do NOT release it.
                                 // By withholding release, the client cannot
@@ -211,16 +223,17 @@ impl Dispatch<WlSurface, SurfaceData> for WaylandState {
                                         stride: shm.stride as u32,
                                     };
                                     state.staged_buffer = Some(committed);
+                                    state.staged_buffer_server_index = data.server_index;
                                     state.defer_frame_callbacks();
                                     state.held_buffers.push(buffer.clone());
                                 }
                             }
                         }
                     } else {
-                        info!("commit: buffer has no BufferData");
+                        debug!("commit: buffer has no BufferData");
                     }
                 } else {
-                    info!("commit: no attached buffer");
+                    trace!("commit: no attached buffer");
                 }
             }
             wl_surface::Request::SetBufferScale { .. }

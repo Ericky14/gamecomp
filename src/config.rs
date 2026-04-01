@@ -44,6 +44,11 @@ pub struct Config {
     pub fps_limit: u32,
     /// Cursor hide delay in milliseconds. 0 = never hide.
     pub cursor_hide_delay_ms: u64,
+    /// Steam mode: use PID-based AppID resolution (gamescope `-e`).
+    /// When enabled, windows get their AppID by walking the parent
+    /// process chain for a Steam reaper process (`SteamLaunch AppId=N`).
+    /// Without this, AppID falls back to the X11 window ID.
+    pub steam_mode: bool,
     /// Child command to launch inside the compositor.
     pub child_command: Option<String>,
     /// Stats pipe path. None = disabled.
@@ -93,6 +98,7 @@ impl Default for Config {
             game_resolution: None,
             fps_limit: 0,
             cursor_hide_delay_ms: 3000,
+            steam_mode: true,
             child_command: None,
             stats_pipe: None,
             log_level: "info".to_string(),
@@ -154,6 +160,8 @@ struct ConfigFile {
     stats_pipe: Option<String>,
     #[serde(default)]
     log_level: Option<String>,
+    #[serde(default)]
+    steam_mode: Option<bool>,
 }
 
 impl Config {
@@ -283,6 +291,8 @@ impl Config {
                         i += 1;
                     }
                 }
+                "-e" | "--steam" => config.steam_mode = true,
+                "--no-steam" => config.steam_mode = false,
                 "--" => {
                     // Everything after `--` is the child command.
                     let child_args: Vec<_> = args[i + 1..].to_vec();
@@ -365,6 +375,9 @@ impl Config {
         }
         if let Some(ref ll) = file.log_level {
             self.log_level = ll.clone();
+        }
+        if let Some(sm) = file.steam_mode {
+            self.steam_mode = sm;
         }
     }
 }

@@ -19,7 +19,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use tracing::debug;
+use tracing::{debug, trace};
 
 use crate::wayland::xwayland::XwmEvent;
 
@@ -52,6 +52,8 @@ pub struct FocusResult {
 pub struct FocusArbiter {
     /// Previous per-server app_id snapshots for change detection.
     prev_server_app_ids: Vec<u32>,
+    /// Last winning app ID.
+    prev_winner_app: u32,
     /// Last winning surface protocol ID.
     prev_surface_id: u32,
     /// Last winning server index.
@@ -65,6 +67,7 @@ impl FocusArbiter {
     pub fn new(server_count: usize) -> Self {
         Self {
             prev_server_app_ids: vec![0; server_count],
+            prev_winner_app: 0,
             prev_surface_id: 0,
             prev_server_index: u32::MAX,
             baselayer_app_ids: Vec::new(),
@@ -135,15 +138,41 @@ impl FocusArbiter {
                 winner_server = srv.index;
             } else {
                 // Phase 2: keep current winner if still valid.
+                //
+                // A server remains "valid" if either:
+                // - It still has a non-zero app_id, OR
+                // - Its surface is still alive (surface_id != 0) AND the
+                //   baselayer hasn't explicitly switched to another client.
+                //
+                // The second condition prevents focus flicker when
+                // STEAM_GAME transiently clears to 0 during dependency
+                // installation (proton, dxdiag, wine patches). The game
+                // window is still mapped but the app_id disappears briefly.
+                // Without this, the arbiter would bounce focus to Grid and
+                // back, causing a visible flicker.
                 let cur_srv = self.prev_server_index;
                 if cur_srv != u32::MAX
                     && let Some(srv) = servers.iter().find(|s| s.index == cur_srv)
                 {
                     let app = srv.focused_app_id.load(Ordering::Relaxed);
+                    let surf = srv.focused_wl_surface_id.load(Ordering::Relaxed);
                     if app != 0 {
                         winner_app = app;
-                        winner_surface = srv.focused_wl_surface_id.load(Ordering::Relaxed);
+                        winner_surface = surf;
                         winner_server = cur_srv;
+                    } else if surf != 0 && !self.baselayer_app_ids.is_empty() {
+                        // Surface still alive but app_id cleared. Retain
+                        // focus to avoid flicker — use the previous app_id
+                        // for the focus feedback atoms.
+                        winner_app = self.prev_winner_app;
+                        winner_surface = surf;
+                        winner_server = cur_srv;
+                        debug!(
+                            winner_app,
+                            surf,
+                            cur_srv,
+                            "focus arbiter: retaining winner despite app_id=0 (surface still alive)"
+                        );
                     }
                 }
                 // Phase 3: fallback — any server with non-zero app_id.
@@ -164,8 +193,45 @@ impl FocusArbiter {
         let changed =
             winner_surface != self.prev_surface_id || winner_server != self.prev_server_index;
 
+        if changed {
+            let phase = if baselayer_matched {
+                "baselayer"
+            } else if stealer.is_some() {
+                "stealer"
+            } else if winner_app != 0 && self.prev_server_index != u32::MAX {
+                "retention"
+            } else if winner_app != 0 {
+                "fallback"
+            } else {
+                "none"
+            };
+            debug!(
+                phase,
+                winner_app,
+                winner_surface,
+                winner_server,
+                prev_surface = self.prev_surface_id,
+                prev_server = self.prev_server_index,
+                ?self.baselayer_app_ids,
+                "focus arbiter: winner changed"
+            );
+            // Log all server states for diagnosis.
+            for (i, srv) in servers.iter().enumerate() {
+                let app = srv.focused_app_id.load(Ordering::Relaxed);
+                let surf = srv.focused_wl_surface_id.load(Ordering::Relaxed);
+                trace!(
+                    slot = i,
+                    server_index = srv.index,
+                    app,
+                    surf,
+                    "focus arbiter: server state"
+                );
+            }
+        }
+
         self.prev_surface_id = winner_surface;
         self.prev_server_index = winner_server;
+        self.prev_winner_app = winner_app;
 
         FocusResult {
             app_id: winner_app,

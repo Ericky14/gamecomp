@@ -40,6 +40,12 @@ pub struct Atoms {
     pub net_wm_state: u32,
     /// `_NET_WM_STATE_FULLSCREEN` — fullscreen state flag.
     pub net_wm_state_fullscreen: u32,
+    /// `_NET_WM_STATE_SKIP_TASKBAR` — window should be skipped in taskbar.
+    pub net_wm_state_skip_taskbar: u32,
+    /// `_NET_WM_STATE_SKIP_PAGER` — window should be skipped in pager.
+    pub net_wm_state_skip_pager: u32,
+    /// `WM_TRANSIENT_FOR` — parent window for transient windows.
+    pub wm_transient_for: u32,
     /// `_NET_WM_WINDOW_TYPE` — window type.
     pub net_wm_window_type: u32,
     /// `_NET_WM_WINDOW_TYPE_NORMAL` — normal window type.
@@ -76,6 +82,8 @@ pub struct Atoms {
     pub focus_window: u32,
     /// `GAMESCOPE_FOCUS_DISPLAY` — which display receives focus.
     pub focus_display: u32,
+    /// `GAMESCOPE_KEYBOARD_FOCUS_DISPLAY` — set on the primary XWayland root
+    pub keyboard_focus_display: u32,
 
     // --- Resolution / display atoms (set on root) ---
     /// `GAMESCOPE_XWAYLAND_MODE_CONTROL` — `[server_idx, width, height, flags]`.
@@ -168,6 +176,9 @@ impl Atoms {
             "_NET_WM_PID",
             "_NET_WM_STATE",
             "_NET_WM_STATE_FULLSCREEN",
+            "_NET_WM_STATE_SKIP_TASKBAR",
+            "_NET_WM_STATE_SKIP_PAGER",
+            "WM_TRANSIENT_FOR",
             "_NET_WM_WINDOW_TYPE",
             "_NET_WM_WINDOW_TYPE_NORMAL",
             "_NET_WM_WINDOW_TYPE_DIALOG",
@@ -186,6 +197,7 @@ impl Atoms {
             "GAMESCOPECTRL_BASELAYER_APPID",
             "GAMESCOPECTRL_BASELAYER_WINDOW",
             "GAMESCOPE_FOCUS_DISPLAY",
+            "GAMESCOPE_KEYBOARD_FOCUS_DISPLAY",
             // Resolution / display
             "GAMESCOPE_XWAYLAND_MODE_CONTROL",
             "GAMESCOPE_FORCE_WINDOWS_FULLSCREEN",
@@ -248,61 +260,65 @@ impl Atoms {
             net_wm_pid: atoms[2],
             net_wm_state: atoms[3],
             net_wm_state_fullscreen: atoms[4],
-            net_wm_window_type: atoms[5],
-            net_wm_window_type_normal: atoms[6],
-            net_wm_window_type_dialog: atoms[7],
-            net_wm_window_type_popup: atoms[8],
-            net_wm_opacity: atoms[9],
-            wm_delete_window: atoms[10],
-            wm_protocols: atoms[11],
-            utf8_string: atoms[12],
+            net_wm_state_skip_taskbar: atoms[5],
+            net_wm_state_skip_pager: atoms[6],
+            wm_transient_for: atoms[7],
+            net_wm_window_type: atoms[8],
+            net_wm_window_type_normal: atoms[9],
+            net_wm_window_type_dialog: atoms[10],
+            net_wm_window_type_popup: atoms[11],
+            net_wm_opacity: atoms[12],
+            wm_delete_window: atoms[13],
+            wm_protocols: atoms[14],
+            utf8_string: atoms[15],
             // Window classification
-            steam_game: atoms[13],
-            steam_overlay: atoms[14],
-            steam_bigpicture: atoms[15],
-            steam_input_focus: atoms[16],
-            external_overlay: atoms[17],
+            steam_game: atoms[16],
+            steam_overlay: atoms[17],
+            steam_bigpicture: atoms[18],
+            steam_input_focus: atoms[19],
+            external_overlay: atoms[20],
             // Focus control
-            focus_appid: atoms[18],
-            focus_window: atoms[19],
-            focus_display: atoms[20],
+            focus_appid: atoms[21],
+            focus_window: atoms[22],
+            focus_display: atoms[23],
+            keyboard_focus_display: atoms[24],
             // Resolution / display
-            xwayland_mode_control: atoms[21],
-            force_windows_fullscreen: atoms[22],
+            xwayland_mode_control: atoms[25],
+            force_windows_fullscreen: atoms[26],
             // FPS / performance
-            fps_limit: atoms[23],
-            vrr_enabled: atoms[24],
-            low_latency: atoms[25],
-            allow_tearing: atoms[26],
+            fps_limit: atoms[27],
+            vrr_enabled: atoms[28],
+            low_latency: atoms[29],
+            allow_tearing: atoms[30],
             // Scaling / filter
-            scaling_filter: atoms[27],
-            fsr_sharpness: atoms[28],
-            sharpness: atoms[29],
+            scaling_filter: atoms[31],
+            fsr_sharpness: atoms[32],
+            sharpness: atoms[33],
             // HDR
-            hdr_enabled: atoms[30],
-            sdr_on_hdr_brightness: atoms[31],
+            hdr_enabled: atoms[34],
+            sdr_on_hdr_brightness: atoms[35],
             // Debug
-            composite_force: atoms[32],
-            composite_debug: atoms[33],
+            composite_force: atoms[36],
+            composite_debug: atoms[37],
             // Multi-display
-            xwayland_server_id: atoms[34],
-            create_xwayland_server: atoms[35],
-            create_xwayland_server_feedback: atoms[36],
-            destroy_xwayland_server: atoms[37],
+            xwayland_server_id: atoms[38],
+            create_xwayland_server: atoms[39],
+            create_xwayland_server_feedback: atoms[40],
+            destroy_xwayland_server: atoms[41],
             // Feedback
-            focused_app: atoms[38],
-            focused_window: atoms[39],
-            focusable_apps: atoms[40],
-            focusable_windows: atoms[41],
-            vrr_capable: atoms[42],
-            vrr_in_use: atoms[43],
-            hdr_supported: atoms[44],
-            fsr_active: atoms[45],
-            display_refresh_rate: atoms[46],
-            cursor_visible: atoms[47],
-            pid: atoms[48],
+            focused_app: atoms[42],
+            focused_window: atoms[43],
+            focusable_apps: atoms[44],
+            focusable_windows: atoms[45],
+            vrr_capable: atoms[46],
+            vrr_in_use: atoms[47],
+            hdr_supported: atoms[48],
+            fsr_active: atoms[49],
+            display_refresh_rate: atoms[50],
+            cursor_visible: atoms[51],
+            pid: atoms[52],
             // Screenshot
-            request_screenshot: atoms[49],
+            request_screenshot: atoms[53],
         })
     }
 }

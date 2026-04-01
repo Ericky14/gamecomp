@@ -13,7 +13,7 @@ High-performance single-app fullscreen Wayland compositor for gaming and robotic
 - **Wayland backend** — Run inside another Wayland compositor for development/testing
 - **Multi-XWayland** — Multiple XWayland servers with independent focus tracking and lifecycle management
 - **Focus gating** — 4-phase cross-server focus arbitration (baselayer → stealer → retention → fallback). Only the focused server's clients receive frame callbacks — zero GPU waste on unfocused servers.
-- **Baselayer control** — `GAMECOMP_BASELAYER_APPID` X11 atom for cross-server focus pinning
+- **Baselayer control** — `GAMESCOPECTRL_BASELAYER_APPID` X11 atom for cross-server focus pinning
 - **Frame pacing** — Adaptive VBlank scheduling with rolling peak draw-time tracking, compositing floor, and FPS limiting
 - **Headless mode** — Offscreen rendering for CI and robotics pipelines
 
@@ -45,18 +45,24 @@ High-level feature goals for Gamecomp. No hard dates — contributions welcome.
 - [x] XKB keymap and modifier forwarding from host to clients (nested mode)
 - [x] Multi-XWayland server lifecycle — spawn, monitor, respawn with per-server XWM threads
 - [x] Focus gating — 4-phase cross-server focus arbitration with per-surface commit gating
-- [x] Baselayer focus control — `GAMECOMP_BASELAYER_APPID` atom for cross-server focus pinning
+- [x] Baselayer focus control — `GAMESCOPECTRL_BASELAYER_APPID` atom for cross-server focus pinning
 - [x] Adaptive frame pacing — rolling peak draw-time, compositing floor, VRR mode, FPS limiting
-- [x] XWayland window management — XWM with fullscreen atoms, reparenting, per-server window tracking
-- [x] Runtime resolution control — `GAMECOMP_XWAYLAND_MODE_CONTROL` atom for per-server resolution switching
+- [x] XWayland window management — XWM with property monitoring, window classification, per-server window tracking
+- [x] Runtime resolution control — `GAMESCOPE_XWAYLAND_MODE_CONTROL` atom for per-server resolution switching
+- [x] PID-based AppID resolution — `steam_mode` walks parent process chain for Steam reaper (`SteamLaunch AppId=N`)
+- [x] Commit-based presentation gating — old content stays visible until new focus target commits a frame
+- [x] Gamescope atom compatibility — full `GAMESCOPE_*`/`GAMESCOPECTRL_*` atom set for ecosystem tool compatibility
 
 ## In Progress
 
 - [ ] VRR (variable refresh rate) — frame pacer support exists, needs per-connector toggle
 - [ ] Multi-plane assignment — overlay/cursor plane offload to reduce GPU work
+- [ ] Multi-display — span or mirror across multiple connected outputs (multi-XWayland spawning done, display routing in progress)
 
 ## Planned
 
+- [ ] **Overlay composition** — Steam Overlay and external overlay rendering (window classification exists, composition layer not wired up)
+- [ ] **Fullscreen handling** — `_NET_WM_STATE_FULLSCREEN` atom support (atom interned, handler not implemented)
 - [ ] **HDR** — HDR10 metadata passthrough, PQ tone mapping (feature-gated: `hdr`)
 - [ ] **FSR upscaling** — AMD FidelityFX Super Resolution via compute shader (`fsr`)
 - [ ] **NIS upscaling** — NVIDIA Image Scaling via compute shader (`nis`)
@@ -66,7 +72,6 @@ High-level feature goals for Gamecomp. No hard dates — contributions welcome.
 - [ ] **Gamepad input** — evdev gamepad passthrough to client
 - [ ] **Color management** — ICC/LUT loading, color-blind filters
 - [ ] **Touch input** — touchscreen support for handheld devices
-- [ ] **Multi-display** — span or mirror across multiple connected outputs (multi-XWayland spawning done, display routing in progress)
 
 ## Building
 
@@ -96,7 +101,7 @@ gamecomp --backend headless -- my-app
 gamecomp --xwayland-count 2 -- steam
 
 # Baselayer pinning (pin focus to a specific server's app)
-# Set GAMECOMP_BASELAYER_APPID on a server's root window to pin focus
+# Set GAMESCOPECTRL_BASELAYER_APPID on a server's root window to pin focus
 
 # Multiple XWayland servers (server 0 = platform, 1+ = game)
 gamecomp --xwayland-count 2 -- my-game

@@ -70,6 +70,14 @@ pub struct TrackedWindow {
     /// Set by XWayland when mapping an X11 window to a wl_surface.
     /// 0 = not yet associated.
     pub wl_surface_id: u32,
+    /// Whether `_NET_WM_STATE_SKIP_TASKBAR` is set.
+    pub skip_taskbar: bool,
+    /// Whether `_NET_WM_STATE_SKIP_PAGER` is set.
+    pub skip_pager: bool,
+    /// Whether this window is a system tray icon.
+    pub is_systray_icon: bool,
+    /// Parent window (from `WM_TRANSIENT_FOR`). 0 = not transient.
+    pub transient_for: u32,
 }
 
 impl TrackedWindow {
@@ -92,16 +100,25 @@ impl TrackedWindow {
             wants_fullscreen: false,
             input_focus_mode: 0,
             wl_surface_id: 0,
+            skip_taskbar: false,
+            skip_pager: false,
+            is_systray_icon: false,
+            transient_for: 0,
         }
     }
 
     /// Whether this window is focusable (visible, non-trivial size, app/platform role).
+    ///
+    /// Excludes 1x1 windows, override-redirect,
+    /// system tray icons, and skip-taskbar+skip-pager non-fullscreen windows.
     #[inline(always)]
     pub fn is_focusable(&self) -> bool {
         self.mapped
             && self.width > 1
             && self.height > 1
             && !self.override_redirect
+            && !self.is_systray_icon
+            && !(self.skip_taskbar && self.skip_pager && !self.wants_fullscreen)
             && matches!(self.role, WindowRole::App | WindowRole::PlatformClient)
     }
 }
@@ -356,8 +373,12 @@ impl WindowTracker {
             .max_by_key(|w| w.map_sequence)
             .map(|w| w.id);
 
-        // Return whether focus changed.
+        // Return whether focus changed — including app_id and surface_id
+        // updates that happen asynchronously (STEAM_GAME, WL_SURFACE_ID
+        // arrive after MapRequest).
         self.focus.app != old_focus.app
+            || self.focus.focused_app_id != old_focus.focused_app_id
+            || self.focus.focused_wl_surface_id != old_focus.focused_wl_surface_id
             || self.focus.overlay != old_focus.overlay
             || self.focus.external_overlay != old_focus.external_overlay
             || self.focus.popup != old_focus.popup

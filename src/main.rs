@@ -36,12 +36,12 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread;
 
 use anyhow::Context;
-use tracing::{error, info, warn};
+use tracing::{error, info, trace, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::compositor::scene::FrameInfo;
 use crate::config::Config;
-use crate::focus::FocusArbiter;
+use crate::focus::{FocusArbiter, ServerFocusState};
 use crate::frame_pacer::{FpsLimiter, FramePacer};
 use crate::input::InputHandler;
 use crate::input::keyboard::{KeyAction, KeyboardMonitor};
@@ -340,6 +340,7 @@ fn run(config: Config) -> anyhow::Result<()> {
         let srv_focused_surface = Arc::new(AtomicU32::new(0));
         let xwm_focused_app = Arc::clone(&srv_focused_app);
         let xwm_focused_surface = Arc::clone(&srv_focused_surface);
+        let xwm_steam_mode = config.steam_mode;
         let thread = thread::Builder::new()
             .name(format!("gamecomp-xwm-{server_idx}"))
             .spawn(move || {
@@ -353,6 +354,7 @@ fn run(config: Config) -> anyhow::Result<()> {
                         &xwm_focused_surface,
                         srv_w,
                         srv_h,
+                        xwm_steam_mode,
                     )
                 });
                 if let Err(e) = result {
@@ -397,7 +399,22 @@ fn run(config: Config) -> anyhow::Result<()> {
 
     // Cross-server focus arbiter — picks the global winning server
     // and gates commits so only the focused surface gets frame callbacks.
-    let mut focus_arbiter = FocusArbiter::new(xwayland_count as usize);
+    // +1 for the native Wayland virtual server slot.
+    let mut focus_arbiter = FocusArbiter::new(xwayland_count as usize + 1);
+
+    // Native Wayland focus state — participates in arbitration alongside
+    // XWayland servers so native clients (e.g., Grid) can win focus.
+    let native_focus = focus::ServerFocusState {
+        index: u32::MAX,
+        focused_app_id: Arc::clone(&wayland_state.native_focused_app_id),
+        focused_wl_surface_id: Arc::clone(&wayland_state.native_focused_surface_id),
+    };
+
+    // Presentation focus — tracks which server's content is actually being
+    // shown. Separate from the logical focus (commit gate atomics) so that
+    // the old content stays visible until the new target commits a frame.
+    let mut presentation_server_index: u32 = u32::MAX;
+    let mut presentation_app_id: u32 = 0;
 
     while RUNNING.load(Ordering::Relaxed) {
         dispatch_session(
@@ -454,15 +471,47 @@ fn run(config: Config) -> anyhow::Result<()> {
         // Drain XWM events and run the 4-phase focus arbiter. The arbiter
         // picks the global winning server and signals focus changes.
         focus_arbiter.drain_events(&xwm_event_rx);
-        let focus_states: Vec<_> = xwayland_servers.iter().map(|s| s.focus_state()).collect();
+        let mut focus_states: Vec<_> = xwayland_servers.iter().map(|s| s.focus_state()).collect();
+        focus_states.push(ServerFocusState {
+            index: native_focus.index,
+            focused_app_id: Arc::clone(&native_focus.focused_app_id),
+            focused_wl_surface_id: Arc::clone(&native_focus.focused_wl_surface_id),
+        });
         let result = focus_arbiter.update(&focus_states);
 
+        // Update commit gate atomics immediately so the new target's
+        // commits are accepted. The old target's commits get rejected
+        // (and their buffers released).
         focused_app_id.store(result.app_id, Ordering::Relaxed);
         focused_wl_surface_id.store(result.surface_id, Ordering::Relaxed);
         focused_server_index.store(result.server_index, Ordering::Relaxed);
 
-        if result.changed && result.surface_id != 0 {
-            wayland_state.fire_frame_callbacks();
+        if result.changed {
+            info!(
+                app_id = result.app_id,
+                surface_id = result.surface_id,
+                server_index = result.server_index,
+                "logical focus changed"
+            );
+
+            if result.surface_id != 0 {
+                let pending = wayland_state.pending_frame_callbacks.len();
+                let deferred = wayland_state.deferred_frame_callbacks.len();
+                let held = wayland_state.held_buffers.len();
+                trace!(pending, deferred, held, "focus changed: waking new client");
+                wayland_state.fire_frame_callbacks();
+                wayland_state.fire_deferred_callbacks();
+                // Release ALL held wl_buffers from the previous focus
+                // owner so we don't leak FDs.
+                wayland_state.release_all_buffers();
+                // Do NOT clear staged_buffer — the old client's last
+                // frame stays visible until the new client commits.
+
+                // Re-configure toplevels so the newly-focused client
+                // receives a configure event and commits, restarting
+                // its frame callback cycle.
+                wayland_state.reconfigure_toplevels();
+            }
         }
 
         // Forward staged buffer if the FPS limiter allows it.
@@ -470,6 +519,48 @@ fn run(config: Config) -> anyhow::Result<()> {
         // means no window is mapped or focusable yet).
         let has_focus = focused_app_id.load(Ordering::Relaxed) != 0;
         forward_staged_frame(&mut wayland_state, &mut fps_limiter, has_focus);
+
+        // ── Commit-based presentation switch ───────────────────────
+        // The presentation focus only updates when the new logical
+        // focus target has actually committed a frame. This prevents
+        // flicker: the old content stays on screen until the new
+        // window renders.
+        let logical_server = result.server_index;
+        if presentation_server_index != logical_server
+            && wayland_state.staged_buffer.is_none()
+            && wayland_state.staged_buffer_server_index == logical_server
+        {
+            presentation_server_index = logical_server;
+            presentation_app_id = result.app_id;
+            info!(
+                presentation_app_id,
+                presentation_server_index, "presentation focus switched"
+            );
+
+            // NOW publish focus feedback — the new client is visible.
+            if let Some(primary) = xwayland_servers.first() {
+                let _ = primary
+                    .cmd_tx
+                    .send(wayland::xwayland::XwmCommand::SetGlobalFocus {
+                        app_id: presentation_app_id,
+                    });
+            }
+        }
+
+        // Also handle first-time presentation (boot) and focus-to-no-focus.
+        if presentation_server_index == logical_server
+            && presentation_app_id != result.app_id
+            && result.app_id != 0
+        {
+            presentation_app_id = result.app_id;
+            if let Some(primary) = xwayland_servers.first() {
+                let _ = primary
+                    .cmd_tx
+                    .send(wayland::xwayland::XwmCommand::SetGlobalFocus {
+                        app_id: presentation_app_id,
+                    });
+            }
+        }
 
         // Dispatch Wayland requests only when the staging slot is empty
         // (backpressure: don't accept new commits while one is pending).
@@ -539,8 +630,6 @@ fn launch_child_command(
         .env("DISPLAY", &xwayland_servers[0].display);
 
     // Set STEAM_GAME_DISPLAY_N env vars for game servers (1+).
-    // This matches gamescope's convention so Steam can direct games
-    // to specific XWayland servers.
     if xwayland_count > 1 {
         for server in xwayland_servers.iter().skip(1) {
             let env_name = format!("STEAM_GAME_DISPLAY_{}", server.index - 1);
