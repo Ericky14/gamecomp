@@ -98,7 +98,7 @@ impl Default for Config {
             game_resolution: None,
             fps_limit: 0,
             cursor_hide_delay_ms: 3000,
-            steam_mode: true,
+            steam_mode: false,
             child_command: None,
             stats_pipe: None,
             log_level: "info".to_string(),
