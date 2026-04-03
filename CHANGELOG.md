@@ -1,3 +1,10 @@
+## [1.1.2](https://github.com/Ericky14/gamecomp/compare/v1.1.1...v1.1.2) (2026-04-03)
+
+
+### Bug Fixes
+
+* default steam_mode to false ([3749ebe](https://github.com/Ericky14/gamecomp/commit/3749ebe37e0713f416d0a89e501ebcd303e774df))
+
 ## [1.1.1](https://github.com/Ericky14/gamecomp/compare/v1.1.0...v1.1.1) (2026-04-01)
 
 
