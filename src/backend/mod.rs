@@ -4,12 +4,14 @@
 //! Each backend owns its display resources exclusively — the render thread
 //! is the sole consumer. Communication with the main thread happens via channels.
 //!
-//! Three backends are provided:
+//! Four backends are provided:
 //! - [`DrmBackend`](drm::DrmBackend) — direct KMS/DRM output for production use.
+//! - [`DrmLeaseBackend`](drm_lease::DrmLeaseBackend) — DRM output via a leased fd from a parent compositor.
 //! - [`HeadlessBackend`](headless::HeadlessBackend) — offscreen rendering for CI and robotics.
 //! - [`WaylandBackend`](wayland::WaylandBackend) — runs inside another Wayland compositor.
 
 pub mod drm;
+pub mod drm_lease;
 pub mod gpu;
 pub mod gpu_discovery;
 pub mod headless;

@@ -55,18 +55,47 @@ use crate::xwayland_mgr::XWaylandInstance;
 /// Ordering: Relaxed is sufficient — all threads poll this periodically.
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
+/// Fade-out exit flag. Set by the main thread when Super+G is detected.
+/// The render thread reads this to start a fade-to-black before exiting.
+static EXIT_FADE_OUT: AtomicBool = AtomicBool::new(false);
+
+/// Display ready flag. Set by the render thread after the initial modeset
+/// completes. The main thread waits for this before launching the shell
+/// process so we don't miss early frames.
+static DISPLAY_READY: AtomicBool = AtomicBool::new(false);
+
 fn main() {
     // Parse config first (before logging, since it sets the log level).
     let config = Config::from_args(std::env::args());
 
     // Initialize tracing.
+    // Write to both stderr and a log file for debugging.
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.log_level));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(true)
-        .compact()
-        .init();
+
+    let log_file = std::fs::File::create("/tmp/gamecomp.log").ok();
+    if let Some(file) = log_file {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+
+        let stderr_layer = tracing_subscriber::fmt::layer().with_target(true).compact();
+        let file_layer = tracing_subscriber::fmt::layer()
+            .with_target(true)
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file));
+
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(stderr_layer)
+            .with(file_layer)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(true)
+            .compact()
+            .init();
+    }
 
     info!(version = env!("CARGO_PKG_VERSION"), "gamecomp starting");
     info!(?config, "configuration");
@@ -149,6 +178,36 @@ fn run(config: Config) -> anyhow::Result<()> {
     let host_dmabuf_formats: Arc<parking_lot::Mutex<std::collections::HashMap<u32, Vec<u64>>>> =
         Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
     wayland_state.host_dmabuf_formats = host_dmabuf_formats.clone();
+
+    // In DRM/DRM-lease mode there is no host compositor to query formats from.
+    // Query the GPU directly via Vulkan for supported DMA-BUF format/modifier
+    // pairs so that EGL clients (Flutter/GTK) can allocate renderable buffers.
+    // Without tiled modifiers, NVIDIA EGL allocates LINEAR DMA-BUFs but cannot
+    // render into them — producing all-black frames.
+    if matches!(
+        config.backend,
+        crate::config::BackendKind::Drm | crate::config::BackendKind::DrmLease
+    ) {
+        match backend::gpu::vulkan_blitter::VulkanBlitter::new_for_import() {
+            Ok(blitter) => match blitter.query_gpu_dmabuf_formats() {
+                Ok(formats) => {
+                    let total: usize = formats.values().map(|v| v.len()).sum();
+                    info!(
+                        num_formats = formats.len(),
+                        total_pairs = total,
+                        "populated GPU DMA-BUF formats for DRM mode"
+                    );
+                    *host_dmabuf_formats.lock() = formats;
+                }
+                Err(e) => {
+                    warn!(?e, "failed to query GPU DMA-BUF formats, using fallback");
+                }
+            },
+            Err(e) => {
+                warn!(?e, "failed to create Vulkan blitter for format query");
+            }
+        }
+    }
 
     // Create frame channel: main thread → wayland backend (committed buffers).
     let (frame_tx, frame_rx) = std::sync::mpsc::channel::<wayland::protocols::CommittedBuffer>();
@@ -386,6 +445,47 @@ fn run(config: Config) -> anyhow::Result<()> {
         });
     }
 
+    // --- Launch shell process (Grid) ---
+    // Launch immediately after XWayland is ready so Grid can boot in
+    // parallel with the Vulkan blitter / DRM modeset initialisation.
+    // Grid needs ~400ms to start rendering; the modeset takes ~150ms,
+    // so this overlap hides most of the startup latency.
+    let mut shell_process: Option<std::process::Child> = None;
+    if let Some(ref shell_path) = config.shell {
+        info!(path = %shell_path.display(), "launching shell process");
+        let shell_log = std::fs::File::create("/tmp/grid-shell.log")
+            .ok()
+            .map(std::process::Stdio::from);
+        let shell_err = std::fs::File::create("/tmp/grid-shell.err")
+            .ok()
+            .map(std::process::Stdio::from);
+        let mut cmd = std::process::Command::new(shell_path);
+        cmd.env("GDK_BACKEND", "x11")
+            .env("DISPLAY", &xwayland_servers[0].display)
+            .env_remove("WAYLAND_DISPLAY")
+            .env("WAYLAND_DEBUG", "1")
+            .env("EGL_LOG_LEVEL", "debug")
+            .env("MESA_DEBUG", "1")
+            .env("LIBGL_DEBUG", "verbose");
+        if let Some(stdout) = shell_log {
+            cmd.stdout(stdout);
+        }
+        if let Some(stderr) = shell_err {
+            cmd.stderr(stderr);
+        }
+        match cmd.spawn() {
+            Ok(child) => {
+                shell_process = Some(child);
+                info!(
+                    "shell process launched (stdout=/tmp/grid-shell.log stderr=/tmp/grid-shell.err)"
+                );
+            }
+            Err(e) => {
+                warn!(path = %shell_path.display(), ?e, "failed to launch shell process");
+            }
+        }
+    }
+
     // --- Launch child command ---
     let mut child_process = launch_child_command(&config, &xwayland_servers, xwayland_count)?;
 
@@ -581,6 +681,13 @@ fn run(config: Config) -> anyhow::Result<()> {
 
     info!("main loop exited, cleaning up");
 
+    // Kill the shell process (Grid) if running.
+    if let Some(ref mut shell) = shell_process {
+        info!("killing shell process");
+        let _ = shell.kill();
+        let _ = shell.wait();
+    }
+
     // Kill the child application (e.g., vkcube). Without this, the child
     // inherits our stdio and keeps the terminal session alive after exit.
     if let Some(ref mut child) = child_process {
@@ -688,6 +795,9 @@ fn poll_keyboard(
                 time_ms,
             } = action
             {
+                if check_super_g_hotkey(key, pressed) {
+                    continue;
+                }
                 wayland_state.send_key(key, pressed, time_ms);
             }
         }
@@ -723,6 +833,32 @@ fn poll_pointer(
     }
 }
 
+/// Track Super (Meta) key state for compositor hotkey detection.
+static SUPER_HELD: AtomicBool = AtomicBool::new(false);
+
+// Evdev keycodes for Super+G hotkey.
+const KEY_LEFTMETA: u32 = 125;
+const KEY_RIGHTMETA: u32 = 126;
+const KEY_G: u32 = 34;
+
+/// Check if a key event is part of the Super+G hotkey combo.
+/// Returns `true` if the combo was triggered (consume the event).
+#[inline]
+fn check_super_g_hotkey(key: u32, pressed: bool) -> bool {
+    match key {
+        KEY_LEFTMETA | KEY_RIGHTMETA => {
+            SUPER_HELD.store(pressed, Ordering::Relaxed);
+            false
+        }
+        KEY_G if pressed && SUPER_HELD.load(Ordering::Relaxed) => {
+            info!("Super+G detected, initiating fade-out exit");
+            EXIT_FADE_OUT.store(true, Ordering::Relaxed);
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Drain host compositor input events (nested/wayland mode) and forward
 /// them to Wayland clients.
 fn drain_host_input(
@@ -735,6 +871,9 @@ fn drain_host_input(
     while let Ok(event) = host_input_rx.try_recv() {
         match event {
             WaylandEvent::Key { key, pressed } => {
+                if check_super_g_hotkey(key, pressed) {
+                    continue;
+                }
                 wayland_state.send_key(key, pressed, now_ms);
             }
             WaylandEvent::Modifiers {
@@ -836,7 +975,16 @@ fn forward_staged_frame(
     has_focus: bool,
 ) {
     let now_ns = wayland::monotonic_ns();
+    let has_staged = state.staged_buffer.is_some();
+    let held_count = state.held_buffers.len();
+    let deferred_count = state.deferred_frame_callbacks.len();
     if !limiter.should_release(now_ns) {
+        if has_staged || held_count > 0 || deferred_count > 0 {
+            info!(
+                has_focus,
+                has_staged, held_count, deferred_count, "DIAG forward: limiter blocked"
+            );
+        }
         return;
     }
 
@@ -847,7 +995,16 @@ fn forward_staged_frame(
         // focused window, buffers are dropped so the host window
         // stays blank.
         if has_focus && let Some(ref tx) = state.frame_channel {
-            let _ = tx.send(buffer);
+            match tx.send(buffer) {
+                Ok(()) => info!("DIAG forward: sent buffer to render thread"),
+                Err(_) => info!("DIAG forward: frame_channel disconnected!"),
+            }
+        } else {
+            info!(
+                has_focus,
+                has_channel = state.frame_channel.is_some(),
+                "DIAG forward: dropped buffer (no focus or no channel)"
+            );
         }
         did_release = true;
     }
@@ -857,12 +1014,25 @@ fn forward_staged_frame(
     // By releasing only one buffer per tick, the client can acquire
     // one free swapchain image, render one frame, and commit — then
     // it blocks until the next tick releases another buffer.
+    let held_before = state.held_buffers.len();
+    let deferred_before = state.deferred_frame_callbacks.len();
     if state.release_one_buffer() {
         did_release = true;
     }
 
     if state.fire_deferred_callbacks() {
         did_release = true;
+    }
+
+    if held_before > 0 || deferred_before > 0 {
+        info!(
+            held_before,
+            held_after = state.held_buffers.len(),
+            deferred_before,
+            deferred_after = state.deferred_frame_callbacks.len(),
+            did_release,
+            "DIAG forward: release/callback status"
+        );
     }
 
     if did_release {

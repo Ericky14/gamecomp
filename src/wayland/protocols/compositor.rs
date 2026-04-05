@@ -4,7 +4,7 @@ use parking_lot::Mutex;
 use std::os::unix::io::AsFd;
 use std::sync::atomic::Ordering;
 
-use tracing::{debug, trace};
+use tracing::{debug, info, trace};
 use wayland_server::protocol::{
     wl_callback::{self, WlCallback},
     wl_compositor::{self, WlCompositor},
@@ -81,6 +81,11 @@ impl Dispatch<WlSurface, SurfaceData> for WaylandState {
         match request {
             wl_surface::Request::Attach { buffer, x: _, y: _ } => {
                 // Store the buffer reference. We'll read pixels on commit.
+                info!(
+                    surface_id = _surface.id().protocol_id(),
+                    has_buffer = buffer.is_some(),
+                    "DIAG: wl_surface.attach"
+                );
                 *data.attached_buffer.lock() = buffer;
             }
             wl_surface::Request::Damage { .. } | wl_surface::Request::DamageBuffer { .. } => {
@@ -89,6 +94,12 @@ impl Dispatch<WlSurface, SurfaceData> for WaylandState {
             wl_surface::Request::Frame { callback } => {
                 let cb = data_init.init(callback, ());
                 state.pending_frame_callbacks.push(cb);
+                // TEMP: trace frame callback registration.
+                info!(
+                    surface_id = _surface.id().protocol_id(),
+                    pending = state.pending_frame_callbacks.len(),
+                    "DIAG: frame callback registered"
+                );
             }
             wl_surface::Request::Commit => {
                 // Cursor surfaces: read SHM pixels and forward to host
@@ -128,12 +139,26 @@ impl Dispatch<WlSurface, SurfaceData> for WaylandState {
                 {
                     let focused_id = state.focused_wl_surface_id.load(Ordering::Relaxed);
                     let focused_srv = state.focused_server_index.load(Ordering::Relaxed);
+                    let native_focused_id = state.native_focused_surface_id.load(Ordering::Relaxed);
                     let surface_id = _surface.id().protocol_id();
                     let surface_srv = data.server_index;
-                    if focused_id == 0 || surface_id != focused_id || surface_srv != focused_srv {
-                        trace!(
+
+                    // Accept if this is the XWayland-focused surface, or
+                    // if it's the native Wayland-focused surface (server_index == u32::MAX).
+                    let is_xwl_focused =
+                        focused_id != 0 && surface_id == focused_id && surface_srv == focused_srv;
+                    let is_native_focused = native_focused_id != 0
+                        && surface_id == native_focused_id
+                        && surface_srv == u32::MAX;
+
+                    if !is_xwl_focused && !is_native_focused {
+                        info!(
                             surface_id,
-                            surface_srv, focused_id, focused_srv, "commit gate: rejected"
+                            surface_srv,
+                            focused_id,
+                            focused_srv,
+                            native_focused_id,
+                            "DIAG commit gate: rejected"
                         );
                         // Release the buffer so the client doesn't starve.
                         let attached = data.attached_buffer.lock();
@@ -145,11 +170,11 @@ impl Dispatch<WlSurface, SurfaceData> for WaylandState {
                 }
 
                 state.frame_seq += 1;
-                trace!(
+                info!(
                     frame_seq = state.frame_seq,
                     surface_id = _surface.id().protocol_id(),
                     server_index = data.server_index,
-                    "commit gate: accepted"
+                    "DIAG commit gate: accepted"
                 );
 
                 // Read pixels from the attached buffer and send to presenter.
@@ -159,6 +184,12 @@ impl Dispatch<WlSurface, SurfaceData> for WaylandState {
                     if let Some(buf_data) = buf_data_opt {
                         match buf_data {
                             BufferData::DmaBuf(dmabuf) => {
+                                info!(
+                                    width = dmabuf.width,
+                                    height = dmabuf.height,
+                                    format = format!("0x{:08x}", dmabuf.format),
+                                    "DIAG commit: DmaBuf buffer"
+                                );
                                 // Ensure GPU has finished writing to the DMA-BUF
                                 // before forwarding. Export an implicit sync fence
                                 // and wait on it. This prevents the host compositor
@@ -205,6 +236,11 @@ impl Dispatch<WlSurface, SurfaceData> for WaylandState {
                                 state.held_buffers.push(buffer.clone());
                             }
                             BufferData::Shm(shm) => {
+                                info!(
+                                    width = shm.width,
+                                    height = shm.height,
+                                    "DIAG commit: SHM buffer"
+                                );
                                 // CPU-copy fallback for SHM buffers.
                                 let offset = shm.offset as usize;
                                 let len = (shm.stride * shm.height) as usize;
@@ -230,10 +266,21 @@ impl Dispatch<WlSurface, SurfaceData> for WaylandState {
                             }
                         }
                     } else {
-                        debug!("commit: buffer has no BufferData");
+                        info!(
+                            surface_id = _surface.id().protocol_id(),
+                            buffer_id = buffer.id().protocol_id(),
+                            "DIAG commit: buffer has NO BufferData"
+                        );
                     }
                 } else {
-                    trace!("commit: no attached buffer");
+                    // No buffer attached — this is typically the initial
+                    // ack-configure commit. Fire pending frame callbacks
+                    // so the client (e.g. Flutter) starts its render loop.
+                    info!(
+                        pending = state.pending_frame_callbacks.len(),
+                        "DIAG commit: no buffer, firing frame callbacks"
+                    );
+                    state.fire_frame_callbacks();
                 }
             }
             wl_surface::Request::SetBufferScale { .. }

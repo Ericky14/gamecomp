@@ -484,12 +484,19 @@ fn handle_x11_event<C: Connection>(
                 ),
             );
 
-            // Do NOT force-configure the window to
-            // fill the output. Let the client render at whatever size it
-            // chooses. The compositor handles viewport scaling (contain-fit)
-            // at present time. Clients that want fullscreen will go fullscreen
-            // at one of the advertised XRandR resolutions.
-            // Map the window as-is.
+            // Configure every window to fill the output, matching
+            // Gamescope behaviour. The compositor still handles
+            // viewport scaling, but the shell (Grid) expects to
+            // render at the full output resolution.
+            let _ = conn.configure_window(
+                e.window,
+                &ConfigureWindowAux::new()
+                    .x(0)
+                    .y(0)
+                    .width(output_width)
+                    .height(output_height)
+                    .border_width(0),
+            );
             let _ = conn.map_window(e.window);
             let _ = conn.flush();
 

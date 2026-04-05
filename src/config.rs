@@ -55,6 +55,17 @@ pub struct Config {
     pub stats_pipe: Option<PathBuf>,
     /// Log level (RUST_LOG format).
     pub log_level: String,
+    /// DRM lease fd inherited from a parent compositor.
+    /// When set, the compositor operates on a leased DRM display,
+    /// receiving input via a host Wayland compositor connection.
+    pub drm_lease_fd: Option<i32>,
+    /// Shell binary to launch as the primary Wayland client (e.g., Grid).
+    /// Spawned after compositor initialization with WAYLAND_DISPLAY set
+    /// to the compositor's internal socket.
+    pub shell: Option<PathBuf>,
+    /// Host Wayland display name for input forwarding in DRM lease mode.
+    /// Defaults to the WAYLAND_DISPLAY environment variable.
+    pub host_wayland_display: Option<String>,
 }
 
 /// Which display backend to use.
@@ -67,6 +78,10 @@ pub enum BackendKind {
     Headless,
     /// Wayland mode (run inside another Wayland compositor as a window).
     Wayland,
+    /// DRM lease mode: DRM output from a leased fd, Wayland input from host.
+    /// Used when launched by a parent compositor (e.g., cosmic-comp) that
+    /// grants a DRM lease for the primary display.
+    DrmLease,
 }
 
 /// Upscaling algorithm.
@@ -102,6 +117,9 @@ impl Default for Config {
             child_command: None,
             stats_pipe: None,
             log_level: "info".to_string(),
+            drm_lease_fd: None,
+            shell: None,
+            host_wayland_display: None,
         }
     }
 }
@@ -293,6 +311,25 @@ impl Config {
                 }
                 "-e" | "--steam" => config.steam_mode = true,
                 "--no-steam" => config.steam_mode = false,
+                "--drm-lease-fd" => {
+                    if let Some(val) = args.get(i + 1).and_then(|v| v.parse().ok()) {
+                        config.drm_lease_fd = Some(val);
+                        config.backend = BackendKind::DrmLease;
+                        i += 1;
+                    }
+                }
+                "--shell" => {
+                    if let Some(val) = args.get(i + 1) {
+                        config.shell = Some(PathBuf::from(val));
+                        i += 1;
+                    }
+                }
+                "--host-wayland-display" => {
+                    if let Some(val) = args.get(i + 1) {
+                        config.host_wayland_display = Some(val.clone());
+                        i += 1;
+                    }
+                }
                 "--" => {
                     // Everything after `--` is the child command.
                     let child_args: Vec<_> = args[i + 1..].to_vec();
@@ -314,8 +351,10 @@ impl Config {
 
         // Auto-detect Wayland backend: if the user didn't explicitly choose a
         // backend and we're running inside a Wayland or X11 session, switch
-        // to the Wayland backend automatically.
+        // to the Wayland backend automatically. Skip if DRM lease mode was
+        // set via --drm-lease-fd.
         if !backend_explicit
+            && config.backend != BackendKind::DrmLease
             && (std::env::var_os("WAYLAND_DISPLAY").is_some()
                 || std::env::var_os("DISPLAY").is_some())
         {

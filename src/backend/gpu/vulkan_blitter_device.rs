@@ -250,6 +250,7 @@ impl VulkanBlitter {
             descriptor_set,
             shader_module,
             output_image_views: Vec::new(),
+            vendor_id: device_props.vendor_id,
         };
 
         // Query all valid modifiers for import (before allocating outputs).

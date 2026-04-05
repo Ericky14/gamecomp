@@ -99,10 +99,12 @@ impl VulkanBlitter {
         modifier: u64,
         offset: u32,
         stride: u32,
+        alpha: f32,
     ) -> anyhow::Result<ExportedBuffer> {
         // Wait for previous blit to complete.
         // SAFETY: Device and fence are valid. Fence was created with SIGNALED flag
         // and is reset after each successful wait. u64::MAX timeout = wait forever.
+        let t0 = std::time::Instant::now();
         unsafe {
             self.device
                 .wait_for_fences(&[self.fence], true, u64::MAX)
@@ -111,6 +113,7 @@ impl VulkanBlitter {
                 .reset_fences(&[self.fence])
                 .context("blit: reset fence")?;
         }
+        let t_fence = t0.elapsed();
 
         // NOTE: DMA-BUF implicit sync is handled by the caller via
         // `poll_dmabuf_ready()` before calling blit(). The caller uses
@@ -330,6 +333,7 @@ impl VulkanBlitter {
                 content_offset_y: dst_y,
                 content_w: dst_w as u32,
                 content_h: dst_h as u32,
+                alpha,
             };
             // SAFETY: push is a #[repr(C)] struct matching the shader layout.
             let push_bytes: &[u8] = std::slice::from_raw_parts(
@@ -400,6 +404,7 @@ impl VulkanBlitter {
 
         // SAFETY: Device is valid. Submit info references a valid command buffer
         // and fence. The fence will be signaled when the GPU completes the work.
+        let t_submit = std::time::Instant::now();
         unsafe {
             self.device
                 .queue_submit(self.queue, &[submit_info], self.fence)
@@ -412,6 +417,13 @@ impl VulkanBlitter {
                 .wait_for_fences(&[self.fence], true, u64::MAX)
                 .context("blit: wait for blit completion")?;
         }
+        let t_gpu = t_submit.elapsed();
+        info!(
+            fence_ms = t_fence.as_secs_f64() * 1000.0,
+            gpu_ms = t_gpu.as_secs_f64() * 1000.0,
+            out_idx,
+            "DIAG blit: timing breakdown"
+        );
 
         // Mark output image as blitted so subsequent acquires use GENERAL
         // layout (preserving block-linear tiling metadata).

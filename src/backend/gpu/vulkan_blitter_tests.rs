@@ -579,6 +579,7 @@ fn gpu_dmabuf_export_reimport_roundtrip() {
             0, // LINEAR source
             src_offset,
             src_stride,
+            1.0,
         )
         .expect("blit");
 
@@ -776,6 +777,7 @@ fn gpu_blit_solid_color() {
             0, // LINEAR
             src_offset,
             src_stride,
+            1.0,
         )
         .expect("blit");
 
@@ -829,6 +831,7 @@ fn gpu_blit_letterbox() {
             0,
             src_offset,
             src_stride,
+            1.0,
         )
         .expect("blit");
 
@@ -886,6 +889,7 @@ fn gpu_blit_pillarbox() {
             0,
             src_offset,
             src_stride,
+            1.0,
         )
         .expect("blit");
 
@@ -971,6 +975,7 @@ fn gpu_blit_4k_with_dump() {
             0, // LINEAR source
             src_offset,
             src_stride,
+            1.0,
         )
         .expect("blit 500×500 → 3840×2160");
 
@@ -1322,6 +1327,7 @@ fn gpu_blit_multi_frame_cycle() {
                 0, // LINEAR
                 src_offset,
                 src_stride,
+                1.0,
             )
             .unwrap_or_else(|_| panic!("blit frame {frame}"));
 

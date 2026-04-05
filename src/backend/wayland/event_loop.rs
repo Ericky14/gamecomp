@@ -363,6 +363,7 @@ impl PresentState {
             modifier,
             first_plane.offset,
             first_plane.stride,
+            1.0,
         ) {
             Ok(e) => e,
             Err(e) => {

@@ -43,7 +43,7 @@ pub struct GbmOutputBuffer {
     pub dmabuf: DmaBuf,
     /// Owned fd keeping the DMA-BUF alive. The `dmabuf.planes[*].fd`
     /// raw fds borrow this — must outlive all Vulkan imports.
-    _fd: std::os::unix::io::OwnedFd,
+    pub(crate) _fd: std::os::unix::io::OwnedFd,
 }
 
 /// Header of the DRM IN_FORMATS property blob (`drm_format_modifier_blob`).
@@ -52,25 +52,25 @@ pub struct GbmOutputBuffer {
 /// supports for scanout. Parsed to discover which modifiers the display
 /// controller can accept.
 #[repr(C)]
-struct InFormatsBlobHeader {
+pub(crate) struct InFormatsBlobHeader {
     _version: u32,
     _flags: u32,
-    count_formats: u32,
-    formats_offset: u32,
-    count_modifiers: u32,
-    modifiers_offset: u32,
+    pub(crate) count_formats: u32,
+    pub(crate) formats_offset: u32,
+    pub(crate) count_modifiers: u32,
+    pub(crate) modifiers_offset: u32,
 }
 
 /// Per-modifier entry in the IN_FORMATS blob (`drm_format_modifier`).
 #[repr(C)]
-struct InFormatsModifier {
+pub(crate) struct InFormatsModifier {
     /// Bitmask of which formats (by index) this modifier applies to.
-    formats: u64,
+    pub(crate) formats: u64,
     /// Offset into the formats array for this modifier's format range.
-    offset: u32,
+    pub(crate) offset: u32,
     _pad: u32,
     /// The DRM modifier value.
-    modifier: u64,
+    pub(crate) modifier: u64,
 }
 
 /// State for a single DRM plane (primary, overlay, or cursor).

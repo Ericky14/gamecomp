@@ -409,10 +409,33 @@ impl VulkanBlitter {
         let mut external_info = vk::ExternalMemoryImageCreateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
 
-        let tiling = if modifier != DRM_FORMAT_MOD_INVALID {
-            vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT
+        // Import strategy per modifier:
+        //
+        //   DRM_FORMAT_MOD_INVALID: OPTIMAL tiling — legacy clients that
+        //     don't negotiate modifiers. The driver knows its own allocation.
+        //
+        //   Known modifier (LINEAR or vendor-tiled): EXPLICIT form with
+        //     the exact modifier and plane layout (offset/stride). On NVIDIA,
+        //     modifier=0 (LINEAR) means the buffer IS truly linear — the
+        //     DMA-BUF size matches width*height*bpp exactly.
+        const VENDOR_NVIDIA: u32 = 0x10DE;
+        let _ = VENDOR_NVIDIA; // suppress unused warning
+
+        #[derive(Debug)]
+        enum ImportMode {
+            Optimal,
+            Explicit,
+        }
+
+        let mode = if modifier == DRM_FORMAT_MOD_INVALID {
+            ImportMode::Optimal
         } else {
-            vk::ImageTiling::OPTIMAL
+            ImportMode::Explicit
+        };
+
+        let tiling = match mode {
+            ImportMode::Optimal => vk::ImageTiling::OPTIMAL,
+            ImportMode::Explicit => vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT,
         };
 
         let mut image_info = vk::ImageCreateInfo::default()
@@ -431,11 +454,23 @@ impl VulkanBlitter {
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .push_next(&mut external_info);
 
-        if modifier != DRM_FORMAT_MOD_INVALID {
-            image_info = image_info.push_next(&mut drm_modifier_explicit);
+        match mode {
+            ImportMode::Optimal => {
+                // No modifier chain — OPTIMAL tiling with DMA_BUF_EXT import
+                // lets the driver determine the layout from its own allocation.
+            }
+            ImportMode::Explicit => {
+                image_info = image_info.push_next(&mut drm_modifier_explicit);
+            }
         }
-        // DRM_FORMAT_MOD_INVALID: no modifier chain needed — OPTIMAL tiling
-        // with DMA_BUF_EXT import lets the driver determine the layout.
+
+        info!(
+            ?mode,
+            modifier = format!("0x{:016x}", modifier),
+            width,
+            height,
+            "DIAG import: client dmabuf import mode"
+        );
 
         // SAFETY: Device is valid; image_info is fully initialized with valid
         // format, extent, and chained DRM modifier list / external memory structs.
@@ -445,8 +480,30 @@ impl VulkanBlitter {
         // SAFETY: Device and image are valid.
         let mem_requirements = unsafe { self.device.get_image_memory_requirements(image) };
 
+        info!(
+            size = mem_requirements.size,
+            alignment = mem_requirements.alignment,
+            memory_type_bits = format!("0x{:08x}", mem_requirements.memory_type_bits),
+            "DIAG import: memory requirements"
+        );
+
         // Import the DMA-BUF fd as memory.
         let dup_fd = rustix::io::dup(fd).context("failed to dup client dmabuf fd")?;
+
+        // Log DMA-BUF fd stat info for debugging.
+        {
+            use std::os::unix::io::AsRawFd;
+            let raw = dup_fd.as_raw_fd();
+            let stat = rustix::fs::fstat(&dup_fd);
+            info!(
+                raw_fd = raw,
+                stat_ok = stat.is_ok(),
+                dev = stat.as_ref().map(|s| s.st_dev).unwrap_or(0),
+                ino = stat.as_ref().map(|s| s.st_ino).unwrap_or(0),
+                size = stat.as_ref().map(|s| s.st_size).unwrap_or(0),
+                "DIAG import: dup'd fd stat"
+            );
+        }
 
         let mut import_fd_info = vk::ImportMemoryFdInfoKHR::default()
             .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)

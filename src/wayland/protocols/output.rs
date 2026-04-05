@@ -18,10 +18,15 @@ impl GlobalDispatch<WlOutput, OutputData> for WaylandState {
         _dh: &DisplayHandle,
         _client: &Client,
         resource: New<WlOutput>,
-        data: &OutputData,
+        _data: &OutputData,
         data_init: &mut DataInit<'_, Self>,
     ) {
         let output = data_init.init(resource, ());
+        // Use current runtime resolution, not the stale global data from
+        // creation time. The DRM lease backend may have updated the output
+        // resolution after the global was registered.
+        let width = state.output_width;
+        let height = state.output_height;
         output.geometry(
             0,
             0,
@@ -34,8 +39,8 @@ impl GlobalDispatch<WlOutput, OutputData> for WaylandState {
         );
         output.mode(
             wl_output::Mode::Current | wl_output::Mode::Preferred,
-            data.width as i32,
-            data.height as i32,
+            width as i32,
+            height as i32,
             60_000, // 60 Hz in mHz
         );
         output.scale(1);

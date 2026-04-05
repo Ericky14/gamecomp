@@ -174,6 +174,7 @@ struct BlitPushConstants {
     content_offset_y: i32,
     content_w: u32,
     content_h: u32,
+    alpha: f32,
 }
 
 /// Vulkan-based DMA-BUF compositor.
@@ -228,6 +229,9 @@ pub struct VulkanBlitter {
     shader_module: vk::ShaderModule,
     /// Per-output image views (STORAGE, for compute shader writes).
     output_image_views: Vec<vk::ImageView>,
+    /// GPU vendor ID (e.g. 0x10DE = NVIDIA). Used to apply vendor-specific
+    /// workarounds during DMA-BUF import.
+    vendor_id: u32,
 }
 
 struct ImportedImage {

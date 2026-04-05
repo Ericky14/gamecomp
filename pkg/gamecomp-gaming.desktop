@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Gamecomp Gaming Mode
+Comment=Gaming compositor with Grid UI
+Exec=gamecomp --shell=/usr/bin/grid
+DesktopNames=Gamecomp

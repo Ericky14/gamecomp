@@ -1,0 +1,15 @@
+[Unit]
+Description=Gamecomp Gaming Compositor
+Documentation=https://github.com/playtron/gamecomp
+ConditionPathExists=/dev/dri/card0
+After=graphical-session-pre.target
+
+[Service]
+Type=notify
+ExecStart=gamecomp --shell=/usr/bin/grid
+Restart=on-failure
+RestartSec=2
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=graphical-session.target

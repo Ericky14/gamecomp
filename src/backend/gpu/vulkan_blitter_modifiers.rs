@@ -7,18 +7,20 @@
 use super::*;
 
 impl VulkanBlitter {
-    /// Two-pass query of DRM format modifier properties for `VK_FORMAT_XRGB`.
+    /// Two-pass query of DRM format modifier properties for a given Vulkan format.
     ///
     /// First call queries the count, second call fills the properties array.
-    /// Used by all modifier query / filter functions.
-    fn query_drm_modifier_props(&self) -> anyhow::Result<Vec<vk::DrmFormatModifierPropertiesEXT>> {
+    fn query_drm_modifier_props_for_format(
+        &self,
+        vk_format: vk::Format,
+    ) -> anyhow::Result<Vec<vk::DrmFormatModifierPropertiesEXT>> {
         let mut modifier_list = vk::DrmFormatModifierPropertiesListEXT::default();
         let mut format_props2 = vk::FormatProperties2::default().push_next(&mut modifier_list);
         // SAFETY: physical_device is valid; first call queries count only.
         unsafe {
             self.instance.get_physical_device_format_properties2(
                 self.physical_device,
-                VK_FORMAT_XRGB,
+                vk_format,
                 &mut format_props2,
             );
         }
@@ -32,12 +34,70 @@ impl VulkanBlitter {
         unsafe {
             self.instance.get_physical_device_format_properties2(
                 self.physical_device,
-                VK_FORMAT_XRGB,
+                vk_format,
                 &mut format_props2,
             );
         }
 
         Ok(modifier_props)
+    }
+
+    /// Two-pass query of DRM format modifier properties for `VK_FORMAT_XRGB`.
+    ///
+    /// First call queries the count, second call fills the properties array.
+    /// Used by all modifier query / filter functions.
+    fn query_drm_modifier_props(&self) -> anyhow::Result<Vec<vk::DrmFormatModifierPropertiesEXT>> {
+        self.query_drm_modifier_props_for_format(VK_FORMAT_XRGB)
+    }
+
+    /// Query the GPU's supported DMA-BUF format/modifier pairs.
+    ///
+    /// Returns a map from DRM fourcc → list of supported modifiers. This is
+    /// used to populate `host_dmabuf_formats` in DRM/DRM-lease mode where
+    /// there is no host compositor to query formats from.
+    ///
+    /// Only returns single-plane, non-INVALID modifiers that support at least
+    /// TRANSFER_SRC + SAMPLED_IMAGE (i.e., modifiers the GPU can render into
+    /// and that the compositor can sample from).
+    pub fn query_gpu_dmabuf_formats(
+        &self,
+    ) -> anyhow::Result<std::collections::HashMap<u32, Vec<u64>>> {
+        // DRM fourcc → Vulkan format mapping for common RGBA8 variants.
+        let format_pairs: &[(u32, vk::Format)] = &[
+            (0x3432_5241, vk::Format::B8G8R8A8_UNORM), // ARGB8888
+            (0x3432_5258, vk::Format::B8G8R8A8_UNORM), // XRGB8888
+            (0x3432_4241, vk::Format::R8G8B8A8_UNORM), // ABGR8888
+            (0x3432_4258, vk::Format::R8G8B8A8_UNORM), // XBGR8888
+        ];
+
+        let mut result: std::collections::HashMap<u32, Vec<u64>> =
+            std::collections::HashMap::new();
+
+        for &(fourcc, vk_format) in format_pairs {
+            let modifier_props = self.query_drm_modifier_props_for_format(vk_format)?;
+
+            let modifiers: Vec<u64> = modifier_props
+                .iter()
+                .filter(|mp| {
+                    mp.drm_format_modifier_plane_count == 1
+                        && mp
+                            .drm_format_modifier_tiling_features
+                            .contains(IMPORT_MODIFIER_FEATURES)
+                })
+                .map(|mp| mp.drm_format_modifier)
+                .collect();
+
+            if !modifiers.is_empty() {
+                info!(
+                    fourcc = format!("0x{:08x}", fourcc),
+                    count = modifiers.len(),
+                    "GPU dmabuf format modifiers"
+                );
+                result.insert(fourcc, modifiers);
+            }
+        }
+
+        Ok(result)
     }
 
     /// Filter modifiers by external memory capability (EXPORTABLE or IMPORTABLE).
@@ -197,7 +257,7 @@ impl VulkanBlitter {
             "blitter: import modifiers (TRANSFER_SRC+SAMPLED_IMAGE, single-plane, non-INVALID)"
         );
         for m in &modifiers {
-            debug!(
+            info!(
                 modifier = format!("0x{:016x}", m),
                 "blitter: import modifier"
             );

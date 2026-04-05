@@ -28,6 +28,7 @@ layout(push_constant) uniform PushConstants {
     uvec2 dstSize;       // Output (display) dimensions.
     ivec2 contentOffset; // Top-left corner of the content region.
     uvec2 contentSize;   // Dimensions of the scaled content region.
+    float alpha;         // Content opacity (0.0 = black, 1.0 = visible).
 } pc;
 
 void main() {
@@ -54,6 +55,9 @@ void main() {
 
     // Hardware bilinear sampling — the sampler does the filtering.
     vec4 color = texture(srcTexture, uv);
+
+    // Fade-in: blend content toward black using alpha.
+    color.rgb *= pc.alpha;
 
     imageStore(dstImage, ivec2(pos), color);
 }
