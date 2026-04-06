@@ -53,6 +53,9 @@ pub struct Config {
     pub child_command: Option<String>,
     /// Stats pipe path. None = disabled.
     pub stats_pipe: Option<PathBuf>,
+    /// Pointer sensitivity multiplier for pointer input (DRM mode).
+    /// 1.0 = unaccelerated 1:1 mapping (libinput-normalized). Higher = faster.
+    pub pointer_sensitivity: f64,
     /// Log level (RUST_LOG format).
     pub log_level: String,
 }
@@ -101,6 +104,7 @@ impl Default for Config {
             steam_mode: false,
             child_command: None,
             stats_pipe: None,
+            pointer_sensitivity: 1.0,
             log_level: "info".to_string(),
         }
     }
@@ -162,6 +166,8 @@ struct ConfigFile {
     log_level: Option<String>,
     #[serde(default)]
     steam_mode: Option<bool>,
+    #[serde(default)]
+    pointer_sensitivity: Option<f64>,
 }
 
 impl Config {
@@ -293,6 +299,12 @@ impl Config {
                 }
                 "-e" | "--steam" => config.steam_mode = true,
                 "--no-steam" => config.steam_mode = false,
+                "--sensitivity" => {
+                    if let Some(val) = args.get(i + 1).and_then(|v| v.parse().ok()) {
+                        config.pointer_sensitivity = val;
+                        i += 1;
+                    }
+                }
                 "--" => {
                     // Everything after `--` is the child command.
                     let child_args: Vec<_> = args[i + 1..].to_vec();
@@ -378,6 +390,9 @@ impl Config {
         }
         if let Some(sm) = file.steam_mode {
             self.steam_mode = sm;
+        }
+        if let Some(ps) = file.pointer_sensitivity {
+            self.pointer_sensitivity = ps;
         }
     }
 }

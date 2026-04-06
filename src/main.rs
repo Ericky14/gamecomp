@@ -32,7 +32,7 @@ mod wayland;
 mod xwayland_mgr;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::thread;
 
 use anyhow::Context;
@@ -192,6 +192,15 @@ fn run(config: Config) -> anyhow::Result<()> {
     let (host_input_tx, host_input_rx) =
         std::sync::mpsc::channel::<crate::backend::wayland::WaylandEvent>();
 
+    // Shared atomics for cursor position. Written by the main thread after
+    // pointer motion events, read by the render thread to position the
+    // hardware cursor plane. Ordering: Relaxed — render thread polls each
+    // iteration, no ordering guarantee needed.
+    let cursor_x = Arc::new(AtomicI32::new(0));
+    let cursor_y = Arc::new(AtomicI32::new(0));
+    let cursor_x_render = cursor_x.clone();
+    let cursor_y_render = cursor_y.clone();
+
     // --- DRM path: open session and GPU device on main thread ---
     // Session management and device discovery must happen before the render
     // thread is spawned so the DRM fd can be transferred.
@@ -223,9 +232,10 @@ fn run(config: Config) -> anyhow::Result<()> {
         kbd.open_from_session(sess);
         keyboard_monitor = Some(kbd);
 
-        let mut ptr = PointerMonitor::new();
-        ptr.open_from_session(sess);
-        pointer_monitor = Some(ptr);
+        match PointerMonitor::new() {
+            Ok(ptr) => pointer_monitor = Some(ptr),
+            Err(e) => warn!(?e, "failed to create libinput pointer monitor"),
+        }
     }
 
     // Track session active→inactive→active transitions so we can
@@ -255,6 +265,8 @@ fn run(config: Config) -> anyhow::Result<()> {
                 host_physical_width_render,
                 host_physical_height_render,
                 host_input_tx,
+                cursor_x_render,
+                cursor_y_render,
             );
         })
         .context("failed to spawn render thread")?;
@@ -266,19 +278,14 @@ fn run(config: Config) -> anyhow::Result<()> {
     // host formats, enabling zero-copy DMA-BUF forwarding.
     if matches!(config.backend, crate::config::BackendKind::Wayland) {
         xwayland_mgr::wait_for_host_formats(&host_dmabuf_formats);
-
-        // Also wait for the host window configure so we know the actual
-        // window dimensions before launching XWayland. Without this,
-        // clients start at the CLI-supplied resolution (e.g., 2560×1440)
-        // instead of the host-constrained physical dimensions, causing
-        // buffer size mismatches on the first frames.
-        xwayland_mgr::wait_for_host_configure(&host_physical_width, &host_physical_height);
-        let pw = host_physical_width.load(Ordering::Acquire);
-        let ph = host_physical_height.load(Ordering::Acquire);
-        if pw > 0 && ph > 0 {
-            wayland_state.update_output_resolution(pw, ph);
-        }
     }
+
+    // Wait for the render thread to publish the display resolution before
+    // launching XWayland. On the Wayland path this comes from the host
+    // window configure; on DRM it comes from the connector mode.
+    // Resolution is applied to clients via propagate_host_resolution()
+    // in the main loop — we only need the synchronization barrier here.
+    xwayland_mgr::wait_for_host_configure(&host_physical_width, &host_physical_height);
 
     // --- Launch XWayland servers ---
     // Spawn `xwayland_count` instances. Server 0 is the platform display
@@ -397,6 +404,11 @@ fn run(config: Config) -> anyhow::Result<()> {
     // Track the last-seen detected refresh rate to avoid redundant updates.
     let mut last_detected_hz: u32 = 0;
 
+    // Track last-propagated resolution to avoid redundant SetResolution
+    // commands and update_output_resolution calls every loop iteration.
+    let mut last_propagated_w: u32 = 0;
+    let mut last_propagated_h: u32 = 0;
+
     // Cross-server focus arbiter — picks the global winning server
     // and gates commits so only the focused surface gets frame callbacks.
     // +1 for the native Wayland virtual server slot.
@@ -422,9 +434,18 @@ fn run(config: Config) -> anyhow::Result<()> {
             &mut session_was_active,
             &mut keyboard_monitor,
             &mut pointer_monitor,
+            &mut wayland_state,
         );
         poll_keyboard(&mut keyboard_monitor, &mut session, &mut wayland_state);
-        poll_pointer(&mut pointer_monitor, &mut session, &mut wayland_state);
+        poll_pointer(
+            &mut pointer_monitor,
+            &mut wayland_state,
+            &cursor_x,
+            &cursor_y,
+            &host_physical_width,
+            &host_physical_height,
+            config.pointer_sensitivity,
+        );
         drain_host_input(&host_input_rx, &mut wayland_state);
 
         // Drain vblank timestamps from the render thread and feed them to
@@ -447,6 +468,8 @@ fn run(config: Config) -> anyhow::Result<()> {
             &host_physical_height,
             &mut wayland_state,
             &xwayland_servers,
+            &mut last_propagated_w,
+            &mut last_propagated_h,
         );
 
         // Monitor all XWayland instances and respawn crashed ones.
@@ -645,13 +668,15 @@ fn launch_child_command(
 
 /// Dispatch libseat events and handle VT switch recovery.
 ///
-/// On session restore (inactive → active), re-opens input devices since
-/// logind revokes evdev fds via `EVIOCREVOKE` on VT switch.
+/// On session restore (inactive → active), re-opens keyboard devices since
+/// logind revokes evdev fds via `EVIOCREVOKE` on VT switch. The pointer
+/// monitor uses libinput's suspend/resume mechanism instead.
 fn dispatch_session(
     session: &mut Option<backend::session::Session>,
     was_active: &mut bool,
     keyboard_monitor: &mut Option<KeyboardMonitor>,
     pointer_monitor: &mut Option<PointerMonitor>,
+    wayland_state: &mut wayland::WaylandState,
 ) {
     let Some(sess) = session.as_mut() else { return };
 
@@ -660,14 +685,27 @@ fn dispatch_session(
     }
 
     let is_active = sess.is_active();
+    // Session going inactive — suspend libinput so it closes devices.
+    if *was_active
+        && !is_active
+        && let Some(ptr) = pointer_monitor.as_mut()
+    {
+        ptr.suspend();
+    }
+    // Session restored — re-open keyboard devices and resume libinput.
     if !*was_active && is_active {
         info!("session restored, re-opening input devices");
         if let Some(kbd) = keyboard_monitor.as_mut() {
             kbd.reopen_after_vt_switch(sess);
         }
         if let Some(ptr) = pointer_monitor.as_mut() {
-            ptr.reopen_after_vt_switch(sess);
+            ptr.resume();
         }
+        // Fire frame callbacks so clients repaint after VT switch back.
+        // The render thread drains stale frames while paused and needs
+        // a fresh commit to present after modeset.
+        info!("firing frame callbacks to request client repaint after VT switch");
+        wayland_state.fire_all_callbacks();
     }
     *was_active = is_active;
 }
@@ -694,21 +732,48 @@ fn poll_keyboard(
     }
 }
 
-/// Poll evdev pointer devices and forward events to Wayland clients.
+/// Poll pointer devices via libinput and forward events to Wayland clients.
+#[allow(clippy::too_many_arguments)]
 fn poll_pointer(
     pointer_monitor: &mut Option<PointerMonitor>,
-    session: &mut Option<backend::session::Session>,
     wayland_state: &mut wayland::WaylandState,
+    cursor_x: &AtomicI32,
+    cursor_y: &AtomicI32,
+    display_width: &AtomicU32,
+    display_height: &AtomicU32,
+    sensitivity: f64,
 ) {
     use crate::input::pointer::PointerEvent;
 
-    if let Some(ptr) = pointer_monitor.as_mut()
-        && let Some(sess) = session.as_mut()
-    {
-        for event in ptr.poll(sess) {
+    if let Some(ptr) = pointer_monitor.as_mut() {
+        for event in ptr.poll() {
             match event {
                 PointerEvent::Motion { dx, dy, time_ms } => {
+                    // Apply sensitivity multiplier to libinput's DPI-normalized
+                    // unaccelerated deltas. 1.0 = 1:1 mapping.
+                    let dx = dx * sensitivity;
+                    let dy = dy * sensitivity;
                     wayland_state.send_pointer_motion(dx, dy, time_ms);
+                    // Scale cursor position from client coords to display coords
+                    // for the hardware cursor plane. When the client renders at a
+                    // lower resolution than the display, the blitter upscales the
+                    // frame, so the cursor must be positioned in display space.
+                    let client_x = wayland_state.pointer_x;
+                    let client_y = wayland_state.pointer_y;
+                    let dw = display_width.load(Ordering::Relaxed);
+                    let dh = display_height.load(Ordering::Relaxed);
+                    let cw = wayland_state.output_width;
+                    let ch = wayland_state.output_height;
+                    let (sx, sy) = if dw > 0 && dh > 0 && cw > 0 && ch > 0 {
+                        (
+                            (client_x * dw as f64 / cw as f64) as i32,
+                            (client_y * dh as f64 / ch as f64) as i32,
+                        )
+                    } else {
+                        (client_x as i32, client_y as i32)
+                    };
+                    cursor_x.store(sx, Ordering::Relaxed);
+                    cursor_y.store(sy, Ordering::Relaxed);
                 }
                 PointerEvent::Button(btn) => {
                     let time_ms = (btn.time_usec / 1000) as u32;
@@ -757,21 +822,36 @@ fn drain_host_input(
             WaylandEvent::Scroll { dx, dy } => {
                 wayland_state.send_pointer_axis(dx, dy, now_ms);
             }
+            WaylandEvent::FocusIn => {
+                // Host window regained focus (e.g., VT switch back, workspace
+                // switch). Flutter only renders on state changes, so fire
+                // frame callbacks + reconfigure toplevels to prompt a repaint.
+                info!("host focus regained, requesting client repaint");
+                wayland_state.fire_all_callbacks();
+                wayland_state.reconfigure_toplevels();
+            }
             _ => {}
         }
     }
 }
 
 /// Propagate host window physical size to Wayland clients and XWM threads.
+///
+/// Only sends updates when the resolution has actually changed since the
+/// last call, avoiding redundant wl_output.mode events and XWM commands.
 fn propagate_host_resolution(
     host_physical_width: &AtomicU32,
     host_physical_height: &AtomicU32,
     wayland_state: &mut wayland::WaylandState,
     xwayland_servers: &[XWaylandInstance],
+    last_w: &mut u32,
+    last_h: &mut u32,
 ) {
     let pw = host_physical_width.load(Ordering::Acquire);
     let ph = host_physical_height.load(Ordering::Acquire);
-    if pw > 0 && ph > 0 {
+    if pw > 0 && ph > 0 && (pw != *last_w || ph != *last_h) {
+        *last_w = pw;
+        *last_h = ph;
         wayland_state.update_output_resolution(pw, ph);
         for srv in xwayland_servers {
             let _ = srv

@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, bail};
 use drm::Device as DrmDeviceTrait;
-use drm::buffer::PlanarBuffer;
+use drm::buffer::{Buffer as DrmBuffer, PlanarBuffer};
 use drm::control::{
     AtomicCommitFlags, Device as ControlDevice, FbCmd2Flags, Mode, PlaneType, connector, crtc,
     plane, property,
@@ -135,6 +135,23 @@ struct OutputState {
     active: bool,
 }
 
+/// Hardware cursor plane state.
+///
+/// Manages a dumb buffer for the cursor image and tracks the current
+/// framebuffer. The cursor plane is updated via separate atomic commits
+/// (no PAGE_FLIP_EVENT) so position updates are independent of the
+/// primary plane flip cadence.
+struct CursorPlaneState {
+    /// Dumb buffer backing the cursor image.
+    dumb: drm::control::dumbbuffer::DumbBuffer,
+    /// DRM framebuffer created from the dumb buffer.
+    fb: drm::control::framebuffer::Handle,
+    /// Hotspot X offset from the cursor image.
+    hotspot_x: i32,
+    /// Hotspot Y offset from the cursor image.
+    hotspot_y: i32,
+}
+
 /// The DRM/KMS display backend.
 pub struct DrmBackend {
     /// DRM device file descriptor.
@@ -159,6 +176,9 @@ pub struct DrmBackend {
     /// is effectively a modeset and needs `ALLOW_MODESET`. This flag is
     /// cleared after the first successful flip.
     needs_modeset: bool,
+    /// Hardware cursor plane state. `None` when no cursor is displayed
+    /// or if the output has no cursor plane.
+    cursor_state: Option<CursorPlaneState>,
 }
 
 /// Wrapper to implement `drm::Device` on an `OwnedFd`.
@@ -204,6 +224,7 @@ impl DrmBackend {
             scanout_formats: Vec::new(),
             flip_pending: false,
             needs_modeset: true,
+            cursor_state: None,
         }
     }
 
@@ -1362,5 +1383,294 @@ impl DrmBackend {
 
         info!(count = outputs.len(), "GBM output buffers ready");
         Ok(outputs)
+    }
+
+    /// Maximum cursor plane buffer dimension.
+    ///
+    /// Most DRM drivers (including NVIDIA) support at least 256×256 cursor
+    /// planes. The client cursor image is copied into the top-left corner
+    /// of this fixed-size buffer; the remainder is transparent black.
+    const CURSOR_SIZE: u32 = 256;
+
+    /// Update the hardware cursor image from ARGB8888 pixel data.
+    ///
+    /// Creates a dumb buffer of [`CURSOR_SIZE`]² pixels, copies the client
+    /// cursor image into it (scaled by `scale` factor using nearest-neighbor),
+    /// and assigns it to the cursor plane via an atomic commit. Replaces any
+    /// previously active cursor.
+    ///
+    /// `scale` is the uniform scale factor derived from
+    /// `min(display_w/client_w, display_h/client_h)` to match the blitter's
+    /// aspect-preserving "contain" scaling.
+    pub fn update_cursor_image(
+        &mut self,
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        hotspot_x: i32,
+        hotspot_y: i32,
+        scale: f64,
+    ) -> anyhow::Result<()> {
+        let output = self.outputs.first().context("no output for cursor")?;
+        if output.cursor_plane.is_none() {
+            debug!("no cursor plane available, skipping cursor update");
+            return Ok(());
+        }
+
+        // Tear down previous cursor state.
+        if let Some(old) = self.cursor_state.take() {
+            let dev = DrmRef(self.fd.as_fd());
+            let _ = dev.destroy_framebuffer(old.fb);
+            let _ = dev.destroy_dumb_buffer(old.dumb);
+        }
+
+        let dev = DrmRef(self.fd.as_fd());
+        let cursor_sz = Self::CURSOR_SIZE;
+
+        // Scaled cursor dimensions (clamped to dumb buffer size).
+        let scaled_w = ((width as f64 * scale) as u32).min(cursor_sz);
+        let scaled_h = ((height as f64 * scale) as u32).min(cursor_sz);
+        let scaled_hotspot_x = (hotspot_x as f64 * scale) as i32;
+        let scaled_hotspot_y = (hotspot_y as f64 * scale) as i32;
+
+        // Allocate a dumb buffer at the fixed cursor plane size.
+        let mut dumb = dev
+            .create_dumb_buffer(
+                (cursor_sz, cursor_sz),
+                DrmFourcc::Argb8888,
+                32, // bpp
+            )
+            .context("failed to create cursor dumb buffer")?;
+
+        // Copy client pixels into the dumb buffer, applying nearest-
+        // neighbor upscaling when scale > 1.
+        let dumb_pitch = dumb.pitch();
+        {
+            let mut mapping = dev
+                .map_dumb_buffer(&mut dumb)
+                .context("failed to map cursor dumb buffer")?;
+            let dst = mapping.as_mut();
+            // Zero-fill first (transparent black).
+            dst.fill(0);
+            let src_stride = width as usize * 4;
+            let dst_stride = dumb_pitch as usize;
+            for dst_row in 0..scaled_h as usize {
+                let src_row = (dst_row as f64 / scale) as usize;
+                for dst_col in 0..scaled_w as usize {
+                    let src_col = (dst_col as f64 / scale) as usize;
+                    let src_off = src_row * src_stride + src_col * 4;
+                    let dst_off = dst_row * dst_stride + dst_col * 4;
+                    if src_off + 4 <= pixels.len() && dst_off + 4 <= dst.len() {
+                        dst[dst_off..dst_off + 4].copy_from_slice(&pixels[src_off..src_off + 4]);
+                    }
+                }
+            }
+        }
+
+        // Create framebuffer from the dumb buffer's GEM handle.
+        struct CursorBuffer {
+            size: (u32, u32),
+            handle: drm::buffer::Handle,
+            pitch: u32,
+        }
+        impl drm::buffer::PlanarBuffer for CursorBuffer {
+            fn size(&self) -> (u32, u32) {
+                self.size
+            }
+            fn format(&self) -> DrmFourcc {
+                DrmFourcc::Argb8888
+            }
+            fn modifier(&self) -> Option<DrmModifier> {
+                None
+            }
+            fn pitches(&self) -> [u32; 4] {
+                [self.pitch, 0, 0, 0]
+            }
+            fn handles(&self) -> [Option<drm::buffer::Handle>; 4] {
+                [Some(self.handle), None, None, None]
+            }
+            fn offsets(&self) -> [u32; 4] {
+                [0; 4]
+            }
+        }
+
+        let cursor_buf = CursorBuffer {
+            size: (cursor_sz, cursor_sz),
+            handle: dumb.handle(),
+            pitch: dumb_pitch,
+        };
+        let fb = dev
+            .add_planar_framebuffer(&cursor_buf, FbCmd2Flags::empty())
+            .context("failed to create cursor framebuffer")?;
+
+        self.cursor_state = Some(CursorPlaneState {
+            dumb,
+            fb,
+            hotspot_x: scaled_hotspot_x,
+            hotspot_y: scaled_hotspot_y,
+        });
+
+        debug!(
+            width,
+            height,
+            scale,
+            scaled_w,
+            scaled_h,
+            hotspot_x = scaled_hotspot_x,
+            hotspot_y = scaled_hotspot_y,
+            cursor_fb = ?fb,
+            "cursor image updated"
+        );
+        Ok(())
+    }
+
+    /// Update the cursor plane position via atomic commit.
+    ///
+    /// The position is adjusted by the cursor hotspot so the pointer tip
+    /// aligns with the coordinate. Uses a synchronous atomic commit (no
+    /// PAGE_FLIP_EVENT) which is independent of the primary plane flip.
+    pub fn update_cursor_position(&mut self, pointer_x: i32, pointer_y: i32) -> anyhow::Result<()> {
+        let output = self.outputs.first().context("no output for cursor")?;
+        let cursor_plane_handle = match output.cursor_plane {
+            Some(h) => h,
+            None => return Ok(()),
+        };
+        let cursor = match self.cursor_state.as_ref() {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+        let plane = match self.planes.get(&cursor_plane_handle) {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+
+        let crtc_x = pointer_x - cursor.hotspot_x;
+        let crtc_y = pointer_y - cursor.hotspot_y;
+        let cursor_sz = Self::CURSOR_SIZE as u64;
+
+        let dev = DrmRef(self.fd.as_fd());
+        let mut req = drm::control::atomic::AtomicModeReq::new();
+
+        if let Some(prop) = plane.props.fb_id {
+            req.add_property(
+                cursor_plane_handle,
+                prop,
+                drm::control::property::Value::Framebuffer(Some(cursor.fb)),
+            );
+        }
+        if let Some(prop) = plane.props.crtc_id {
+            req.add_property(
+                cursor_plane_handle,
+                prop,
+                drm::control::property::Value::CRTC(Some(output.crtc)),
+            );
+        }
+        if let Some(prop) = plane.props.crtc_x {
+            req.add_property(
+                cursor_plane_handle,
+                prop,
+                drm::control::property::Value::SignedRange(crtc_x as i64),
+            );
+        }
+        if let Some(prop) = plane.props.crtc_y {
+            req.add_property(
+                cursor_plane_handle,
+                prop,
+                drm::control::property::Value::SignedRange(crtc_y as i64),
+            );
+        }
+        if let Some(prop) = plane.props.crtc_w {
+            req.add_property(
+                cursor_plane_handle,
+                prop,
+                drm::control::property::Value::UnsignedRange(cursor_sz),
+            );
+        }
+        if let Some(prop) = plane.props.crtc_h {
+            req.add_property(
+                cursor_plane_handle,
+                prop,
+                drm::control::property::Value::UnsignedRange(cursor_sz),
+            );
+        }
+        // Source rect (16.16 fixed point).
+        if let Some(prop) = plane.props.src_x {
+            req.add_property(
+                cursor_plane_handle,
+                prop,
+                drm::control::property::Value::UnsignedRange(0),
+            );
+        }
+        if let Some(prop) = plane.props.src_y {
+            req.add_property(
+                cursor_plane_handle,
+                prop,
+                drm::control::property::Value::UnsignedRange(0),
+            );
+        }
+        if let Some(prop) = plane.props.src_w {
+            req.add_property(
+                cursor_plane_handle,
+                prop,
+                drm::control::property::Value::UnsignedRange(cursor_sz << 16),
+            );
+        }
+        if let Some(prop) = plane.props.src_h {
+            req.add_property(
+                cursor_plane_handle,
+                prop,
+                drm::control::property::Value::UnsignedRange(cursor_sz << 16),
+            );
+        }
+
+        // Synchronous commit — takes effect on next vblank without
+        // requiring PAGE_FLIP_EVENT. Independent of primary plane flip.
+        dev.atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req)
+            .context("cursor plane atomic commit failed")?;
+
+        Ok(())
+    }
+
+    /// Hide the hardware cursor by disabling the cursor plane.
+    pub fn hide_cursor(&mut self) -> anyhow::Result<()> {
+        let output = self.outputs.first().context("no output for cursor")?;
+        let cursor_plane_handle = match output.cursor_plane {
+            Some(h) => h,
+            None => return Ok(()),
+        };
+        let plane = match self.planes.get(&cursor_plane_handle) {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+
+        let dev = DrmRef(self.fd.as_fd());
+        let mut req = drm::control::atomic::AtomicModeReq::new();
+
+        if let Some(prop) = plane.props.fb_id {
+            req.add_property(
+                cursor_plane_handle,
+                prop,
+                drm::control::property::Value::Framebuffer(None),
+            );
+        }
+        if let Some(prop) = plane.props.crtc_id {
+            req.add_property(
+                cursor_plane_handle,
+                prop,
+                drm::control::property::Value::CRTC(None),
+            );
+        }
+
+        dev.atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req)
+            .context("cursor plane hide commit failed")?;
+
+        // Clean up resources.
+        if let Some(old) = self.cursor_state.take() {
+            let _ = dev.destroy_framebuffer(old.fb);
+            let _ = dev.destroy_dumb_buffer(old.dumb);
+        }
+
+        debug!("cursor hidden");
+        Ok(())
     }
 }

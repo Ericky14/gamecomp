@@ -213,6 +213,15 @@ impl WindowTracker {
         }
     }
 
+    /// Return the IDs of all currently mapped windows.
+    pub fn mapped_windows(&self) -> Vec<u32> {
+        self.windows
+            .values()
+            .filter(|w| w.mapped)
+            .map(|w| w.id)
+            .collect()
+    }
+
     /// Remove a window entirely (DestroyNotify).
     pub fn remove_window(&mut self, id: u32) {
         self.windows.remove(&id);

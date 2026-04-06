@@ -377,7 +377,7 @@ fn process_command<C: Connection>(
     output_width: &mut u32,
     output_height: &mut u32,
 ) -> ControlFlow {
-    use x11rb::protocol::xproto::{AtomEnum, PropMode};
+    use x11rb::protocol::xproto::{AtomEnum, ConfigureWindowAux, ConnectionExt, PropMode};
     match cmd_rx.try_recv() {
         Ok(XwmCommand::Shutdown) => {
             info!("XWM received shutdown command");
@@ -395,9 +395,20 @@ fn process_command<C: Connection>(
                 *output_width = width;
                 *output_height = height;
 
-                // Do NOT reconfigure existing windows.
-                // Clients choose their own resolution. The compositor
-                // handles contain-fit viewport scaling at present time.
+                // Reconfigure all mapped windows to fill the new output size.
+                // Without this, clients keep their old dimensions and the
+                // compositor must upscale, causing blurry output.
+                for win in tracker.mapped_windows() {
+                    let _ = conn.configure_window(
+                        win,
+                        &ConfigureWindowAux::new()
+                            .x(0)
+                            .y(0)
+                            .width(width)
+                            .height(height),
+                    );
+                }
+                let _ = conn.flush();
             }
         }
         Ok(XwmCommand::CloseWindow { window_id }) => {
@@ -484,23 +495,23 @@ fn handle_x11_event<C: Connection>(
                 ),
             );
 
-            // Do NOT force-configure the window to
-            // fill the output. Let the client render at whatever size it
-            // chooses. The compositor handles viewport scaling (contain-fit)
-            // at present time. Clients that want fullscreen will go fullscreen
-            // at one of the advertised XRandR resolutions.
-            // Map the window as-is.
+            // Configure the window to fill the output before mapping.
+            // This ensures clients (e.g., Flutter/Grid) render at the full
+            // output resolution instead of their default size. Without this,
+            // clients pick a small default which the compositor must upscale,
+            // causing blurry output and broken cursor coordinate mapping.
+            let _ = conn.configure_window(
+                e.window,
+                &ConfigureWindowAux::new()
+                    .x(0)
+                    .y(0)
+                    .width(output_width)
+                    .height(output_height),
+            );
             let _ = conn.map_window(e.window);
             let _ = conn.flush();
 
-            // Read current geometry for tracking.
-            let geom = conn
-                .get_geometry(e.window)
-                .ok()
-                .and_then(|c| c.reply().ok());
-            let (w, h) = geom.map_or((output_width, output_height), |g| {
-                (g.width as u32, g.height as u32)
-            });
+            let (w, h) = (output_width, output_height);
 
             // Read initial properties for classification.
             let role = classify_window(conn, atoms, e.window);

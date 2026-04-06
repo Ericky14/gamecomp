@@ -29,6 +29,8 @@ use wayland_server::protocol::wl_pointer::{self, WlPointer};
 use wayland_server::protocol::wl_surface::WlSurface;
 use wayland_server::{Display, ListeningSocket, Resource};
 
+use wayland_protocols::wp::pointer_constraints::zv1::server::zwp_locked_pointer_v1::ZwpLockedPointerV1;
+use wayland_protocols::wp::relative_pointer::zv1::server::zwp_relative_pointer_v1::ZwpRelativePointerV1;
 use wayland_protocols::xdg::shell::server::xdg_toplevel::XdgToplevel;
 
 use crate::backend::ConnectorInfo;
@@ -158,6 +160,17 @@ pub struct WaylandState {
     /// Focused surface protocol ID for native Wayland clients.
     /// Set to the wl_surface protocol_id when a non-XWayland toplevel is created.
     pub native_focused_surface_id: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// Client's `zwp_relative_pointer_v1` objects — used to forward raw
+    /// motion deltas even while the pointer is locked.
+    pub relative_pointers: Vec<ZwpRelativePointerV1>,
+    /// Whether the pointer is currently locked by a client via
+    /// `zwp_pointer_constraints_v1.lock_pointer`. While locked,
+    /// `wl_pointer.motion` events are suppressed and only
+    /// `relative_motion` events are emitted.
+    pub pointer_locked: bool,
+    /// The active locked pointer object (if any). Stored so we can send
+    /// `unlocked` when the lock is released.
+    pub locked_pointer: Option<ZwpLockedPointerV1>,
 }
 
 impl WaylandState {
@@ -196,6 +209,9 @@ impl WaylandState {
             xwayland_client_map: std::collections::HashMap::new(),
             native_focused_app_id: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             native_focused_surface_id: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            relative_pointers: Vec::new(),
+            pointer_locked: false,
+            locked_pointer: None,
         }
     }
 
@@ -289,6 +305,26 @@ impl WaylandState {
         let now_ms = monotonic_ms();
         for cb in self.pending_frame_callbacks.drain(..) {
             cb.done(now_ms);
+        }
+    }
+
+    /// Fire all frame callbacks (both pending and deferred) and release
+    /// all held buffers.
+    ///
+    /// Used when the host window regains focus to unblock clients that
+    /// are waiting for frame callbacks or free buffers to render again.
+    pub fn fire_all_callbacks(&mut self) {
+        let now_ms = monotonic_ms();
+        for cb in self.pending_frame_callbacks.drain(..) {
+            cb.done(now_ms);
+        }
+        for cb in self.deferred_frame_callbacks.drain(..) {
+            cb.done(now_ms);
+        }
+        self.has_pending_commit = false;
+        // Release held buffers so the client can reuse them immediately.
+        for buf in self.held_buffers.drain(..) {
+            buf.release();
         }
     }
 
@@ -512,7 +548,19 @@ impl WaylandState {
     ///
     /// Accumulates relative deltas (DRM mode evdev). Tracks position in
     /// output space, clamped to `output_width × output_height`.
+    ///
+    /// When the pointer is locked, `wl_pointer.motion` is suppressed but
+    /// `zwp_relative_pointer_v1.relative_motion` is still emitted so the
+    /// client receives raw deltas (essential for FPS camera controls).
     pub fn send_pointer_motion(&mut self, dx: f64, dy: f64, time_ms: u32) {
+        // Always send relative motion (unaffected by lock).
+        self.send_relative_motion(dx, dy, time_ms);
+
+        if self.pointer_locked {
+            // Protocol spec: no wl_pointer.motion while locked.
+            return;
+        }
+
         self.pointer_x = (self.pointer_x + dx).clamp(0.0, self.output_width as f64 - 1.0);
         self.pointer_y = (self.pointer_y + dy).clamp(0.0, self.output_height as f64 - 1.0);
         for ptr in &self.pointers {
@@ -531,8 +579,23 @@ impl WaylandState {
     pub fn send_pointer_motion_absolute(&mut self, x: f64, y: f64, time_ms: u32) {
         let w = self.output_width.max(1) as f64;
         let h = self.output_height.max(1) as f64;
+
+        let old_x = self.pointer_x;
+        let old_y = self.pointer_y;
         self.pointer_x = x.clamp(0.0, w - 1.0);
         self.pointer_y = y.clamp(0.0, h - 1.0);
+
+        // Emit relative motion from the delta of absolute positions.
+        let rdx = self.pointer_x - old_x;
+        let rdy = self.pointer_y - old_y;
+        if rdx.abs() > f64::EPSILON || rdy.abs() > f64::EPSILON {
+            self.send_relative_motion(rdx, rdy, time_ms);
+        }
+
+        if self.pointer_locked {
+            return;
+        }
+
         for ptr in &self.pointers {
             if ptr.is_alive() {
                 ptr.motion(time_ms, self.pointer_x, self.pointer_y);
@@ -569,6 +632,50 @@ impl WaylandState {
                 }
                 ptr.frame();
             }
+        }
+    }
+
+    /// Send `relative_motion` to all bound `zwp_relative_pointer_v1` objects.
+    ///
+    /// These events carry raw (unaccelerated) dx/dy deltas and are emitted
+    /// regardless of pointer lock state. `time_ms` is split into the
+    /// u64-microsecond hi/lo halves expected by the protocol.
+    fn send_relative_motion(&mut self, dx: f64, dy: f64, time_ms: u32) {
+        if self.relative_pointers.is_empty() {
+            return;
+        }
+        let time_us = time_ms as u64 * 1000;
+        let hi = (time_us >> 32) as u32;
+        let lo = time_us as u32;
+        self.relative_pointers.retain(|rp| rp.is_alive());
+        for rp in &self.relative_pointers {
+            rp.relative_motion(hi, lo, dx, dy, dx, dy);
+        }
+    }
+
+    /// Activate pointer lock — hide hardware cursor and suppress
+    /// `wl_pointer.motion` events.
+    pub fn lock_pointer(&mut self, locked_ptr: ZwpLockedPointerV1) {
+        debug!("pointer lock activated");
+        self.pointer_locked = true;
+
+        // Send `locked` event to notify the client.
+        locked_ptr.locked();
+        self.locked_pointer = Some(locked_ptr);
+
+        // Hide the hardware cursor.
+        if let Some(ref tx) = self.cursor_tx {
+            let _ = tx.send(CursorUpdate::Hide);
+        }
+    }
+
+    /// Deactivate pointer lock — restore cursor visibility.
+    pub fn unlock_pointer(&mut self, resource: &ZwpLockedPointerV1) {
+        if self.locked_pointer.as_ref() == Some(resource) {
+            debug!("pointer lock deactivated");
+            resource.unlocked();
+            self.locked_pointer = None;
+            self.pointer_locked = false;
         }
     }
 }

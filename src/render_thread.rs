@@ -12,7 +12,7 @@
 //!   with a calloop event loop for page flip handling.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 
 use anyhow::Context;
 use tracing::{debug, error, info, trace, warn};
@@ -42,6 +42,8 @@ pub fn render_thread_main(
     host_physical_width: Arc<AtomicU32>,
     host_physical_height: Arc<AtomicU32>,
     host_input_tx: std::sync::mpsc::Sender<backend::wayland::WaylandEvent>,
+    cursor_x: Arc<AtomicI32>,
+    cursor_y: Arc<AtomicI32>,
 ) {
     info!("render thread started");
 
@@ -96,13 +98,12 @@ pub fn render_thread_main(
                 let connectors = drm.connectors();
                 if let Some(conn) = connectors.first() {
                     let mode = conn.mode;
-                    info!(
-                        connector = %conn.name,
-                        mode_w = mode.size().0,
-                        mode_h = mode.size().1,
-                        vrr = drm.capabilities().vrr,
-                        "DRM backend initialized"
-                    );
+                    let (mode_w, mode_h) = (mode.size().0 as u32, mode.size().1 as u32);
+                    // Publish display resolution so the main thread can
+                    // scale the hardware cursor position from client coords
+                    // to display coords.
+                    host_physical_width.store(mode_w, Ordering::Release);
+                    host_physical_height.store(mode_h, Ordering::Release);
                 }
                 _drm_backend = Some(drm);
             } else {
@@ -122,7 +123,18 @@ pub fn render_thread_main(
         let rx = committed_frames
             .take()
             .expect("committed_frames receiver missing for DRM path");
-        if let Err(e) = run_drm_event_loop(drm, rx, &vblank_tx, session_active.clone()) {
+        let cursor_rx = cursor_updates
+            .take()
+            .expect("cursor_updates receiver missing for DRM path");
+        if let Err(e) = run_drm_event_loop(
+            drm,
+            rx,
+            cursor_rx,
+            &vblank_tx,
+            session_active.clone(),
+            cursor_x.clone(),
+            cursor_y.clone(),
+        ) {
             error!(?e, "DRM event loop exited with error");
         }
         info!("render thread exited");
@@ -182,8 +194,11 @@ pub fn render_thread_main(
 fn run_drm_event_loop(
     drm: &mut backend::drm::DrmBackend,
     committed_frames: std::sync::mpsc::Receiver<wayland::protocols::CommittedBuffer>,
+    cursor_updates: std::sync::mpsc::Receiver<backend::wayland::CursorUpdate>,
     vblank_tx: &std::sync::mpsc::Sender<u64>,
     session_active: Option<Arc<AtomicBool>>,
+    cursor_x: Arc<AtomicI32>,
+    cursor_y: Arc<AtomicI32>,
 ) -> anyhow::Result<()> {
     let drm_raw_fd = drm.drm_fd().context("DRM backend has no fd")?;
 
@@ -274,6 +289,22 @@ fn run_drm_event_loop(
 
     let mut was_active = true;
 
+    // Track last cursor position to avoid redundant atomic commits.
+    let mut last_cursor_x: i32 = i32::MIN;
+    let mut last_cursor_y: i32 = i32::MIN;
+    let mut cursor_visible = false;
+
+    // Track last-seen client buffer dimensions for cursor scaling.
+    // When the client renders at a lower resolution than the display,
+    // the cursor image must be scaled up to match the upscaled frame.
+    let mut last_client_w: u32 = display_w;
+    let mut last_client_h: u32 = display_h;
+
+    // Track last successfully presented output buffer index so we can
+    // re-present it immediately after VT switch back (modeset) without
+    // waiting for the client to commit a new frame.
+    let mut last_presented_fb_idx: Option<usize> = None;
+
     while RUNNING.load(Ordering::Relaxed) {
         // --- Session pause: stop presenting while VT-switched away ---
         // When the session is disabled (VT switch), the kernel revokes
@@ -295,6 +326,26 @@ fn run_drm_event_loop(
                 drm.force_modeset();
                 flip_pending = false;
                 was_active = true;
+                // Re-present the last output buffer so the display shows
+                // content immediately instead of staying black until the
+                // client commits a new frame.
+                if let Some(idx) = last_presented_fb_idx
+                    && let Some(Some(fb)) = output_fb_cache.get(idx)
+                {
+                    info!(
+                        buffer_index = idx,
+                        "re-presenting last buffer after VT switch"
+                    );
+                    match drm.present(fb) {
+                        Ok(backend::FlipResult::Queued) => {
+                            flip_pending = true;
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            warn!(?e, "failed to re-present after VT switch");
+                        }
+                    }
+                }
             }
         }
 
@@ -316,6 +367,64 @@ fn run_drm_event_loop(
             }
             flip_pending = false;
             flip_ready = false;
+        }
+
+        // --- Cursor plane updates (independent of primary plane flip) ---
+        // Drain cursor image updates from the Wayland protocol layer.
+        while let Ok(update) = cursor_updates.try_recv() {
+            match update {
+                backend::wayland::CursorUpdate::Image {
+                    pixels,
+                    width,
+                    height,
+                    hotspot_x,
+                    hotspot_y,
+                } => {
+                    // Scale cursor image when the client renders at a
+                    // lower resolution than the display. Use the minimum
+                    // of X/Y scale factors to match the blitter's
+                    // aspect-preserving "contain" scaling.
+                    let scale_x = if last_client_w > 0 {
+                        display_w as f64 / last_client_w as f64
+                    } else {
+                        1.0
+                    };
+                    let scale_y = if last_client_h > 0 {
+                        display_h as f64 / last_client_h as f64
+                    } else {
+                        1.0
+                    };
+                    let scale = scale_x.min(scale_y).max(1.0);
+                    if let Err(e) =
+                        drm.update_cursor_image(&pixels, width, height, hotspot_x, hotspot_y, scale)
+                    {
+                        warn!(?e, "failed to update cursor image");
+                    } else {
+                        cursor_visible = true;
+                        // Force position update after image change.
+                        last_cursor_x = i32::MIN;
+                    }
+                }
+                backend::wayland::CursorUpdate::Hide => {
+                    if let Err(e) = drm.hide_cursor() {
+                        warn!(?e, "failed to hide cursor");
+                    }
+                    cursor_visible = false;
+                }
+            }
+        }
+
+        // Update cursor plane position when the pointer has moved.
+        if cursor_visible {
+            let cx = cursor_x.load(Ordering::Relaxed);
+            let cy = cursor_y.load(Ordering::Relaxed);
+            if cx != last_cursor_x || cy != last_cursor_y {
+                if let Err(e) = drm.update_cursor_position(cx, cy) {
+                    warn!(?e, "failed to update cursor position");
+                }
+                last_cursor_x = cx;
+                last_cursor_y = cy;
+            }
         }
 
         // Don't submit a new frame while a flip is pending — the display
@@ -366,6 +475,25 @@ fn run_drm_event_loop(
         }
 
         if let Some(buffer) = pending_buffer.take() {
+            // Track client buffer dimensions for cursor scaling.
+            match &buffer {
+                wayland::protocols::CommittedBuffer::DmaBuf { width, height, .. } => {
+                    if *width > 0 {
+                        last_client_w = *width;
+                    }
+                    if *height > 0 {
+                        last_client_h = *height;
+                    }
+                }
+                wayland::protocols::CommittedBuffer::Shm { width, height, .. } => {
+                    if *width > 0 {
+                        last_client_w = *width;
+                    }
+                    if *height > 0 {
+                        last_client_h = *height;
+                    }
+                }
+            }
             match present_committed_buffer(
                 drm,
                 buffer,
@@ -375,8 +503,11 @@ fn run_drm_event_loop(
                 &mut output_fb_cache,
                 &mut prev_scanout_fb,
             ) {
-                Ok(is_async) => {
+                Ok((is_async, buf_idx)) => {
                     flip_pending = is_async;
+                    if let Some(idx) = buf_idx {
+                        last_presented_fb_idx = Some(idx);
+                    }
                     frame_count += 1;
                     consecutive_failures = 0;
                     if frame_count % 300 == 1 {
@@ -419,8 +550,9 @@ fn run_drm_event_loop(
 ///
 /// The blitter solves the NVIDIA primary-plane limitation: the DRM plane
 /// cannot scale, so the framebuffer MUST match the CRTC mode dimensions.
-/// Returns `true` if a page flip is pending (async), `false` if the
-/// commit was synchronous (first modeset frame).
+/// Returns `(is_async, output_buffer_index)` where `is_async` is true if a
+/// page flip is pending, and `output_buffer_index` is the GBM output buffer
+/// used (blit path) or `None` (direct scanout / SHM).
 fn present_committed_buffer(
     drm: &mut backend::drm::DrmBackend,
     buffer: wayland::protocols::CommittedBuffer,
@@ -429,7 +561,7 @@ fn present_committed_buffer(
     display_h: u32,
     output_fb_cache: &mut [Option<backend::Framebuffer>],
     prev_scanout_fb: &mut Option<drm::control::framebuffer::Handle>,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<(bool, Option<usize>)> {
     use std::os::unix::io::{AsFd, AsRawFd};
 
     match buffer {
@@ -460,21 +592,26 @@ fn present_committed_buffer(
                         })
                         .collect(),
                 };
-                let fb = drm.import_dmabuf(&dmabuf)?;
-                if drm.try_direct_scanout(&fb)? {
-                    // Track the previous scanout FB for deferred destruction.
-                    // The display controller may still be scanning it out
-                    // until our page flip completes.
-                    *prev_scanout_fb = Some(fb.handle);
-                    match drm.present(&fb)? {
-                        backend::FlipResult::Queued => return Ok(true),
-                        backend::FlipResult::DirectScanout => return Ok(false),
-                        backend::FlipResult::Failed(e) => {
-                            return Err(e.context("direct scanout flip failed"));
+                // Import may fail if the client's modifier is not scanout-compatible
+                // (e.g. Linear on NVIDIA). Fall through to blit in that case.
+                match drm.import_dmabuf(&dmabuf) {
+                    Ok(fb) => {
+                        if drm.try_direct_scanout(&fb)? {
+                            *prev_scanout_fb = Some(fb.handle);
+                            match drm.present(&fb)? {
+                                backend::FlipResult::Queued => return Ok((true, None)),
+                                backend::FlipResult::DirectScanout => return Ok((false, None)),
+                                backend::FlipResult::Failed(e) => {
+                                    return Err(e.context("direct scanout flip failed"));
+                                }
+                            }
                         }
+                        // TEST_ONLY failed — fall through to blit.
+                    }
+                    Err(e) => {
+                        debug!(?e, "direct scanout import failed, falling through to blit");
                     }
                 }
-                // TEST_ONLY failed (format/modifier mismatch) — fall through to blit.
             }
 
             // --- GPU composition path ---
@@ -505,16 +642,18 @@ fn present_committed_buffer(
                 "present: using DRM framebuffer"
             );
 
+            let buf_idx = exported.buffer_index;
+
             match drm.present(out_fb)? {
-                backend::FlipResult::Queued => Ok(true),
-                backend::FlipResult::DirectScanout => Ok(false),
+                backend::FlipResult::Queued => Ok((true, Some(buf_idx))),
+                backend::FlipResult::DirectScanout => Ok((false, Some(buf_idx))),
                 backend::FlipResult::Failed(e) => Err(e.context("blitted frame flip failed")),
             }
         }
         wayland::protocols::CommittedBuffer::Shm { .. } => {
             // TODO: SHM buffers require GPU-side blit (Vulkan compositor).
             trace!("skipping SHM buffer on DRM path (not yet supported)");
-            Ok(false)
+            Ok((false, None))
         }
     }
 }

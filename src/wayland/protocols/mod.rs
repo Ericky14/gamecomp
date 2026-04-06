@@ -17,6 +17,8 @@ mod compositor;
 mod data_device;
 mod dmabuf;
 mod output;
+mod pointer_constraints;
+mod relative_pointer;
 mod seat;
 mod shm;
 mod subcompositor;
@@ -29,6 +31,8 @@ use std::sync::atomic::{AtomicBool, AtomicI32};
 
 use tracing::{debug, info};
 use wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1;
+use wayland_protocols::wp::pointer_constraints::zv1::server::zwp_pointer_constraints_v1::ZwpPointerConstraintsV1;
+use wayland_protocols::wp::relative_pointer::zv1::server::zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1;
 use wayland_protocols::xdg::shell::server::xdg_wm_base::XdgWmBase;
 use wayland_server::DisplayHandle;
 use wayland_server::backend::GlobalId;
@@ -197,6 +201,8 @@ pub struct Globals {
     pub data_device_manager: GlobalId,
     pub linux_dmabuf: GlobalId,
     pub wl_drm: GlobalId,
+    pub pointer_constraints: GlobalId,
+    pub relative_pointer_manager: GlobalId,
 }
 
 /// Register all protocol globals on the display.
@@ -227,6 +233,13 @@ pub fn register_globals(dh: &DisplayHandle, output_width: u32, output_height: u3
         },
     );
 
+    // Pointer constraints — allows clients to lock/confine the pointer.
+    let pointer_constraints = dh.create_global::<WaylandState, ZwpPointerConstraintsV1, ()>(1, ());
+
+    // Relative pointer — provides raw dx/dy while pointer is locked.
+    let relative_pointer_manager =
+        dh.create_global::<WaylandState, ZwpRelativePointerManagerV1, ()>(1, ());
+
     info!("registered Wayland protocol globals");
 
     Globals {
@@ -239,6 +252,8 @@ pub fn register_globals(dh: &DisplayHandle, output_width: u32, output_height: u3
         data_device_manager,
         linux_dmabuf,
         wl_drm,
+        pointer_constraints,
+        relative_pointer_manager,
     }
 }
 
