@@ -78,6 +78,14 @@ pub struct TrackedWindow {
     pub is_systray_icon: bool,
     /// Parent window (from `WM_TRANSIENT_FOR`). 0 = not transient.
     pub transient_for: u32,
+    /// Whether `WM_NORMAL_HINTS` specifies a fixed size (min == max).
+    /// Fixed-size windows (e.g., glxgears) are not force-resized to
+    /// the output — the compositor scales them via contain-fit instead.
+    pub size_hints_fixed: bool,
+    /// Requested width from `WM_NORMAL_HINTS` (only valid when `size_hints_fixed`).
+    pub requested_width: u32,
+    /// Requested height from `WM_NORMAL_HINTS` (only valid when `size_hints_fixed`).
+    pub requested_height: u32,
 }
 
 impl TrackedWindow {
@@ -104,6 +112,9 @@ impl TrackedWindow {
             skip_pager: false,
             is_systray_icon: false,
             transient_for: 0,
+            size_hints_fixed: false,
+            requested_width: 0,
+            requested_height: 0,
         }
     }
 
@@ -299,6 +310,11 @@ impl WindowTracker {
     /// Whether focus needs re-evaluation.
     pub fn is_focus_dirty(&self) -> bool {
         self.focus_dirty
+    }
+
+    /// Mark focus as needing re-evaluation.
+    pub fn mark_focus_dirty(&mut self) {
+        self.focus_dirty = true;
     }
 
     /// Determine focus based on current window state.

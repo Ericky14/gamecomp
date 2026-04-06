@@ -395,18 +395,21 @@ fn process_command<C: Connection>(
                 *output_width = width;
                 *output_height = height;
 
-                // Reconfigure all mapped windows to fill the new output size.
-                // Without this, clients keep their old dimensions and the
-                // compositor must upscale, causing blurry output.
-                for win in tracker.mapped_windows() {
-                    let _ = conn.configure_window(
-                        win,
-                        &ConfigureWindowAux::new()
-                            .x(0)
-                            .y(0)
-                            .width(width)
-                            .height(height),
-                    );
+                // Reconfigure fullscreen windows to fill the new output.
+                // Non-fullscreen windows keep their current size — the
+                // compositor scales them via contain-fit.
+                for win_id in tracker.mapped_windows() {
+                    let should_resize = tracker.get(win_id).is_some_and(|w| w.wants_fullscreen);
+                    if should_resize {
+                        let _ = conn.configure_window(
+                            win_id,
+                            &ConfigureWindowAux::new()
+                                .x(0)
+                                .y(0)
+                                .width(width)
+                                .height(height),
+                        );
+                    }
                 }
                 let _ = conn.flush();
             }
@@ -495,23 +498,49 @@ fn handle_x11_event<C: Connection>(
                 ),
             );
 
-            // Configure the window to fill the output before mapping.
-            // This ensures clients (e.g., Flutter/Grid) render at the full
-            // output resolution instead of their default size. Without this,
-            // clients pick a small default which the compositor must upscale,
-            // causing blurry output and broken cursor coordinate mapping.
-            let _ = conn.configure_window(
-                e.window,
-                &ConfigureWindowAux::new()
-                    .x(0)
-                    .y(0)
-                    .width(output_width)
-                    .height(output_height),
-            );
+            // Check WM_NORMAL_HINTS for fixed-size windows (e.g., glxgears).
+            let (size_fixed, hint_w, hint_h) =
+                read_size_hints(conn, e.window, atoms.wm_normal_hints);
+
+            // Read initial _NET_WM_STATE to check for fullscreen.
+            let states = read_atom_list_prop(conn, e.window, atoms.net_wm_state);
+            let wants_fullscreen = states.contains(&atoms.net_wm_state_fullscreen);
+
+            // Determine map size. Like gamescope, we pass through the
+            // window's own size by default and only force-resize when
+            // fullscreen is explicitly requested.
+            let (w, h) = if wants_fullscreen {
+                // Fullscreen — fill the output.
+                let _ = conn.configure_window(
+                    e.window,
+                    &ConfigureWindowAux::new()
+                        .x(0)
+                        .y(0)
+                        .width(output_width)
+                        .height(output_height),
+                );
+                (output_width, output_height)
+            } else if size_fixed {
+                // Fixed-size window — ensure position is 0,0 and use
+                // the hint dimensions.
+                let _ = conn.configure_window(e.window, &ConfigureWindowAux::new().x(0).y(0));
+                (hint_w, hint_h)
+            } else {
+                // Normal window — pass through its requested size.
+                // Query current geometry so we record the actual size.
+                let geom = conn
+                    .get_geometry(e.window)
+                    .ok()
+                    .and_then(|c| c.reply().ok());
+                let (gw, gh) = geom
+                    .map(|g| (u32::from(g.width), u32::from(g.height)))
+                    .unwrap_or((output_width, output_height));
+                // Position at origin but don't change size.
+                let _ = conn.configure_window(e.window, &ConfigureWindowAux::new().x(0).y(0));
+                (gw, gh)
+            };
             let _ = conn.map_window(e.window);
             let _ = conn.flush();
-
-            let (w, h) = (output_width, output_height);
 
             // Read initial properties for classification.
             let role = classify_window(conn, atoms, e.window);
@@ -548,9 +577,14 @@ fn handle_x11_event<C: Connection>(
             win.height = h;
             win.role = role;
             win.app_id = app_id;
+            win.size_hints_fixed = size_fixed;
+            win.wants_fullscreen = wants_fullscreen;
+            if size_fixed {
+                win.requested_width = hint_w;
+                win.requested_height = hint_h;
+            }
 
-            // Read initial _NET_WM_STATE flags.
-            let states = read_atom_list_prop(conn, e.window, atoms.net_wm_state);
+            // Apply initial _NET_WM_STATE flags (already read above).
             win.skip_taskbar = states.contains(&atoms.net_wm_state_skip_taskbar);
             win.skip_pager = states.contains(&atoms.net_wm_state_skip_pager);
 
@@ -639,27 +673,52 @@ fn handle_x11_event<C: Connection>(
                 let d = e.data.as_data32();
                 let action = d[0];
                 let prop_atoms = [d[1], d[2]];
+                let mut fullscreen_changed = false;
                 if let Some(win) = tracker.get_mut(e.window) {
                     for &pa in &prop_atoms {
                         if pa == 0 {
                             continue;
                         }
-                        let flag = if pa == atoms.net_wm_state_skip_taskbar {
-                            Some(&mut win.skip_taskbar)
-                        } else if pa == atoms.net_wm_state_skip_pager {
-                            Some(&mut win.skip_pager)
-                        } else {
-                            None
-                        };
-                        if let Some(f) = flag {
+                        if pa == atoms.net_wm_state_fullscreen {
                             match action {
-                                0 => *f = false, // Remove
-                                1 => *f = true,  // Add
-                                2 => *f = !*f,   // Toggle
+                                0 => win.wants_fullscreen = false,
+                                1 => win.wants_fullscreen = true,
+                                2 => win.wants_fullscreen = !win.wants_fullscreen,
+                                _ => {}
+                            }
+                            fullscreen_changed = true;
+                        } else if pa == atoms.net_wm_state_skip_taskbar {
+                            match action {
+                                0 => win.skip_taskbar = false,
+                                1 => win.skip_taskbar = true,
+                                2 => win.skip_taskbar = !win.skip_taskbar,
+                                _ => {}
+                            }
+                        } else if pa == atoms.net_wm_state_skip_pager {
+                            match action {
+                                0 => win.skip_pager = false,
+                                1 => win.skip_pager = true,
+                                2 => win.skip_pager = !win.skip_pager,
                                 _ => {}
                             }
                         }
                     }
+                }
+                if fullscreen_changed {
+                    // Resize to match new fullscreen state.
+                    let is_fs = tracker.get(e.window).is_some_and(|w| w.wants_fullscreen);
+                    if is_fs {
+                        let _ = conn.configure_window(
+                            e.window,
+                            &ConfigureWindowAux::new()
+                                .x(0)
+                                .y(0)
+                                .width(output_width)
+                                .height(output_height),
+                        );
+                        let _ = conn.flush();
+                    }
+                    tracker.mark_focus_dirty();
                 }
             }
         }
@@ -978,6 +1037,63 @@ fn read_window_prop<C: Connection>(conn: &C, window: u32, atom: X11Atom) -> u32 
     }
 }
 
+/// Size hint flags from `WM_SIZE_HINTS`.
+const P_MIN_SIZE: u32 = 1 << 4; // 16
+const P_MAX_SIZE: u32 = 1 << 5; // 32
+
+/// Read `WM_NORMAL_HINTS` and return `(is_fixed, width, height)`.
+///
+/// A window is "fixed size" when `PMinSize` and `PMaxSize` are both set
+/// and `min_width == max_width && min_height == max_height`.
+fn read_size_hints<C: Connection>(
+    conn: &C,
+    window: u32,
+    wm_normal_hints_atom: X11Atom,
+) -> (bool, u32, u32) {
+    use x11rb::protocol::xproto::ConnectionExt;
+
+    // WM_SIZE_HINTS is type WM_SIZE_HINTS (not CARDINAL). Use AnyPropertyType (0).
+    let reply = conn.get_property(false, window, wm_normal_hints_atom, 0u32, 0, 18);
+    let Ok(cookie) = reply else {
+        return (false, 0, 0);
+    };
+    let Ok(prop) = cookie.reply() else {
+        return (false, 0, 0);
+    };
+    if prop.format != 32 || prop.value_len < 9 {
+        return (false, 0, 0);
+    }
+
+    let vals = bytemuck_or_manual_u32(&prop.value);
+    if vals.len() < 9 {
+        return (false, 0, 0);
+    }
+
+    let flags = vals[0];
+    // Offsets: min_width=5, min_height=6, max_width=7, max_height=8
+    let min_w = vals[5];
+    let min_h = vals[6];
+    let max_w = vals[7];
+    let max_h = vals[8];
+
+    let has_min = flags & P_MIN_SIZE != 0;
+    let has_max = flags & P_MAX_SIZE != 0;
+    let is_fixed = has_min
+        && has_max
+        && min_w > 0
+        && min_h > 0
+        && max_w > 0
+        && max_h > 0
+        && min_w == max_w
+        && min_h == max_h;
+
+    if is_fixed {
+        (true, max_w, max_h)
+    } else {
+        (false, 0, 0)
+    }
+}
+
 /// Query the PID of the client that created an X11 window via XRes.
 ///
 /// Returns `0` if the PID cannot be determined.
@@ -1013,9 +1129,14 @@ fn update_net_wm_state_flags<C: Connection>(
     let states = read_atom_list_prop(conn, window, atoms.net_wm_state);
     let skip_taskbar = states.contains(&atoms.net_wm_state_skip_taskbar);
     let skip_pager = states.contains(&atoms.net_wm_state_skip_pager);
+    let wants_fullscreen = states.contains(&atoms.net_wm_state_fullscreen);
     if let Some(win) = tracker.get_mut(window) {
         win.skip_taskbar = skip_taskbar;
         win.skip_pager = skip_pager;
+        if win.wants_fullscreen != wants_fullscreen {
+            win.wants_fullscreen = wants_fullscreen;
+            tracker.mark_focus_dirty();
+        }
     }
 }
 
