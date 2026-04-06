@@ -11,6 +11,9 @@ High-performance single-app fullscreen Wayland compositor for gaming and robotic
 - **XWayland** — Full X11 application support with per-server XWM threads
 - **VRR support** — Variable refresh rate for compatible displays
 - **Wayland backend** — Run inside another Wayland compositor for development/testing
+- **Hardware cursor** — DRM cursor plane with dumb buffer, position updates independent of primary plane flip
+- **Pointer lock & constraints** — `zwp_pointer_constraints_v1` / `zwp_relative_pointer_v1` for FPS games and pointer-locked UIs
+- **libinput** — DPI-normalized unaccelerated pointer deltas with configurable sensitivity, automatic device hotplug
 - **Multi-XWayland** — Multiple XWayland servers with independent focus tracking and lifecycle management
 - **Focus gating** — 4-phase cross-server focus arbitration (baselayer → stealer → retention → fallback). Only the focused server's clients receive frame callbacks — zero GPU waste on unfocused servers.
 - **Baselayer control** — `GAMESCOPECTRL_BASELAYER_APPID` X11 atom for cross-server focus pinning
@@ -37,7 +40,7 @@ High-level feature goals for Gamecomp. No hard dates — contributions welcome.
 - [x] Vulkan compute shader composition (blit.comp + VulkanBlitter pipeline)
 - [x] Session switching — VT switch handling via libseat (Ctrl+Alt+Fn, pause/resume, fd revocation)
 - [x] Keyboard monitor — raw evdev with udev hotplug, modifier tracking, connect/disconnect support
-- [x] Pointer monitor — raw evdev with udev hotplug, motion/button/scroll, connect/disconnect support
+- [x] Pointer monitor — libinput with udev hotplug, DPI-normalized unaccelerated deltas, configurable sensitivity
 - [x] GBM-backed output buffer allocation (native GEM handles, no PRIME corruption)
 - [x] Async DMA-BUF implicit sync (non-blocking poll before blit)
 - [x] Input routing — keyboard, pointer, scroll forwarding to focused client (DRM evdev + nested host passthrough)
@@ -52,11 +55,14 @@ High-level feature goals for Gamecomp. No hard dates — contributions welcome.
 - [x] PID-based AppID resolution — `steam_mode` walks parent process chain for Steam reaper (`SteamLaunch AppId=N`)
 - [x] Commit-based presentation gating — old content stays visible until new focus target commits a frame
 - [x] Gamescope atom compatibility — full `GAMESCOPE_*`/`GAMESCOPECTRL_*` atom set for ecosystem tool compatibility
+- [x] Hardware cursor — DRM cursor plane via dumb buffer, independent atomic commits for position updates
+- [x] Pointer lock / constraints — `zwp_pointer_constraints_v1` (lock + confine) and `zwp_relative_pointer_v1`
+- [x] Window fill-on-map — XWayland windows configured to fill output on map and resize (no blurry upscale)
 
 ## In Progress
 
 - [ ] VRR (variable refresh rate) — frame pacer support exists, needs per-connector toggle
-- [ ] Multi-plane assignment — overlay/cursor plane offload to reduce GPU work
+- [ ] Multi-plane assignment — overlay plane offload to reduce GPU work (cursor plane done)
 - [ ] Multi-display — span or mirror across multiple connected outputs (multi-XWayland spawning done, display routing in progress)
 
 ## Planned
@@ -81,7 +87,8 @@ cargo build --release
 
 Requires Rust stable (edition 2024) and the following system dependencies:
 - `libdrm`, `libgbm` — DRM/KMS support
-- `libseat`, `libudev` — Session and device management  
+- `libinput`, `libudev` — Input handling and device management
+- `libseat` — Session management
 - `libwayland` — Wayland protocol
 - `vulkan-loader` — Vulkan runtime
 
@@ -125,6 +132,8 @@ gamecomp --xwayland-count 2 -- my-game
 | `--upscale MODE` | Upscaling algorithm: `fsr`, `nis`, `cas`, or `none` |
 | `--fps-limit N` | FPS cap (0 = match display refresh rate) |
 | `--stats-pipe PATH` | Write per-frame stats to a named pipe |
+| `--sensitivity N` | Pointer sensitivity multiplier (default: 1.0, libinput-normalized) |
+| `-e`, `--steam` | Enable Steam mode (PID-based AppID resolution) |
 | `--log LEVEL` | Log level (`trace`, `debug`, `info`, `warn`, `error`) |
 
 ## Configuration
@@ -135,6 +144,7 @@ Create `~/.config/gamecomp/config.toml`:
 vrr = true
 hdr = false
 upscale = "none"  # or "fsr", "nis", "cas"
+pointer_sensitivity = 1.0  # 1.0 = 1:1 libinput-normalized, higher = faster
 ```
 
 ## Documentation

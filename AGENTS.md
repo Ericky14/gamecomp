@@ -46,7 +46,7 @@ src/
 │   ├── mod.rs           # Input subsystem entry
 │   ├── keyboard.rs      # Evdev keyboard → Wayland forwarding
 │   ├── keyboard_tests.rs
-│   └── pointer.rs       # Evdev pointer → Wayland forwarding
+│   └── pointer.rs       # libinput pointer → Wayland forwarding (DPI-normalized)
 └── wayland/
     ├── mod.rs           # Wayland server setup, commit gating
     ├── atoms.rs         # X11 atom definitions (STEAM_GAME, GAMESCOPE_*, etc.)
@@ -55,6 +55,7 @@ src/
     └── protocols/       # Wayland protocol implementations
         ├── compositor.rs, seat.rs, output.rs, shm.rs, dmabuf.rs
         ├── xdg_shell.rs, subcompositor.rs, data_device.rs
+        ├── pointer_constraints.rs, relative_pointer.rs
         └── wl_drm.rs
 ```
 

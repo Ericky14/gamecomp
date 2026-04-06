@@ -53,9 +53,13 @@ src/
       subcompositor.rs wl_subcompositor — subsurface management
       wl_drm.rs        wl_drm — XWayland glamor GPU buffer negotiation
       xdg_shell.rs     xdg_wm_base, xdg_surface, xdg_toplevel — window management
+      pointer_constraints.rs  zwp_pointer_constraints_v1 — pointer lock and confinement
+      relative_pointer.rs     zwp_relative_pointer_v1 — raw relative motion during pointer lock
 
   input/
-    mod.rs             libinput integration, event batching, keyboard/pointer dispatch
+    mod.rs             Input event types, batching, InputHandler
+    keyboard.rs        Raw evdev keyboard — VT switch hotkeys, modifier tracking, udev hotplug
+    pointer.rs         libinput pointer — DPI-normalized unaccelerated deltas, auto-discovery, hotplug
 
   frame_pacer.rs       Adaptive VBlank scheduling, timerfd wakeups, VRR support
 ```
