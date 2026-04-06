@@ -9,6 +9,7 @@ use wayland_server::protocol::{
     wl_callback::{self, WlCallback},
     wl_compositor::{self, WlCompositor},
     wl_region::{self, WlRegion},
+    wl_shm,
     wl_surface::{self, WlSurface},
 };
 use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource};
@@ -101,17 +102,37 @@ impl Dispatch<WlSurface, SurfaceData> for WaylandState {
                         let len = (shm.stride * shm.height) as usize;
                         if let Some(pixels) = shm.pool.lock().read_pixels(shm.offset as usize, len)
                         {
-                            let hotspot_x = data.hotspot_x.load(Ordering::Relaxed);
-                            let hotspot_y = data.hotspot_y.load(Ordering::Relaxed);
-                            if let Some(ref tx) = state.cursor_tx {
-                                let _ = tx.send(crate::backend::wayland::CursorUpdate::Image {
-                                    pixels,
-                                    width: shm.width as u32,
-                                    height: shm.height as u32,
-                                    hotspot_x,
-                                    hotspot_y,
-                                });
+                            // Detect fully-transparent cursor images (e.g.,
+                            // GTK/Flutter `SystemMouseCursors.none` sends a
+                            // blank cursor surface instead of null). In
+                            // ARGB8888, alpha is byte 3 of each 4-byte pixel
+                            // on little-endian.
+                            let is_argb = shm.format == wl_shm::Format::Argb8888;
+                            let all_transparent = is_argb
+                                && pixels.len() >= 4
+                                && pixels[3..].iter().step_by(4).all(|&a| a == 0);
+                            if all_transparent {
+                                if let Some(ref tx) = state.cursor_tx {
+                                    let _ = tx.send(crate::backend::wayland::CursorUpdate::Hide);
+                                }
+                            } else if state.cursor_user_moved {
+                                let hotspot_x = data.hotspot_x.load(Ordering::Relaxed);
+                                let hotspot_y = data.hotspot_y.load(Ordering::Relaxed);
+                                if let Some(ref tx) = state.cursor_tx {
+                                    let _ = tx.send(crate::backend::wayland::CursorUpdate::Image {
+                                        pixels,
+                                        width: shm.width as u32,
+                                        height: shm.height as u32,
+                                        hotspot_x,
+                                        hotspot_y,
+                                    });
+                                }
                             }
+                        }
+                    } else {
+                        // No buffer attached — hide cursor.
+                        if let Some(ref tx) = state.cursor_tx {
+                            let _ = tx.send(crate::backend::wayland::CursorUpdate::Hide);
                         }
                     }
                     // Fire cursor surface's frame callbacks so the client

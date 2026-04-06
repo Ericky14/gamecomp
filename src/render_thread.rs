@@ -294,6 +294,10 @@ fn run_drm_event_loop(
     let mut last_cursor_y: i32 = i32::MIN;
     let mut cursor_visible = false;
 
+    // Ensure cursor plane starts hidden — DRM may retain state from
+    // a previous session or compositor.
+    let _ = drm.hide_cursor();
+
     // Track last-seen client buffer dimensions for cursor scaling.
     // When the client renders at a lower resolution than the display,
     // the cursor image must be scaled up to match the upscaled frame.

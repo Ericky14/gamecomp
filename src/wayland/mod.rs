@@ -171,6 +171,9 @@ pub struct WaylandState {
     /// The active locked pointer object (if any). Stored so we can send
     /// `unlocked` when the lock is released.
     pub locked_pointer: Option<ZwpLockedPointerV1>,
+    /// Whether the user has moved the mouse since startup. Like gamescope,
+    /// the cursor stays hidden until the first real pointer motion event.
+    pub cursor_user_moved: bool,
 }
 
 impl WaylandState {
@@ -178,8 +181,8 @@ impl WaylandState {
     pub fn new(outputs: Vec<ConnectorInfo>, width: u32, height: u32) -> Self {
         Self {
             outputs,
-            pointer_x: 0.0,
-            pointer_y: 0.0,
+            pointer_x: width as f64 / 2.0,
+            pointer_y: height as f64 / 2.0,
             focused_surface: None,
             frame_seq: 0,
             output_width: width,
@@ -212,6 +215,7 @@ impl WaylandState {
             relative_pointers: Vec::new(),
             pointer_locked: false,
             locked_pointer: None,
+            cursor_user_moved: false,
         }
     }
 
@@ -236,6 +240,14 @@ impl WaylandState {
             new_h = height,
             "updating Wayland output resolution"
         );
+
+        // Rescale pointer position proportionally so it stays at the
+        // same relative location (e.g., center stays center).
+        if self.output_width > 0 && self.output_height > 0 {
+            self.pointer_x = self.pointer_x * width as f64 / self.output_width as f64;
+            self.pointer_y = self.pointer_y * height as f64 / self.output_height as f64;
+        }
+
         self.output_width = width;
         self.output_height = height;
 
@@ -553,6 +565,7 @@ impl WaylandState {
     /// `zwp_relative_pointer_v1.relative_motion` is still emitted so the
     /// client receives raw deltas (essential for FPS camera controls).
     pub fn send_pointer_motion(&mut self, dx: f64, dy: f64, time_ms: u32) {
+        self.cursor_user_moved = true;
         // Always send relative motion (unaffected by lock).
         self.send_relative_motion(dx, dy, time_ms);
 
@@ -577,6 +590,7 @@ impl WaylandState {
     /// host surface-local coordinates to client buffer coordinates.
     /// Coordinates are clamped to `output_width × output_height`.
     pub fn send_pointer_motion_absolute(&mut self, x: f64, y: f64, time_ms: u32) {
+        self.cursor_user_moved = true;
         let w = self.output_width.max(1) as f64;
         let h = self.output_height.max(1) as f64;
 

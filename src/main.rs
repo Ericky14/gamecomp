@@ -287,6 +287,12 @@ fn run(config: Config) -> anyhow::Result<()> {
     // in the main loop — we only need the synchronization barrier here.
     xwayland_mgr::wait_for_host_configure(&host_physical_width, &host_physical_height);
 
+    // Initialize cursor position to center of screen (like gamescope).
+    let pw = host_physical_width.load(Ordering::Acquire);
+    let ph = host_physical_height.load(Ordering::Acquire);
+    cursor_x.store((pw / 2) as i32, Ordering::Relaxed);
+    cursor_y.store((ph / 2) as i32, Ordering::Relaxed);
+
     // --- Launch XWayland servers ---
     // Spawn `xwayland_count` instances. Server 0 is the platform display
     // (Steam client, etc.) and gets the full output resolution. Servers 1+

@@ -4,8 +4,8 @@ use super::*;
 fn wayland_state_new() {
     let state = WaylandState::new(Vec::new(), 1920, 1080);
     assert!(state.outputs.is_empty());
-    assert_eq!(state.pointer_x, 0.0);
-    assert_eq!(state.pointer_y, 0.0);
+    assert_eq!(state.pointer_x, 960.0);
+    assert_eq!(state.pointer_y, 540.0);
     assert!(state.focused_surface.is_none());
     assert_eq!(state.frame_seq, 0);
 }
