@@ -43,10 +43,42 @@ impl XWaylandInstance {
     }
 }
 
-/// Find a free X11 display number and return the display string (e.g., ":1").
+/// Find a free X11 display number and return the display string (e.g., ":0").
+///
+/// A display is considered free if neither its socket
+/// (`/tmp/.X11-unix/X<N>`) nor its lock file (`/tmp/.X<N>-lock`) exists.
+/// Stale lock files (whose PID is no longer running) are cleaned up so
+/// display numbers can be reused across gamecomp restarts.
 pub fn find_free_x11_display() -> anyhow::Result<String> {
-    let display_num = (0..33)
-        .find(|n| !std::path::Path::new(&format!("/tmp/.X11-unix/X{n}")).exists())
+    let display_num = (0..64)
+        .find(|n| {
+            let socket = format!("/tmp/.X11-unix/X{n}");
+            let lock = format!("/tmp/.X{n}-lock");
+            let socket_exists = std::path::Path::new(&socket).exists();
+            let lock_exists = std::path::Path::new(&lock).exists();
+
+            if !socket_exists && !lock_exists {
+                return true;
+            }
+
+            // Check if the lock holder is still alive.
+            if lock_exists
+                && let Ok(contents) = std::fs::read_to_string(&lock)
+                && let Ok(pid) = contents.trim().parse::<i32>()
+                // SAFETY: kill(pid, 0) only probes process existence.
+                && unsafe { libc::kill(pid, 0) } == 0
+            {
+                return false; // Lock holder alive — display in use.
+            }
+            // Lock holder dead or unreadable — clean up stale files.
+            if lock_exists {
+                let _ = std::fs::remove_file(&lock);
+            }
+            if socket_exists {
+                let _ = std::fs::remove_file(&socket);
+            }
+            true
+        })
         .context("no free X11 display number found")?;
     Ok(format!(":{display_num}"))
 }
@@ -193,6 +225,44 @@ pub fn monitor_xwayland(
         Err(e) => {
             warn!(?e, "error checking XWayland status");
         }
+    }
+}
+
+/// Gracefully terminate an XWayland child process.
+///
+/// Sends SIGTERM first so XWayland can clean up its lock files and
+/// `/tmp/.X11-unix/X<N>` sockets. Falls back to SIGKILL after 1 second.
+/// Removes the socket file as a safety net in case XWayland didn't
+/// clean it up (e.g., if SIGKILL was required).
+pub fn terminate_xwayland(mut child: std::process::Child, display: &str) {
+    let pid = child.id() as i32;
+    // SAFETY: Sending a signal to a known child PID.
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+
+    // Wait up to 1 s for graceful exit.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    warn!(pid, "XWayland did not exit after SIGTERM, sending SIGKILL");
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(_) => break,
+        }
+    }
+
+    // Clean up the socket file in case XWayland didn't remove it
+    // (happens when SIGKILL is used or XWayland crashes).
+    let display_num = display.trim_start_matches(':');
+    let socket_path = format!("/tmp/.X11-unix/X{display_num}");
+    if std::path::Path::new(&socket_path).exists() {
+        let _ = std::fs::remove_file(&socket_path);
     }
 }
 

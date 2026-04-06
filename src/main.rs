@@ -623,9 +623,7 @@ fn run(config: Config) -> anyhow::Result<()> {
     for srv in xwayland_servers.into_iter().rev() {
         let _ = srv.cmd_tx.send(wayland::xwayland::XwmCommand::Shutdown);
         let _ = srv.thread.join();
-        let mut child = srv.child;
-        let _ = child.kill();
-        let _ = child.wait();
+        xwayland_mgr::terminate_xwayland(srv.child, &srv.display);
     }
 
     // Wait for render thread to finish.
