@@ -400,7 +400,8 @@ fn run(config: Config) -> anyhow::Result<()> {
     }
 
     // --- Launch child command ---
-    let mut child_process = launch_child_command(&config, &xwayland_servers, xwayland_count)?;
+    let mut child_process =
+        launch_child_command(&config, &xwayland_servers, xwayland_count, &socket_name)?;
 
     // --- Main event loop ---
     info!("entering main event loop");
@@ -636,15 +637,17 @@ fn run(config: Config) -> anyhow::Result<()> {
 
 // ─── Event loop helpers ─────────────────────────────────────────────
 
-/// Launch the child process (e.g., Steam, vkcube) with the correct
-/// `DISPLAY` and `STEAM_GAME_DISPLAY_N` env vars.
+/// Launch the child process (e.g., Steam, Grid, vkcube) with the correct
+/// `DISPLAY`, `WAYLAND_DISPLAY`, and `STEAM_GAME_DISPLAY_N` env vars.
 ///
-/// `WAYLAND_DISPLAY` is explicitly removed so all apps route through
-/// XWayland (X11), where window tracking and focus gating operate.
+/// Both `WAYLAND_DISPLAY` (our compositor socket) and `DISPLAY` (XWayland
+/// server 0) are set so that native Wayland clients (e.g., Flutter/Grid)
+/// connect directly while X11 games route through XWayland.
 fn launch_child_command(
     config: &Config,
     xwayland_servers: &[XWaylandInstance],
     xwayland_count: u32,
+    socket_name: &str,
 ) -> anyhow::Result<Option<std::process::Child>> {
     let Some(ref cmd) = config.child_command else {
         return Ok(None);
@@ -655,7 +658,7 @@ fn launch_child_command(
     child_cmd
         .arg("-c")
         .arg(cmd)
-        .env_remove("WAYLAND_DISPLAY")
+        .env("WAYLAND_DISPLAY", socket_name)
         .env("DISPLAY", &xwayland_servers[0].display);
 
     // Set STEAM_GAME_DISPLAY_N env vars for game servers (1+).

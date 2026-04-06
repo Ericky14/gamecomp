@@ -201,6 +201,12 @@ impl Dispatch<WlSurface, SurfaceData> for WaylandState {
                                         })
                                     })
                                     .collect();
+                                // Stage the buffer for FPS-limited forwarding.
+                                // The main loop forwards the staged buffer to
+                                // the render thread when the FPS limiter allows.
+                                // If the client is committing faster than the
+                                // target FPS, the previous staged buffer is
+                                // silently dropped (its dup'd fds are closed).
                                 let committed = CommittedBuffer::DmaBuf {
                                     planes,
                                     width: dmabuf.width as u32,
@@ -208,12 +214,6 @@ impl Dispatch<WlSurface, SurfaceData> for WaylandState {
                                     format: dmabuf.format,
                                     modifier: dmabuf.modifier,
                                 };
-                                // Stage the buffer for FPS-limited forwarding.
-                                // The main loop forwards the staged buffer to
-                                // the render thread when the FPS limiter allows.
-                                // If the client is committing faster than the
-                                // target FPS, the previous staged buffer is
-                                // silently dropped (its dup'd fds are closed).
                                 state.staged_buffer = Some(committed);
                                 state.staged_buffer_server_index = data.server_index;
                                 state.defer_frame_callbacks();
