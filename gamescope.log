@@ -1,0 +1,45 @@
+task: Available tasks for this project:
+* bloat:                            Show binary size breakdown (requires cargo-bloat)
+* build:                            Build release binary
+* check:                            Run cargo check (fast compile validation)
+* ci:                               Run full CI pipeline (fmt check, clippy, tests)
+* clean:                            Remove build artifacts
+* deps:                             Show dependency tree
+* doc:                              Build and open documentation
+* fmt:                              Format all code
+* install:                          Build release binary and install to /usr/bin
+* lint:                             Run clippy with all features (zero warnings)
+* loc:                              Count lines of Rust source code
+* release:                          Publish a new release via semantic-release
+* run:                              Build and run (APP=program)
+* test:                             Run all tests
+* build:debug:                      Build debug binary
+* dist:all:                         Build all distributable packages      (aliases: dist)
+* dist:archive:                     Build a tar archive of the project
+* dist:prepare:                     Prepare the project for packaging
+* dist:rpm:                         Build an RPM package      (aliases: rpm)
+* docker:build:                     Build the container image used for docker:run
+* docker:run:                       Run tasks inside Docker. E.g. go-task docker:run TARGET=ci      (aliases: in-docker)
+* fmt:check:                        Check formatting without modifying files
+* overlay:ext-mark:                 Mark an existing window as an external overlay (X11_DISPLAY=:N WIN_ID=0xNNN)
+* overlay:ext-run:                  Launch an app as an external overlay on a running gamecomp (APP=program)
+* overlay:mark:                     Mark an existing window as a Steam overlay (X11_DISPLAY=:N WIN_ID=0xNNN)
+* overlay:run:                      Launch an app as a Steam overlay on a running gamecomp (APP=program)
+* overlay:test:                     Run gamecomp with an app + overlay (APP=vkcube OVERLAY_APP=glxgears)
+* overlay:unmark:                   Remove overlay atoms from a window (X11_DISPLAY=:N WIN_ID=0xNNN)
+* run:headless:                     Build and run in headless mode (APP=program)
+* run:release:                      Build and run release binary (APP=program)
+* x11:atoms:                        Dump all GAMESCOPE_* atoms from root window (X11_DISPLAY=:N)
+* x11:focus:                        Show current focus state (X11_DISPLAY=:N)
+* x11:focus-app:                    Focus a Steam AppID (X11_DISPLAY=:N APP_ID=NNN)
+* x11:focus-display:                Set which display receives input focus (X11_DISPLAY=:N TARGET=server_idx)
+* x11:focus-window:                 Focus a specific window ID (X11_DISPLAY=:N WIN_ID=NNN)
+* x11:remove-baselayer-appid:       Remove GAMESCOPECTRL_BASELAYER_APPID from root window (X11_DISPLAY=:N)
+* x11:remove-steam-game:            Remove STEAM_GAME from a window (X11_DISPLAY=:N WIN_ID=0xNNN)
+* x11:servers:                      List running gamecomp XWayland servers and their properties
+* x11:set-baselayer-appid:          Set GAMESCOPECTRL_BASELAYER_APPID on root window (X11_DISPLAY=:N APP_IDS='769,770')
+* x11:set-fps:                      Set FPS limit at runtime (X11_DISPLAY=:N FPS=NNN)
+* x11:set-resolution:               Set resolution for a server (X11_DISPLAY=:N SERVER=idx W=width H=height)
+* x11:set-steam-game:               Set STEAM_GAME on a window (X11_DISPLAY=:N WIN_ID=0xNNN APP_ID=NNN)
+* x11:windows:                      List all X11 windows on a display (X11_DISPLAY=:N)
+task: Task "run:debug" does not exist

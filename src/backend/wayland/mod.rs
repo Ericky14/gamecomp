@@ -30,7 +30,7 @@ use drm_fourcc::{DrmFormat, DrmFourcc, DrmModifier};
 use tracing::{info, warn};
 
 use super::{Backend, BackendCaps, ConnectorInfo, DmaBuf, FlipResult, Framebuffer};
-use crate::wayland::protocols::CommittedBuffer;
+use crate::wayland::protocols::CommittedFrame;
 use event_loop::{HostLoopParams, wayland_event_loop};
 
 /// Cursor update from a client, forwarded to the host compositor.
@@ -106,7 +106,7 @@ pub struct WaylandConfig {
     /// Host compositor's WAYLAND_DISPLAY (saved before we overwrite it).
     pub host_wayland_display: Option<String>,
     /// Receiver for committed frames from the Wayland server.
-    pub committed_frame_rx: Option<std::sync::mpsc::Receiver<CommittedBuffer>>,
+    pub committed_frame_rx: Option<std::sync::mpsc::Receiver<CommittedFrame>>,
     /// Receiver for cursor image updates from the Wayland server.
     pub cursor_rx: Option<std::sync::mpsc::Receiver<CursorUpdate>>,
     /// Shared atomic for detected host display refresh rate (millihertz).

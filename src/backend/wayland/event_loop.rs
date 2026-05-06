@@ -25,7 +25,7 @@ use super::host_state::HostState;
 use crate::backend::BackendError;
 use crate::backend::gpu::vulkan_blitter::VulkanBlitter;
 use crate::backend::wayland::CursorUpdate;
-use crate::wayland::protocols::{CommittedBuffer, CommittedDmaBufPlane};
+use crate::wayland::protocols::{CommittedBuffer, CommittedDmaBufPlane, CommittedFrame};
 
 /// Parameters for the host compositor event loop thread.
 pub(super) struct HostLoopParams {
@@ -35,7 +35,7 @@ pub(super) struct HostLoopParams {
     pub height: u32,
     pub title: String,
     pub host_display: Option<String>,
-    pub committed_rx: Option<std::sync::mpsc::Receiver<CommittedBuffer>>,
+    pub committed_rx: Option<std::sync::mpsc::Receiver<CommittedFrame>>,
     pub cursor_rx: Option<std::sync::mpsc::Receiver<CursorUpdate>>,
     pub detected_refresh_mhz: Arc<AtomicU32>,
     pub host_dmabuf_formats: Arc<parking_lot::Mutex<std::collections::HashMap<u32, Vec<u64>>>>,
@@ -186,6 +186,7 @@ impl PresentState {
                 height,
                 format,
                 modifier,
+                ..
             } => self.present_dmabuf(
                 &planes,
                 width,
@@ -204,6 +205,204 @@ impl PresentState {
                 stride: _,
             } => self.present_shm_content(&pixels, width, height, surfaces, shm, qh),
         }
+    }
+
+    /// Present a complete frame with optional overlay layers.
+    ///
+    /// When overlays are present, forces the Vulkan blit path and uses
+    /// `blit_composite()` to alpha-blend overlays onto the output.
+    /// When no overlays, delegates to the normal `present_frame()` path.
+    fn present_committed_frame(
+        &mut self,
+        frame: CommittedFrame,
+        host_state: &HostState,
+        surfaces: &Surfaces,
+        shm: &wl_shm::WlShm,
+        qh: &QueueHandle<HostState>,
+        event_queue: &mut EventQueue<HostState>,
+        shm_test_mode: bool,
+    ) -> bool {
+        let has_overlays = frame.overlay.is_some() || frame.external_overlay.is_some();
+
+        if !has_overlays {
+            return self.present_frame(
+                frame.app,
+                host_state,
+                surfaces,
+                shm,
+                qh,
+                event_queue,
+                shm_test_mode,
+            );
+        }
+
+        // Overlays require Vulkan composition — extract DmaBuf fields from app.
+        let CommittedBuffer::DmaBuf {
+            ref planes,
+            width,
+            height,
+            format,
+            modifier,
+            ..
+        } = frame.app
+        else {
+            // SHM + overlays not supported — present app only.
+            return self.present_frame(
+                frame.app,
+                host_state,
+                surfaces,
+                shm,
+                qh,
+                event_queue,
+                shm_test_mode,
+            );
+        };
+
+        let Some(linux_dmabuf) = &host_state.linux_dmabuf else {
+            warn!("host lacks zwp_linux_dmabuf_v1, dropping overlay frame");
+            return false;
+        };
+
+        self.ensure_blitter();
+        let Some(blitter) = self.vulkan_blitter.as_mut() else {
+            return false;
+        };
+
+        use crate::backend::gpu::vulkan_blitter::OverlayLayer;
+        use std::os::unix::io::AsFd;
+
+        // Build overlay layer descriptors.
+        let mut overlay_layers = Vec::new();
+        if let Some(CommittedBuffer::DmaBuf {
+            ref planes,
+            width,
+            height,
+            format,
+            modifier,
+            ..
+        }) = frame.overlay
+        {
+            let p = &planes[0];
+            overlay_layers.push(OverlayLayer {
+                fd: p.fd.as_fd(),
+                width,
+                height,
+                format,
+                modifier,
+                offset: p.offset,
+                stride: p.stride,
+                opacity: frame.overlay_opacity,
+            });
+        }
+        if let Some(CommittedBuffer::DmaBuf {
+            ref planes,
+            width,
+            height,
+            format,
+            modifier,
+            ..
+        }) = frame.external_overlay
+        {
+            let p = &planes[0];
+            overlay_layers.push(OverlayLayer {
+                fd: p.fd.as_fd(),
+                width,
+                height,
+                format,
+                modifier,
+                offset: p.offset,
+                stride: p.stride,
+                opacity: frame.external_overlay_opacity,
+            });
+        }
+
+        let first_plane = &planes[0];
+        let exported = match blitter.blit_composite(
+            first_plane.fd.as_fd(),
+            width,
+            height,
+            format,
+            modifier,
+            first_plane.offset,
+            first_plane.stride,
+            &overlay_layers,
+        ) {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(error = %e, "wayland: Vulkan blit_composite failed, dropping frame");
+                return false;
+            }
+        };
+
+        // Present the composited output buffer to the host.
+        let out_idx = if blitter.output_index() == 0 {
+            blitter.output_count() - 1
+        } else {
+            blitter.output_index() - 1
+        };
+
+        let host_buffer = self
+            .output_buffer_cache
+            .entry(out_idx)
+            .or_insert_with(|| {
+                let params = linux_dmabuf.create_params(qh, ());
+                let hi = (exported.modifier >> 32) as u32;
+                let lo = exported.modifier as u32;
+                for (idx, plane) in exported.planes.iter().enumerate() {
+                    params.add(
+                        plane.fd.as_fd(),
+                        idx as u32,
+                        plane.offset,
+                        plane.stride,
+                        hi,
+                        lo,
+                    );
+                }
+                info!(
+                    out_idx,
+                    modifier = format!("0x{:016x}", exported.modifier),
+                    format = format!("0x{:08x}", exported.format),
+                    width = exported.width,
+                    height = exported.height,
+                    "wayland: created host wl_buffer for overlay composite output"
+                );
+                params.create_immed(
+                    exported.width as i32,
+                    exported.height as i32,
+                    exported.format,
+                    zwp_linux_buffer_params_v1::Flags::empty(),
+                    qh,
+                    (),
+                )
+            })
+            .clone();
+
+        let (fit_w, fit_h, off_x, off_y) = contain_fit(
+            exported.width,
+            exported.height,
+            self.logical_w,
+            self.logical_h,
+        );
+
+        if let Some(ref vp) = surfaces.game_viewport {
+            vp.set_source(0.0, 0.0, exported.width as f64, exported.height as f64);
+            vp.set_destination(fit_w as i32, fit_h as i32);
+        }
+        surfaces.game_subsurface.set_position(off_x, off_y);
+        surfaces.game_surface.set_buffer_scale(1);
+        surfaces.game_surface.attach(Some(&host_buffer), 0, 0);
+        surfaces.game_surface.damage(0, 0, i32::MAX, i32::MAX);
+        surfaces.game_surface.commit();
+        surfaces.parent.commit();
+
+        self.current_shm_frame = None;
+        self.present_count += 1;
+        trace!(
+            self.present_count,
+            overlay_count = overlay_layers.len(),
+            "wayland: committed composited overlay frame"
+        );
+        true
     }
 
     /// Zero-copy or blit DMA-BUF presentation.
@@ -731,7 +930,7 @@ fn run_host_connection(
     height: u32,
     title: &str,
     host_display: Option<String>,
-    committed_rx: Option<std::sync::mpsc::Receiver<CommittedBuffer>>,
+    committed_rx: Option<std::sync::mpsc::Receiver<CommittedFrame>>,
     cursor_rx: Option<std::sync::mpsc::Receiver<CursorUpdate>>,
     detected_refresh_mhz: Arc<AtomicU32>,
     shared_host_formats: Arc<parking_lot::Mutex<std::collections::HashMap<u32, Vec<u64>>>>,
@@ -893,26 +1092,26 @@ fn run_host_connection(
         // Present committed buffers.
         let mut presented = false;
         if let Some(ref rx) = committed_rx {
-            let mut latest: Option<CommittedBuffer> = None;
+            let mut latest: Option<CommittedFrame> = None;
             let mut drain_count = 0u32;
-            while let Ok(buf) = rx.try_recv() {
-                latest = Some(buf);
+            while let Ok(frame) = rx.try_recv() {
+                latest = Some(frame);
                 drain_count += 1;
             }
             if drain_count > 0 {
                 trace!(drain_count, "wayland: drained buffers");
             }
-            if let (Some(buffer), true) = (latest, host_state.surface.is_some()) {
+            if let (Some(frame), true) = (latest, host_state.surface.is_some()) {
                 // Update the game buffer dimensions so the pointer handler
                 // can compute the correct viewport offset + scale.
-                let (bw, bh) = match &buffer {
+                let (bw, bh) = match &frame.app {
                     CommittedBuffer::DmaBuf { width, height, .. } => (*width, *height),
                     CommittedBuffer::Shm { width, height, .. } => (*width, *height),
                 };
                 host_state.game_buf_w = bw;
                 host_state.game_buf_h = bh;
-                presented = state.present_frame(
-                    buffer,
+                presented = state.present_committed_frame(
+                    frame,
                     &host_state,
                     &surfaces,
                     &shm,

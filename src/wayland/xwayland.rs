@@ -124,6 +124,9 @@ pub enum XwmCommand {
     SetFeedback { atom_name: FeedbackAtom, value: u32 },
     /// Update the global focused app/window on this server's root window.
     SetGlobalFocus { app_id: u32 },
+    /// Send Expose events to all mapped windows to force a full repaint.
+    /// Used after VT switch to restart the client's frame clock.
+    RefreshWindows,
     /// Shutdown the XWM.
     Shutdown,
 }
@@ -254,6 +257,12 @@ pub fn run_xwm(
         .check()
         .context("Composite extension not available")?;
 
+    // Register as a composite manager so GTK/GDK clients know RGBA
+    // (Depth 32) visuals are usable. Without this, toolkits fall back to
+    // Depth 24 (XRGB) and overlays lose their alpha channel.
+    register_composite_manager(&conn, screen_num, root)
+        .context("failed to register as composite manager")?;
+
     // Publish our PID on the root window for identification.
     publish_pid(&conn, root, &atoms);
 
@@ -351,6 +360,65 @@ enum ControlFlow {
     Break,
 }
 
+/// Register as a composite manager on the given screen.
+///
+/// Creates a small 1×1 window, claims the `_NET_WM_CM_S<screen>` selection,
+/// and sets `_NET_SUPPORTING_WM_CHECK` on the root window. GTK/GDK uses
+/// this to decide whether RGBA (Depth 32) visuals are available — without
+/// it, clients fall back to Depth 24 (XRGB) and lose alpha transparency.
+fn register_composite_manager<C: Connection>(
+    conn: &C,
+    screen_num: usize,
+    root: u32,
+) -> anyhow::Result<()> {
+    use x11rb::COPY_DEPTH_FROM_PARENT;
+    use x11rb::protocol::xproto::{ConnectionExt, WindowClass};
+
+    // Intern the per-screen composite manager atom.
+    let atom_name = format!("_NET_WM_CM_S{screen_num}");
+    let cm_atom = conn
+        .intern_atom(false, atom_name.as_bytes())
+        .context("failed to send InternAtom for _NET_WM_CM")?
+        .reply()
+        .context("failed to intern _NET_WM_CM atom")?
+        .atom;
+
+    // Create a small off-screen window to own the selection.
+    let wid = conn
+        .generate_id()
+        .context("failed to generate X11 window ID")?;
+    conn.create_window(
+        COPY_DEPTH_FROM_PARENT,
+        wid,
+        root,
+        0,
+        0,
+        1,
+        1,
+        0,
+        WindowClass::INPUT_ONLY,
+        0, // CopyFromParent visual
+        &Default::default(),
+    )
+    .context("failed to create composite manager window")?
+    .check()
+    .context("CreateWindow failed")?;
+
+    // Claim the _NET_WM_CM_S<screen> selection. GDK checks this to
+    // decide whether RGBA (Depth 32) visuals are usable.
+    conn.set_selection_owner(wid, cm_atom, x11rb::CURRENT_TIME)
+        .context("failed to set selection owner")?
+        .check()
+        .context("SetSelectionOwner failed")?;
+
+    conn.flush()
+        .context("failed to flush after CM registration")?;
+
+    info!(atom_name, wid, "registered as composite manager");
+
+    Ok(())
+}
+
 /// Publish the compositor PID on the root window for identification.
 fn publish_pid<C: Connection>(conn: &C, root: u32, atoms: &Atoms) {
     use x11rb::protocol::xproto::{AtomEnum, PropMode};
@@ -395,11 +463,11 @@ fn process_command<C: Connection>(
                 *output_width = width;
                 *output_height = height;
 
-                // Reconfigure fullscreen windows to fill the new output.
-                // Non-fullscreen windows keep their current size — the
-                // compositor scales them via contain-fit.
+                // Reconfigure non-fixed-size windows to fill the new
+                // output. Fixed-size windows (WM_NORMAL_HINTS min==max)
+                // keep their current dimensions.
                 for win_id in tracker.mapped_windows() {
-                    let should_resize = tracker.get(win_id).is_some_and(|w| w.wants_fullscreen);
+                    let should_resize = tracker.get(win_id).is_some_and(|w| !w.size_hints_fixed);
                     if should_resize {
                         let _ = conn.configure_window(
                             win_id,
@@ -457,6 +525,35 @@ fn process_command<C: Connection>(
             );
             let _ = conn.flush();
         }
+        Ok(XwmCommand::RefreshWindows) => {
+            use x11rb::protocol::xproto::{ConnectionExt as _, ExposeEvent};
+            for win_id in tracker.mapped_windows() {
+                if let Some(win) = tracker.get(win_id) {
+                    let event = ExposeEvent {
+                        response_type: x11rb::protocol::xproto::EXPOSE_EVENT,
+                        sequence: 0,
+                        window: win_id,
+                        x: 0,
+                        y: 0,
+                        width: win.width as u16,
+                        height: win.height as u16,
+                        count: 0,
+                    };
+                    // Use NO_EVENT so the event is delivered to the
+                    // window owner regardless of their event-mask
+                    // selections. Modern DRI3/Present clients (Flutter)
+                    // don't select ExposureMask, so EXPOSURE would
+                    // silently drop the event.
+                    let _ = conn.send_event(
+                        false,
+                        win_id,
+                        x11rb::protocol::xproto::EventMask::NO_EVENT,
+                        event,
+                    );
+                }
+            }
+            let _ = conn.flush();
+        }
         Err(std::sync::mpsc::TryRecvError::Empty) => {}
         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
             info!("XWM command channel disconnected, shutting down");
@@ -506,11 +603,19 @@ fn handle_x11_event<C: Connection>(
             let states = read_atom_list_prop(conn, e.window, atoms.net_wm_state);
             let wants_fullscreen = states.contains(&atoms.net_wm_state_fullscreen);
 
-            // Determine map size. Like gamescope, we pass through the
-            // window's own size by default and only force-resize when
-            // fullscreen is explicitly requested.
-            let (w, h) = if wants_fullscreen {
-                // Fullscreen — fill the output.
+            // Determine map size. Gaming compositor policy: App and
+            // PlatformClient windows fill the output so the client
+            // renders at the correct resolution. Fixed-size windows
+            // (WM_NORMAL_HINTS min==max) are left alone.
+            let (w, h) = if size_fixed {
+                // Fixed-size window — ensure position is 0,0 and use
+                // the hint dimensions.
+                let _ = conn.configure_window(e.window, &ConfigureWindowAux::new().x(0).y(0));
+                (hint_w, hint_h)
+            } else {
+                // Non-fixed window — fill the output so the client
+                // renders at display resolution. This covers both
+                // explicit fullscreen and normal app windows.
                 let _ = conn.configure_window(
                     e.window,
                     &ConfigureWindowAux::new()
@@ -520,24 +625,6 @@ fn handle_x11_event<C: Connection>(
                         .height(output_height),
                 );
                 (output_width, output_height)
-            } else if size_fixed {
-                // Fixed-size window — ensure position is 0,0 and use
-                // the hint dimensions.
-                let _ = conn.configure_window(e.window, &ConfigureWindowAux::new().x(0).y(0));
-                (hint_w, hint_h)
-            } else {
-                // Normal window — pass through its requested size.
-                // Query current geometry so we record the actual size.
-                let geom = conn
-                    .get_geometry(e.window)
-                    .ok()
-                    .and_then(|c| c.reply().ok());
-                let (gw, gh) = geom
-                    .map(|g| (u32::from(g.width), u32::from(g.height)))
-                    .unwrap_or((output_width, output_height));
-                // Position at origin but don't change size.
-                let _ = conn.configure_window(e.window, &ConfigureWindowAux::new().x(0).y(0));
-                (gw, gh)
             };
             let _ = conn.map_window(e.window);
             let _ = conn.flush();
@@ -754,9 +841,16 @@ fn publish_focus_feedback<C: Connection>(
         std::sync::atomic::Ordering::Relaxed,
     );
 
-    // Set X11 input focus so XWayland forwards keyboard events to the
-    // focused window. Without this, key events are discarded.
-    let focus_target = focus.overlay.or(focus.app);
+    // Set X11 input focus based on overlay input_focus_mode priority.
+    // Gamescope priority: external_overlay > steam_overlay > app.
+    // Only overlays with input_focus_mode > 0 grab input focus.
+    let focus_target = if focus.external_overlay_input_focus_mode > 0 {
+        focus.external_overlay
+    } else if focus.overlay_input_focus_mode > 0 {
+        focus.overlay
+    } else {
+        focus.app
+    };
     if let Some(win_id) = focus_target {
         let _ = conn.set_input_focus(InputFocus::NONE, win_id, x11rb::CURRENT_TIME);
     }
@@ -826,18 +920,24 @@ fn handle_property_notify<C: Connection>(
             let val = read_u32_prop(conn, window, atoms.steam_overlay);
             if val > 0 {
                 tracker.set_role(window, WindowRole::Overlay);
+            } else {
+                tracker.set_role(window, WindowRole::App);
             }
             debug!(window, val, "STEAM_OVERLAY changed");
         } else if atom == atoms.steam_bigpicture {
             let val = read_u32_prop(conn, window, atoms.steam_bigpicture);
             if val > 0 {
                 tracker.set_role(window, WindowRole::PlatformClient);
+            } else {
+                tracker.set_role(window, WindowRole::App);
             }
             debug!(window, val, "STEAM_BIGPICTURE changed");
         } else if atom == atoms.external_overlay {
             let val = read_u32_prop(conn, window, atoms.external_overlay);
             if val > 0 {
                 tracker.set_role(window, WindowRole::ExternalOverlay);
+            } else {
+                tracker.set_role(window, WindowRole::App);
             }
             debug!(window, val, "GAMESCOPE_EXTERNAL_OVERLAY changed");
         } else if atom == atoms.net_wm_opacity {

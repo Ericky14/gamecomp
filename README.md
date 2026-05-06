@@ -58,6 +58,7 @@ High-level feature goals for Gamecomp. No hard dates — contributions welcome.
 - [x] Hardware cursor — DRM cursor plane via dumb buffer, independent atomic commits for position updates
 - [x] Pointer lock / constraints — `zwp_pointer_constraints_v1` (lock + confine) and `zwp_relative_pointer_v1`
 - [x] Window fill-on-map — XWayland windows configured to fill output on map and resize (no blurry upscale)
+- [x] Overlay composition — Steam Overlay and external overlay (Vulkan multi-layer alpha blend, per-surface commit gating, input focus routing)
 
 ## In Progress
 
@@ -67,7 +68,6 @@ High-level feature goals for Gamecomp. No hard dates — contributions welcome.
 
 ## Planned
 
-- [ ] **Overlay composition** — Steam Overlay and external overlay rendering (window classification exists, composition layer not wired up)
 - [ ] **Fullscreen handling** — `_NET_WM_STATE_FULLSCREEN` atom support (atom interned, handler not implemented)
 - [ ] **HDR** — HDR10 metadata passthrough, PQ tone mapping (feature-gated: `hdr`)
 - [ ] **FSR upscaling** — AMD FidelityFX Super Resolution via compute shader (`fsr`)

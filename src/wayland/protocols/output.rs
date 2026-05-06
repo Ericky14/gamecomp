@@ -36,7 +36,7 @@ impl GlobalDispatch<WlOutput, OutputData> for WaylandState {
             wl_output::Mode::Current | wl_output::Mode::Preferred,
             data.width as i32,
             data.height as i32,
-            60_000, // 60 Hz in mHz
+            state.output_refresh_mhz as i32,
         );
         output.scale(1);
         output.done();

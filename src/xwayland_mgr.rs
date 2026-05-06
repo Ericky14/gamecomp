@@ -14,6 +14,11 @@ use tracing::{error, info, warn};
 use crate::focus::ServerFocusState;
 use crate::wayland::{self, WaylandServer};
 
+/// Maximum number of consecutive respawn attempts before giving up.
+const MAX_RESPAWNS: u32 = 10;
+/// Initial respawn backoff delay.
+const RESPAWN_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Per-XWayland server state managed by the main thread.
 pub struct XWaylandInstance {
     /// X11 display string (e.g., ":1").
@@ -30,6 +35,10 @@ pub struct XWaylandInstance {
     pub focused_app_id: Arc<AtomicU32>,
     /// Per-server focused surface protocol ID (XWM thread writes, main loop reads).
     pub focused_wl_surface_id: Arc<AtomicU32>,
+    /// Consecutive respawn failures (reset on successful stable run).
+    pub respawn_failures: u32,
+    /// Whether this server has permanently failed and should not be respawned.
+    pub permanently_failed: bool,
 }
 
 impl XWaylandInstance {
@@ -49,9 +58,18 @@ impl XWaylandInstance {
 /// (`/tmp/.X11-unix/X<N>`) nor its lock file (`/tmp/.X<N>-lock`) exists.
 /// Stale lock files (whose PID is no longer running) are cleaned up so
 /// display numbers can be reused across gamecomp restarts.
-pub fn find_free_x11_display() -> anyhow::Result<String> {
+///
+/// `exclude` lists display strings already allocated by this compositor
+/// instance (e.g., `[":2"]`), preventing TOCTOU races between
+/// sequential server launches.
+pub fn find_free_x11_display(exclude: &[String]) -> anyhow::Result<String> {
     let display_num = (0..64)
         .find(|n| {
+            // Skip displays already allocated to our own servers.
+            let candidate = format!(":{n}");
+            if exclude.contains(&candidate) {
+                return false;
+            }
             let socket = format!("/tmp/.X11-unix/X{n}");
             let lock = format!("/tmp/.X{n}-lock");
             let socket_exists = std::path::Path::new(&socket).exists();
@@ -65,10 +83,19 @@ pub fn find_free_x11_display() -> anyhow::Result<String> {
             if lock_exists
                 && let Ok(contents) = std::fs::read_to_string(&lock)
                 && let Ok(pid) = contents.trim().parse::<i32>()
-                // SAFETY: kill(pid, 0) only probes process existence.
-                && unsafe { libc::kill(pid, 0) } == 0
             {
-                return false; // Lock holder alive — display in use.
+                // SAFETY: kill(pid, 0) only probes process existence.
+                let ret = unsafe { libc::kill(pid, 0) };
+                if ret == 0 {
+                    return false; // Lock holder alive — display in use.
+                }
+                // kill() returned -1. Check errno: EPERM means the process
+                // exists but is owned by another user (e.g., display manager).
+                // Only ESRCH means the process is truly dead.
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EPERM) {
+                    return false; // Process alive, different user — display in use.
+                }
             }
             // Lock holder dead or unreadable — clean up stale files.
             if lock_exists {
@@ -76,6 +103,12 @@ pub fn find_free_x11_display() -> anyhow::Result<String> {
             }
             if socket_exists {
                 let _ = std::fs::remove_file(&socket);
+            }
+            // Verify cleanup succeeded. On sticky-bit directories like /tmp,
+            // only the file owner (or root) can delete. If the socket or lock
+            // still exists after our remove attempt, we cannot use this display.
+            if std::path::Path::new(&socket).exists() || std::path::Path::new(&lock).exists() {
+                return false;
             }
             true
         })
@@ -201,27 +234,77 @@ pub fn spawn_xwayland(
 /// The XWM thread's retry loop will re-establish the window manager
 /// connection automatically.
 pub fn monitor_xwayland(
-    child: &mut std::process::Child,
-    display: &str,
+    instance: &mut XWaylandInstance,
     socket: &str,
     server: &mut WaylandServer,
     state: &mut wayland::WaylandState,
-    server_index: u32,
 ) {
-    match child.try_wait() {
+    if instance.permanently_failed {
+        return;
+    }
+
+    match instance.child.try_wait() {
         Ok(Some(status)) => {
-            warn!(?status, "XWayland exited, respawning");
-            match spawn_xwayland(display, socket, server, state, server_index) {
+            instance.respawn_failures += 1;
+
+            if instance.respawn_failures > MAX_RESPAWNS {
+                error!(
+                    server_index = instance.index,
+                    display = %instance.display,
+                    attempts = instance.respawn_failures,
+                    "XWayland exceeded max respawn attempts, giving up"
+                );
+                instance.permanently_failed = true;
+                return;
+            }
+
+            let backoff = RESPAWN_BACKOFF_BASE * instance.respawn_failures;
+            warn!(
+                ?status,
+                server_index = instance.index,
+                attempt = instance.respawn_failures,
+                max = MAX_RESPAWNS,
+                backoff_ms = backoff.as_millis() as u64,
+                "XWayland exited, respawning"
+            );
+            std::thread::sleep(backoff);
+
+            // Clean up stale socket/lock files before respawning.
+            let display_num = instance.display.trim_start_matches(':');
+            let socket_path = format!("/tmp/.X11-unix/X{display_num}");
+            let lock_path = format!("/tmp/.X{display_num}-lock");
+            if std::path::Path::new(&socket_path).exists() {
+                let _ = std::fs::remove_file(&socket_path);
+            }
+            if std::path::Path::new(&lock_path).exists() {
+                let _ = std::fs::remove_file(&lock_path);
+            }
+
+            match spawn_xwayland(&instance.display, socket, server, state, instance.index) {
                 Ok(new_child) => {
-                    *child = new_child;
-                    info!("XWayland respawned successfully");
+                    instance.child = new_child;
+                    info!(
+                        server_index = instance.index,
+                        display = %instance.display,
+                        "XWayland respawned successfully"
+                    );
                 }
                 Err(e) => {
-                    error!(?e, "failed to respawn XWayland");
+                    error!(
+                        ?e,
+                        server_index = instance.index,
+                        "failed to respawn XWayland"
+                    );
                 }
             }
         }
-        Ok(None) => {} // Still running.
+        Ok(None) => {
+            // Still running — reset failure counter so transient crashes
+            // don't accumulate across long healthy stretches.
+            if instance.respawn_failures > 0 {
+                instance.respawn_failures = 0;
+            }
+        }
         Err(e) => {
             warn!(?e, "error checking XWayland status");
         }

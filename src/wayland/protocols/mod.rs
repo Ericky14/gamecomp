@@ -16,8 +16,10 @@
 mod compositor;
 mod data_device;
 mod dmabuf;
+pub mod drm_syncobj;
 mod output;
 mod pointer_constraints;
+pub mod presentation;
 mod relative_pointer;
 mod seat;
 mod shm;
@@ -31,7 +33,9 @@ use std::sync::atomic::{AtomicBool, AtomicI32};
 
 use tracing::{debug, info};
 use wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1;
+use wayland_protocols::wp::linux_drm_syncobj::v1::server::wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1;
 use wayland_protocols::wp::pointer_constraints::zv1::server::zwp_pointer_constraints_v1::ZwpPointerConstraintsV1;
+use wayland_protocols::wp::presentation_time::server::wp_presentation::WpPresentation;
 use wayland_protocols::wp::relative_pointer::zv1::server::zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1;
 use wayland_protocols::xdg::shell::server::xdg_wm_base::XdgWmBase;
 use wayland_server::DisplayHandle;
@@ -49,6 +53,7 @@ use wayland_server::protocol::{
 use super::WaylandState;
 
 pub use dmabuf::{DmaBufBufferData, DmaBufPlaneInfo};
+pub use drm_syncobj::{SyncPoint, SyncobjDevice, SyncobjGlobalData};
 pub use output::OutputData;
 pub use shm::ShmBufferData;
 
@@ -75,6 +80,12 @@ pub struct SurfaceData {
     /// mapping so the commit handler can disambiguate surfaces with the
     /// same protocol_id across different XWayland servers.
     pub server_index: u32,
+    /// Pending `wp_presentation_feedback` callbacks for this surface.
+    /// Filled by `wp_presentation.feedback` requests, drained on commit
+    /// and moved into `WaylandState.staged_feedbacks`.
+    pub pending_feedbacks: Mutex<
+        Vec<wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::WpPresentationFeedback>,
+    >,
 }
 
 /// Wrapper enum for `WlBuffer` user data — either SHM or DMA-BUF.
@@ -110,6 +121,12 @@ pub enum CommittedBuffer {
         format: u32,
         /// DRM modifier.
         modifier: u64,
+        /// Explicit sync acquire point. When set, the render thread must
+        /// wait for this timeline point before reading the buffer.
+        acquire_point: Option<SyncPoint>,
+        /// Explicit sync release point. When set, the render thread signals
+        /// this timeline point instead of relying on `wl_buffer.release`.
+        release_point: Option<SyncPoint>,
     },
     /// SHM CPU-copy fallback.
     Shm {
@@ -122,6 +139,106 @@ pub enum CommittedBuffer {
         /// Stride in bytes.
         stride: u32,
     },
+}
+
+impl CommittedBuffer {
+    /// Duplicate the buffer by dup'ing all owned file descriptors.
+    ///
+    /// Used to keep an overlay buffer alive across frames while sending
+    /// a copy to the render thread.
+    pub fn try_dup(&self) -> std::io::Result<Self> {
+        match self {
+            Self::DmaBuf {
+                planes,
+                width,
+                height,
+                format,
+                modifier,
+                acquire_point,
+                release_point,
+            } => {
+                let mut dup_planes = Vec::with_capacity(planes.len());
+                for p in planes {
+                    dup_planes.push(CommittedDmaBufPlane {
+                        fd: p.fd.try_clone()?,
+                        offset: p.offset,
+                        stride: p.stride,
+                    });
+                }
+                Ok(Self::DmaBuf {
+                    planes: dup_planes,
+                    width: *width,
+                    height: *height,
+                    format: *format,
+                    modifier: *modifier,
+                    acquire_point: acquire_point.clone(),
+                    release_point: release_point.clone(),
+                })
+            }
+            Self::Shm {
+                pixels,
+                width,
+                height,
+                stride,
+            } => Ok(Self::Shm {
+                pixels: pixels.clone(),
+                width: *width,
+                height: *height,
+                stride: *stride,
+            }),
+        }
+    }
+}
+
+impl CommittedBuffer {
+    /// Signal the explicit sync release point (if any) and discard it.
+    ///
+    /// **Must** be called before dropping a `CommittedBuffer` whose frame
+    /// will never be presented (e.g., coalesced / replaced). Without this,
+    /// the client永远 waits for the release signal and its buffer pool gets
+    /// exhausted, causing a rendering freeze.
+    pub fn signal_release(&mut self, device: &SyncobjDevice) {
+        if let Self::DmaBuf { release_point, .. } = self
+            && let Some(rp) = release_point.take()
+        {
+            let _ = device.timeline_signal(rp.handle(), rp.point);
+        }
+    }
+}
+
+/// A complete frame with optional overlay layers.
+///
+/// Sent through the channel to the render thread / wayland backend.
+/// Contains the primary app buffer plus optional overlay buffers for
+/// multi-layer composition.
+pub struct CommittedFrame {
+    /// Primary application buffer (always present).
+    pub app: CommittedBuffer,
+    /// Steam overlay buffer (LAYER_OVERLAY). `None` if no overlay visible.
+    pub overlay: Option<CommittedBuffer>,
+    /// External overlay buffer (LAYER_EXTERNAL_OVERLAY). `None` if no external
+    /// overlay visible.
+    pub external_overlay: Option<CommittedBuffer>,
+    /// Overlay opacity (0.0–1.0, from `_NET_WM_OPACITY`).
+    pub overlay_opacity: f32,
+    /// External overlay opacity (0.0–1.0).
+    pub external_overlay_opacity: f32,
+}
+
+impl CommittedFrame {
+    /// Signal all explicit sync release points in this frame.
+    ///
+    /// Called when discarding a frame that will never be presented
+    /// (coalesced in the render thread or replaced in the staging area).
+    pub fn signal_release_points(&mut self, device: &SyncobjDevice) {
+        self.app.signal_release(device);
+        if let Some(ref mut buf) = self.overlay {
+            buf.signal_release(device);
+        }
+        if let Some(ref mut buf) = self.external_overlay {
+            buf.signal_release(device);
+        }
+    }
 }
 
 // ─── Fence sync ─────────────────────────────────────────────────────
@@ -203,10 +320,17 @@ pub struct Globals {
     pub wl_drm: GlobalId,
     pub pointer_constraints: GlobalId,
     pub relative_pointer_manager: GlobalId,
+    pub presentation: GlobalId,
+    pub drm_syncobj: Option<GlobalId>,
 }
 
 /// Register all protocol globals on the display.
-pub fn register_globals(dh: &DisplayHandle, output_width: u32, output_height: u32) -> Globals {
+pub fn register_globals(
+    dh: &DisplayHandle,
+    output_width: u32,
+    output_height: u32,
+    syncobj_device: Option<SyncobjDevice>,
+) -> Globals {
     let compositor = dh.create_global::<WaylandState, WlCompositor, ()>(6, ());
     let subcompositor = dh.create_global::<WaylandState, WlSubcompositor, ()>(1, ());
     let shm = dh.create_global::<WaylandState, WlShm, ()>(2, ());
@@ -240,6 +364,27 @@ pub fn register_globals(dh: &DisplayHandle, output_width: u32, output_height: u3
     let relative_pointer_manager =
         dh.create_global::<WaylandState, ZwpRelativePointerManagerV1, ()>(1, ());
 
+    // wp_presentation_time — accurate frame presentation feedback.
+    // Critical for XWayland's X11 Present extension; without it,
+    // GTK/Flutter clients fall back to a software 60Hz timer.
+    let presentation = dh.create_global::<WaylandState, WpPresentation, ()>(2, ());
+
+    // wp_linux_drm_syncobj_manager_v1 — explicit GPU synchronization.
+    // Only available in DRM mode when the kernel supports syncobj_eventfd.
+    // XWayland uses this for zero-copy flip mode: acquire fences tell the
+    // compositor when the client GPU finishes, release fences tell the
+    // client when the display is done scanning out the buffer.
+    let drm_syncobj = syncobj_device.map(|device| {
+        let global = dh.create_global::<WaylandState, WpLinuxDrmSyncobjManagerV1, SyncobjGlobalData>(
+            1,
+            SyncobjGlobalData {
+                device: Some(device),
+            },
+        );
+        info!("wp_linux_drm_syncobj_manager_v1: registered");
+        global
+    });
+
     info!("registered Wayland protocol globals");
 
     Globals {
@@ -254,6 +399,8 @@ pub fn register_globals(dh: &DisplayHandle, output_width: u32, output_height: u3
         wl_drm,
         pointer_constraints,
         relative_pointer_manager,
+        presentation,
+        drm_syncobj,
     }
 }
 

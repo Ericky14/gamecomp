@@ -466,7 +466,7 @@ impl FrameBuilder {
 
     /// Add an overlay layer at the given position.
     ///
-    /// Places the layer at [`LAYER_OVERLAY`] (index 2).
+    /// Places the layer at [`LAYER_OVERLAY`] (index 4).
     pub fn with_overlay(
         mut self,
         texture_index: u32,
@@ -504,9 +504,51 @@ impl FrameBuilder {
         self
     }
 
+    /// Add an external overlay layer at the given position.
+    ///
+    /// Places the layer at [`LAYER_EXTERNAL_OVERLAY`] (index 3).
+    /// External overlays render below the Steam overlay but above the app,
+    /// matching gamescope's z-order.
+    pub fn with_external_overlay(
+        mut self,
+        texture_index: u32,
+        x: i32,
+        y: i32,
+        w: u32,
+        h: u32,
+        opacity: f32,
+    ) -> Self {
+        use crate::compositor::scene::LAYER_EXTERNAL_OVERLAY;
+        self.frame.layers[LAYER_EXTERNAL_OVERLAY] = Layer {
+            texture_index,
+            active: true,
+            src: Rect {
+                x: 0,
+                y: 0,
+                width: w,
+                height: h,
+            },
+            dst: Rect {
+                x,
+                y,
+                width: w,
+                height: h,
+            },
+            opacity,
+            filter: FilterMode::Linear,
+            color_space: ColorSpace::Srgb,
+            blend: BlendMode::AlphaPreMultiplied,
+            format: DrmFourcc::Argb8888 as u32,
+        };
+        if self.frame.layer_count <= LAYER_EXTERNAL_OVERLAY as u32 {
+            self.frame.layer_count = (LAYER_EXTERNAL_OVERLAY + 1) as u32;
+        }
+        self
+    }
+
     /// Add a cursor layer.
     ///
-    /// Places the layer at [`LAYER_CURSOR`] (index 3).
+    /// Places the layer at [`LAYER_CURSOR`] (index 5).
     pub fn with_cursor(mut self, texture_index: u32, x: i32, y: i32) -> Self {
         use crate::compositor::scene::LAYER_CURSOR;
         self.frame.layers[LAYER_CURSOR] = Layer {

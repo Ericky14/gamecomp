@@ -35,7 +35,7 @@ use wayland_protocols::xdg::shell::server::xdg_toplevel::XdgToplevel;
 
 use crate::backend::ConnectorInfo;
 use crate::backend::wayland::CursorUpdate;
-use crate::wayland::protocols::CommittedBuffer;
+use crate::wayland::protocols::{CommittedBuffer, CommittedFrame};
 
 /// Per-client data stored with each Wayland client connection.
 struct ClientData;
@@ -81,20 +81,34 @@ pub struct WaylandState {
     /// Output resolution for configure events.
     pub output_width: u32,
     pub output_height: u32,
+    /// Output refresh rate in mHz (e.g. 144000 for 144Hz). Advertised
+    /// to clients via `wl_output.mode`. Updated when the DRM/host display
+    /// refresh rate is detected.
+    pub output_refresh_mhz: u32,
     /// Serial counter for configure events.
     serial: u32,
-    /// Pending frame callbacks to fire on next present.
-    pub pending_frame_callbacks: Vec<WlCallback>,
-    /// Deferred frame callbacks — withheld by the FPS limiter until it's
-    /// time for the client to render the next frame. Moved here from
-    /// `pending_frame_callbacks` on commit; fired by the main loop when
-    /// the limiter allows.
-    pub deferred_frame_callbacks: Vec<WlCallback>,
-    /// Set to `true` on each `wl_surface.commit` that has a buffer.
-    /// Cleared after deferred callbacks are fired.
-    pub has_pending_commit: bool,
+    /// Per-surface pending frame callbacks.
+    ///
+    /// Key: `(wl_surface protocol_id, server_index)`.
+    /// Callbacks are pushed here on `wl_surface.frame()`.
+    /// Moved to `surface_deferred_callbacks` on commit for App surfaces
+    /// (FPS-limited path), or fired immediately for overlays / cursors /
+    /// rejected commits.
+    pub surface_callbacks: std::collections::HashMap<(u32, u32), Vec<WlCallback>>,
+    /// Per-surface deferred frame callbacks.
+    ///
+    /// Key: `(wl_surface protocol_id, server_index)`.
+    /// Moved here from `surface_callbacks` on App commit; fired by the
+    /// main loop on each vblank tick alongside buffer releases. This
+    /// matches gamescope's `receivedDoneCommit` + `unlockedForFrameCallback`
+    /// gate: callbacks fire on the first vblank after commit, AT THE SAME
+    /// TIME as `wl_buffer.release`. The synchronous delivery is critical —
+    /// XWayland's Present extension uses both events together to calibrate
+    /// its MSC timing, and desynchronizing them causes 250ms hiccups on
+    /// idle→active transitions.
+    pub surface_deferred_callbacks: std::collections::HashMap<(u32, u32), Vec<WlCallback>>,
     /// Channel to send committed frames to the wayland backend for presentation.
-    pub frame_channel: Option<std::sync::mpsc::Sender<CommittedBuffer>>,
+    pub frame_channel: Option<std::sync::mpsc::Sender<CommittedFrame>>,
     /// Staged committed buffer awaiting FPS-limited forwarding.
     ///
     /// On `wl_surface.commit`, the latest buffer is staged here instead of
@@ -116,6 +130,23 @@ pub struct WaylandState {
     /// [`release_one_buffer`], keeping the client's frame count in
     /// lockstep with the compositor's display rate.
     pub held_buffers: Vec<wayland_server::protocol::wl_buffer::WlBuffer>,
+    /// Presentation feedback callbacks attached to the current `staged_buffer`.
+    /// Moved from `SurfaceData.pending_feedbacks` on commit. If a newer commit
+    /// replaces the staged buffer before forwarding, these are `discarded()`.
+    pub staged_feedbacks: Vec<
+        wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::WpPresentationFeedback,
+    >,
+    /// Presentation feedback callbacks for the buffer currently in the
+    /// display pipeline (forwarded to render thread, awaiting page flip).
+    /// Sent `presented(...)` when the page flip completes.
+    pub inflight_feedbacks: Vec<
+        wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::WpPresentationFeedback,
+    >,
+    /// Monotonic sequence counter for presentation events (MSC).
+    pub presentation_sequence: u64,
+    /// Number of `wp_presentation.feedback` requests received (ever).
+    /// Observable indicator that a client actually uses the protocol.
+    pub presentation_requests: u64,
     /// Host compositor's DMA-BUF format→modifier map. Populated by the wayland
     /// backend's event thread after connecting to the host. Used by the dmabuf
     /// module to advertise formats that allow zero-copy forwarding to the host.
@@ -131,10 +162,20 @@ pub struct WaylandState {
     /// Surfaces that have an xdg_toplevel role. Used preferentially for
     /// focus enter — cursor and subsurfaces are ignored.
     pub toplevel_surfaces: Vec<WlSurface>,
-    /// Client IDs that have already received `wl_keyboard.enter`.
-    pub keyboard_entered_clients: std::collections::HashSet<wayland_server::backend::ClientId>,
-    /// Client IDs that have already received `wl_pointer.enter`.
-    pub pointer_entered_clients: std::collections::HashSet<wayland_server::backend::ClientId>,
+    /// Map of currently-entered keyboard `(client, resource id)` →
+    /// `(surface client, surface id)` it was entered on.
+    ///
+    /// Wayland protocol IDs are *per-client*, so the key must include the
+    /// client to avoid collisions when a disconnected client's IDs are
+    /// reused by a new client.
+    pub entered_keyboards: std::collections::HashMap<
+        (wayland_server::backend::ClientId, u32),
+        (wayland_server::backend::ClientId, u32),
+    >,
+    pub entered_pointers: std::collections::HashMap<
+        (wayland_server::backend::ClientId, u32),
+        (wayland_server::backend::ClientId, u32),
+    >,
     /// Bound `wl_output` objects — used to send mode updates on resize.
     pub bound_outputs: Vec<WlOutput>,
     /// Active `xdg_toplevel` objects — used to re-configure on output resize.
@@ -149,6 +190,31 @@ pub struct WaylandState {
     /// `focused_wl_surface_id` to uniquely identify the focused surface
     /// across multiple XWayland servers (protocol_id is per-client).
     pub focused_server_index: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// Overlay surface protocol ID. Written by XWM when overlay focus
+    /// changes. The commit handler accepts commits from this surface
+    /// alongside the focused app surface.
+    pub overlay_wl_surface_id: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// Overlay server index.
+    pub overlay_server_index: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// External overlay surface protocol ID.
+    pub external_overlay_wl_surface_id: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// External overlay server index.
+    pub external_overlay_server_index: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// Steam overlay input focus mode (from `STEAM_INPUT_FOCUS`).
+    /// 0=none, 1=overlay grabs all input, 2=overlay grabs pointer only
+    /// (keyboard stays with the app — gamescope-compatible).
+    pub overlay_input_focus_mode: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// External overlay input focus mode (same semantics as above).
+    pub external_overlay_input_focus_mode: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// Staged overlay buffer (Steam overlay). Forwarded alongside
+    /// the app buffer when compositing.
+    pub staged_overlay_buffer: Option<CommittedBuffer>,
+    /// Staged external overlay buffer (MangoHud, etc.).
+    pub staged_external_overlay_buffer: Option<CommittedBuffer>,
+    /// Overlay opacity (0.0–1.0, from _NET_WM_OPACITY).
+    pub overlay_opacity: std::sync::Arc<parking_lot::Mutex<f32>>,
+    /// External overlay opacity (0.0–1.0).
+    pub external_overlay_opacity: std::sync::Arc<parking_lot::Mutex<f32>>,
     /// Maps Wayland ClientId → XWayland server index. Populated during
     /// XWayland spawn so the commit handler can determine which server
     /// a surface belongs to.
@@ -174,6 +240,29 @@ pub struct WaylandState {
     /// Whether the user has moved the mouse since startup. Like gamescope,
     /// the cursor stays hidden until the first real pointer motion event.
     pub cursor_user_moved: bool,
+    /// DRM direct scanout mode. When true, the commit handler skips
+    /// synchronous DMA-BUF fence waits — the render thread handles
+    /// implicit sync asynchronously via `poll_dmabuf_ready()`.
+    pub drm_mode: bool,
+    /// DRM syncobj device for explicit sync operations.
+    /// Set in DRM mode when the kernel supports `syncobj_eventfd`.
+    pub syncobj_device: Option<protocols::SyncobjDevice>,
+    /// Map of `(surface_id, server_index)` → `WpLinuxDrmSyncobjSurfaceV1`.
+    /// Keyed by both IDs because different XWayland servers can allocate
+    /// the same `wl_surface` protocol ID.
+    pub syncobj_surfaces: std::collections::HashMap<
+        (u32, u32),
+        wayland_protocols::wp::linux_drm_syncobj::v1::server::wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1,
+    >,
+    /// Monotonic timestamp (ns) of the last deferred-callback fire.
+    /// Used for diagnosing frame pacing: the delta from this to the
+    /// next commit arrival reveals client render time + IPC latency.
+    pub last_callback_fire_ns: u64,
+    /// Monotonic timestamp (ns) when the current `staged_buffer` was set.
+    /// Measures how long a frame sits in the staging slot before forwarding.
+    pub staged_at_ns: u64,
+    /// Counter for total commits accepted (for stats).
+    pub commit_count: u64,
 }
 
 impl WaylandState {
@@ -187,14 +276,18 @@ impl WaylandState {
             frame_seq: 0,
             output_width: width,
             output_height: height,
+            output_refresh_mhz: 60_000,
             serial: 1,
-            pending_frame_callbacks: Vec::new(),
-            deferred_frame_callbacks: Vec::new(),
-            has_pending_commit: false,
+            surface_callbacks: std::collections::HashMap::new(),
+            surface_deferred_callbacks: std::collections::HashMap::new(),
             frame_channel: None,
             staged_buffer: None,
             staged_buffer_server_index: u32::MAX,
             held_buffers: Vec::new(),
+            staged_feedbacks: Vec::new(),
+            inflight_feedbacks: Vec::new(),
+            presentation_sequence: 0,
+            presentation_requests: 0,
             host_dmabuf_formats: std::sync::Arc::new(parking_lot::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -202,13 +295,29 @@ impl WaylandState {
             pointers: Vec::new(),
             client_surfaces: Vec::new(),
             toplevel_surfaces: Vec::new(),
-            keyboard_entered_clients: std::collections::HashSet::new(),
-            pointer_entered_clients: std::collections::HashSet::new(),
+            entered_keyboards: std::collections::HashMap::new(),
+            entered_pointers: std::collections::HashMap::new(),
             bound_outputs: Vec::new(),
             toplevels: Vec::new(),
             cursor_tx: None,
             focused_wl_surface_id: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             focused_server_index: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX)),
+            overlay_wl_surface_id: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            overlay_server_index: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX)),
+            external_overlay_wl_surface_id: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
+                0,
+            )),
+            external_overlay_server_index: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
+                u32::MAX,
+            )),
+            overlay_input_focus_mode: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            external_overlay_input_focus_mode: std::sync::Arc::new(
+                std::sync::atomic::AtomicU32::new(0),
+            ),
+            staged_overlay_buffer: None,
+            staged_external_overlay_buffer: None,
+            overlay_opacity: std::sync::Arc::new(parking_lot::Mutex::new(0.0)),
+            external_overlay_opacity: std::sync::Arc::new(parking_lot::Mutex::new(0.0)),
             xwayland_client_map: std::collections::HashMap::new(),
             native_focused_app_id: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             native_focused_surface_id: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -216,6 +325,12 @@ impl WaylandState {
             pointer_locked: false,
             locked_pointer: None,
             cursor_user_moved: false,
+            drm_mode: false,
+            syncobj_device: None,
+            syncobj_surfaces: std::collections::HashMap::new(),
+            last_callback_fire_ns: 0,
+            staged_at_ns: 0,
+            commit_count: 0,
         }
     }
 
@@ -259,13 +374,39 @@ impl WaylandState {
                     | wayland_server::protocol::wl_output::Mode::Preferred,
                 width as i32,
                 height as i32,
-                60_000,
+                self.output_refresh_mhz as i32,
             );
             output.done();
         }
 
         // Re-configure all toplevels so clients resize their buffers.
         self.reconfigure_toplevels();
+    }
+
+    /// Update the advertised output refresh rate and re-send `wl_output.mode`
+    /// to all bound outputs so clients update their internal frame timing
+    /// (e.g. Flutter syncs to the new vsync interval).
+    pub fn update_output_refresh(&mut self, refresh_mhz: u32) {
+        if refresh_mhz == 0 || refresh_mhz == self.output_refresh_mhz {
+            return;
+        }
+        info!(
+            old_mhz = self.output_refresh_mhz,
+            new_mhz = refresh_mhz,
+            "updating advertised wl_output refresh rate"
+        );
+        self.output_refresh_mhz = refresh_mhz;
+        self.bound_outputs.retain(|o| o.is_alive());
+        for output in &self.bound_outputs {
+            output.mode(
+                wayland_server::protocol::wl_output::Mode::Current
+                    | wayland_server::protocol::wl_output::Mode::Preferred,
+                self.output_width as i32,
+                self.output_height as i32,
+                refresh_mhz as i32,
+            );
+            output.done();
+        }
     }
 
     /// Re-configure all toplevels (Activated + Fullscreen).
@@ -298,62 +439,162 @@ impl WaylandState {
         s
     }
 
-    /// Move pending frame callbacks to the deferred queue.
+    /// Push a frame callback for a specific surface.
     ///
-    /// Called on `wl_surface.commit`. The deferred callbacks will be
-    /// released later by [`fire_deferred_callbacks`] when the FPS
-    /// limiter allows.
-    pub fn defer_frame_callbacks(&mut self) {
-        self.deferred_frame_callbacks
-            .append(&mut self.pending_frame_callbacks);
-        self.has_pending_commit = true;
+    /// Called from `wl_surface::Request::Frame`. Keyed by
+    /// `(protocol_id, server_index)` so each surface's callbacks are
+    /// isolated — matching gamescope's per-window callback model.
+    pub fn push_surface_callback(&mut self, surface_id: u32, server_index: u32, cb: WlCallback) {
+        self.surface_callbacks
+            .entry((surface_id, server_index))
+            .or_default()
+            .push(cb);
     }
 
-    /// Fire all pending frame callbacks immediately (no FPS limiting).
+    /// Move a surface's pending callbacks to the deferred queue.
     ///
-    /// Use this when FPS limiting is disabled, or in code paths that
-    /// should not be throttled (e.g., initial frame, cursor updates).
-    pub fn fire_frame_callbacks(&mut self) {
-        let now_ms = monotonic_ms();
-        for cb in self.pending_frame_callbacks.drain(..) {
-            cb.done(now_ms);
+    /// Called on `wl_surface.commit` for the focused App surface.
+    /// Deferred callbacks are released on the next vblank tick by
+    /// [`fire_all_deferred_callbacks`].
+    pub fn defer_surface_callbacks(&mut self, surface_id: u32, server_index: u32) {
+        let key = (surface_id, server_index);
+        if let Some(mut pending) = self.surface_callbacks.remove(&key) {
+            self.surface_deferred_callbacks
+                .entry(key)
+                .or_default()
+                .append(&mut pending);
         }
     }
 
-    /// Fire all frame callbacks (both pending and deferred) and release
-    /// all held buffers.
+    /// Fire a single surface's pending callbacks immediately.
     ///
-    /// Used when the host window regains focus to unblock clients that
-    /// are waiting for frame callbacks or free buffers to render again.
+    /// Used for overlays, cursors, and rejected commits — surfaces that
+    /// should not be FPS-limited.
+    pub fn fire_surface_pending(&mut self, surface_id: u32, server_index: u32) {
+        if let Some(cbs) = self.surface_callbacks.remove(&(surface_id, server_index)) {
+            let now_ms = monotonic_ms();
+            for cb in cbs {
+                cb.done(now_ms);
+            }
+        }
+    }
+
+    /// Fire all frame callbacks (pending and deferred) for ALL surfaces,
+    /// and release all held buffers.
+    ///
+    /// Used on VT resume, host focus regain, and other recovery paths
+    /// to unblock all clients.
     pub fn fire_all_callbacks(&mut self) {
         let now_ms = monotonic_ms();
-        for cb in self.pending_frame_callbacks.drain(..) {
-            cb.done(now_ms);
+        for (_, cbs) in self.surface_callbacks.drain() {
+            for cb in cbs {
+                cb.done(now_ms);
+            }
         }
-        for cb in self.deferred_frame_callbacks.drain(..) {
-            cb.done(now_ms);
+        for (_, cbs) in self.surface_deferred_callbacks.drain() {
+            for cb in cbs {
+                cb.done(now_ms);
+            }
         }
-        self.has_pending_commit = false;
         // Release held buffers so the client can reuse them immediately.
         for buf in self.held_buffers.drain(..) {
             buf.release();
         }
     }
 
-    /// Fire deferred frame callbacks. Called by the main loop when the
-    /// FPS limiter says it's time to release.
+    /// Fire all pending and deferred callbacks for ALL surfaces, then
+    /// release stale held buffers.
     ///
-    /// Returns `true` if any callbacks were actually fired.
-    pub fn fire_deferred_callbacks(&mut self) -> bool {
-        if self.deferred_frame_callbacks.is_empty() {
+    /// Called on each vblank tick. Matches gamescope's `paint_all` where
+    /// both `flush_frame_done` (callbacks) and buffer unlocks happen in
+    /// the same vblank iteration. Delivering `wl_callback.done` and
+    /// `wl_buffer.release` together is critical — XWayland's Present
+    /// extension uses both events to calibrate its MSC timing.
+    /// Desynchronizing them (e.g., releasing buffers immediately on
+    /// commit but deferring callbacks to vblank) causes 250ms hiccups
+    /// when Flutter resumes from idle.
+    ///
+    /// Returns `true` if any callbacks were fired.
+    pub fn fire_all_surface_callbacks(&mut self) -> bool {
+        let has_any = !self.surface_callbacks.is_empty()
+            || !self.surface_deferred_callbacks.is_empty();
+        if !has_any {
             return false;
         }
         let now_ms = monotonic_ms();
-        for cb in self.deferred_frame_callbacks.drain(..) {
-            cb.done(now_ms);
+        for (_, cbs) in self.surface_callbacks.drain() {
+            for cb in cbs {
+                cb.done(now_ms);
+            }
         }
-        self.has_pending_commit = false;
+        for (_, cbs) in self.surface_deferred_callbacks.drain() {
+            for cb in cbs {
+                cb.done(now_ms);
+            }
+        }
+
+        // Release stale held buffers AT THE SAME TIME as callbacks.
+        // Gamescope releases old buffers (via commit_t destructor) during
+        // paint_all, synchronized with frame callback delivery. Releasing
+        // buffers here instead of in forward_staged_frame() ensures
+        // wl_buffer.release and wl_callback.done arrive in the same
+        // Wayland flush, keeping XWayland's Present timing coherent.
+        self.release_stale_buffers();
+
         true
+    }
+
+    /// Fire all pending + deferred callbacks for a specific server.
+    ///
+    /// Used when waking a server (e.g., overlay activation wakes
+    /// server 0) without disturbing other servers' callback rhythm.
+    pub fn fire_server_callbacks(&mut self, server_index: u32) {
+        let now_ms = monotonic_ms();
+        let pending_keys: Vec<_> = self
+            .surface_callbacks
+            .keys()
+            .filter(|k| k.1 == server_index)
+            .copied()
+            .collect();
+        for key in pending_keys {
+            if let Some(cbs) = self.surface_callbacks.remove(&key) {
+                for cb in cbs {
+                    cb.done(now_ms);
+                }
+            }
+        }
+        let deferred_keys: Vec<_> = self
+            .surface_deferred_callbacks
+            .keys()
+            .filter(|k| k.1 == server_index)
+            .copied()
+            .collect();
+        for key in deferred_keys {
+            if let Some(cbs) = self.surface_deferred_callbacks.remove(&key) {
+                for cb in cbs {
+                    cb.done(now_ms);
+                }
+            }
+        }
+    }
+
+    /// Total number of pending callbacks across all surfaces.
+    #[must_use]
+    pub fn pending_callback_count(&self) -> usize {
+        self.surface_callbacks.values().map(Vec::len).sum()
+    }
+
+    /// Total number of deferred callbacks across all surfaces.
+    #[must_use]
+    pub fn deferred_callback_count(&self) -> usize {
+        self.surface_deferred_callbacks.values().map(Vec::len).sum()
+    }
+
+    /// Whether any surface has pending or deferred callbacks.
+    #[must_use]
+    pub fn has_surface_callbacks(&self) -> bool {
+        self.surface_callbacks.values().any(|v| !v.is_empty())
+            || self.surface_deferred_callbacks.values().any(|v| !v.is_empty())
     }
 
     /// Release the oldest held `wl_buffer` back to the client.
@@ -381,121 +622,325 @@ impl WaylandState {
         }
     }
 
-    /// Send keyboard and pointer enter events to each client's own surface.
+    /// Release every held `wl_buffer` *except* the two most recently
+    /// committed ones.
     ///
-    /// Called every main loop iteration. For each keyboard/pointer, finds the
-    /// surface belonging to the same Wayland client and sends enter if not
-    /// already sent. Prefers toplevel surfaces (xdg_toplevel role) so that
-    /// native Wayland clients like Flutter/GTK receive enter on the correct
-    /// window surface rather than a cursor or subsurface.
-    pub fn send_focus_enter(&mut self) {
-        if self.client_surfaces.is_empty() && self.toplevel_surfaces.is_empty() {
-            return;
+    /// Called when forwarding a staged frame: any older held buffers must
+    /// have come from commits the render thread silently coalesced (it
+    /// drains the channel keeping only the latest frame). Without this,
+    /// those wl_buffers stay held forever — the client runs out of pool
+    /// slots and frame rate drops.
+    ///
+    /// We keep TWO buffers because in the DRM direct-scanout path, the
+    /// client's DMA-BUF *is* the display scanout buffer. When a new
+    /// frame is committed, the previous frame is still being scanned out
+    /// until the new frame's page flip completes. Keeping two ensures the
+    /// active scanout buffer is never released prematurely.
+    ///
+    /// Returns the number of buffers released.
+    pub fn release_stale_buffers(&mut self) -> usize {
+        if self.held_buffers.len() <= 2 {
+            return 0;
         }
+        // Keep the two newest (last two pushed).
+        let keep_new = self.held_buffers.pop();
+        let keep_prev = self.held_buffers.pop();
+        let count = self.held_buffers.len();
+        for buf in self.held_buffers.drain(..) {
+            buf.release();
+        }
+        if let Some(buf) = keep_prev {
+            self.held_buffers.push(buf);
+        }
+        if let Some(buf) = keep_new {
+            self.held_buffers.push(buf);
+        }
+        count
+    }
 
-        // Clean up dead surfaces.
+    /// Compute the client that should currently receive keyboard focus.
+    ///
+    /// Compute the (client, surface_id) currently entitled to keyboard focus.
+    ///
+    /// Priority:
+    ///   external_overlay (mode > 0 && mode != 2)
+    ///     > steam_overlay (mode > 0 && mode != 2)
+    ///     > focused app
+    ///
+    /// Mode 2 means "pointer only" — keyboard stays with the app.
+    fn target_keyboard_focus(&self) -> Option<(wayland_server::backend::ClientId, u32)> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let ext_id = self.external_overlay_wl_surface_id.load(Relaxed);
+        let ext_srv = self.external_overlay_server_index.load(Relaxed);
+        let ext_mode = self.external_overlay_input_focus_mode.load(Relaxed);
+        let ovl_id = self.overlay_wl_surface_id.load(Relaxed);
+        let ovl_srv = self.overlay_server_index.load(Relaxed);
+        let ovl_mode = self.overlay_input_focus_mode.load(Relaxed);
+        let app_srv = self.focused_server_index.load(Relaxed);
+        let app_id = self.focused_wl_surface_id.load(Relaxed);
+
+        if ext_id != 0 && ext_mode > 0 && ext_mode != 2 {
+            return self
+                .find_xwayland_client_by_server(ext_srv)
+                .map(|c| (c, ext_id));
+        }
+        if ovl_id != 0 && ovl_mode > 0 && ovl_mode != 2 {
+            return self
+                .find_xwayland_client_by_server(ovl_srv)
+                .map(|c| (c, ovl_id));
+        }
+        if app_id != 0 {
+            return self
+                .find_xwayland_client_by_server(app_srv)
+                .map(|c| (c, app_id));
+        }
+        None
+    }
+
+    /// Compute the (client, surface_id) currently entitled to pointer focus.
+    /// Same as keyboard but mode 2 still grabs pointer.
+    fn target_pointer_focus(&self) -> Option<(wayland_server::backend::ClientId, u32)> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let ext_id = self.external_overlay_wl_surface_id.load(Relaxed);
+        let ext_srv = self.external_overlay_server_index.load(Relaxed);
+        let ext_mode = self.external_overlay_input_focus_mode.load(Relaxed);
+        let ovl_id = self.overlay_wl_surface_id.load(Relaxed);
+        let ovl_srv = self.overlay_server_index.load(Relaxed);
+        let ovl_mode = self.overlay_input_focus_mode.load(Relaxed);
+        let app_srv = self.focused_server_index.load(Relaxed);
+        let app_id = self.focused_wl_surface_id.load(Relaxed);
+
+        if ext_id != 0 && ext_mode > 0 {
+            return self
+                .find_xwayland_client_by_server(ext_srv)
+                .map(|c| (c, ext_id));
+        }
+        if ovl_id != 0 && ovl_mode > 0 {
+            return self
+                .find_xwayland_client_by_server(ovl_srv)
+                .map(|c| (c, ovl_id));
+        }
+        if app_id != 0 {
+            return self
+                .find_xwayland_client_by_server(app_srv)
+                .map(|c| (c, app_id));
+        }
+        None
+    }
+
+    /// Reverse-lookup: find the XWayland client owning the given server index.
+    fn find_xwayland_client_by_server(
+        &self,
+        server_idx: u32,
+    ) -> Option<wayland_server::backend::ClientId> {
+        if server_idx == u32::MAX {
+            return None;
+        }
+        self.xwayland_client_map
+            .iter()
+            .find(|(_, v)| **v == server_idx)
+            .map(|(k, _)| k.clone())
+    }
+
+    /// Find a specific surface by protocol ID belonging to the given client.
+    ///
+    /// Critical: clients (especially XWayland) create many surfaces — one
+    /// per X11 window, plus cursor surfaces and DnD icons. Picking any
+    /// surface for the client is wrong: cursor surfaces have role `cursor`
+    /// and sending `wl_pointer.enter` on them produces broken behavior
+    /// (default X-shaped cursor, no input). The XWM publishes the actual
+    /// focused window's `wl_surface.protocol_id()` via `focused_wl_surface_id`,
+    /// and we must use exactly that.
+    fn find_surface_by_id(
+        &self,
+        cid: &wayland_server::backend::ClientId,
+        surface_id: u32,
+    ) -> Option<WlSurface> {
+        for s in self
+            .toplevel_surfaces
+            .iter()
+            .chain(self.client_surfaces.iter())
+        {
+            if s.is_alive()
+                && s.id().protocol_id() == surface_id
+                && s.client().map(|c| c.id()).as_ref() == Some(cid)
+            {
+                return Some(s.clone());
+            }
+        }
+        None
+    }
+
+    /// Update keyboard and pointer focus to match the current focus state.
+    ///
+    /// Called every main loop iteration. Per-resource sweep: any
+    /// pointer/keyboard belonging to the focused client that hasn't yet
+    /// received `enter` gets one (provided we can find a focus surface);
+    /// any resource currently entered whose client is no longer focused
+    /// receives `leave`. Per-resource tracking ensures new resources
+    /// created by the focused client (or after a surface becomes
+    /// available) are picked up automatically.
+    // ClientId carries an `Arc<AtomicBool>` aliveness flag (interior
+    // mutability), but its identity for hashing/equality is the underlying
+    // wl_client pointer — stable for the lifetime we care about.
+    #[allow(clippy::mutable_key_type)]
+    pub fn update_input_focus(&mut self) {
         self.client_surfaces.retain(|s| s.is_alive());
         self.toplevel_surfaces.retain(|s| s.is_alive());
+        self.keyboards.retain(|k| k.is_alive());
+        self.pointers.retain(|p| p.is_alive());
 
-        // Helper: find the best surface for a client. Prefer toplevel
-        // surfaces; fall back to client_surfaces (bare surfaces from
-        // XWayland that never create an xdg_toplevel).
-        let find_surface =
-            |cid: &wayland_server::backend::ClientId, toplevel: &[WlSurface]| -> Option<usize> {
-                // First try toplevel_surfaces.
-                for (i, s) in toplevel.iter().enumerate() {
-                    if s.client().map(|c| c.id()).as_ref() == Some(cid) {
-                        // Return a sentinel: index >= toplevel.len() not needed,
-                        // we'll use a tag to distinguish.
-                        return Some(i);
+        // Prune entries whose resource no longer exists. Wayland protocol
+        // IDs are recycled per client, so stale entries would collide with
+        // freshly-created resources sharing the same id.
+        let live_kb_keys: std::collections::HashSet<(wayland_server::backend::ClientId, u32)> =
+            self.keyboards
+                .iter()
+                .filter_map(|k| k.client().map(|c| (c.id(), k.id().protocol_id())))
+                .collect();
+        self.entered_keyboards
+            .retain(|k, _| live_kb_keys.contains(k));
+        let live_ptr_keys: std::collections::HashSet<(wayland_server::backend::ClientId, u32)> =
+            self.pointers
+                .iter()
+                .filter_map(|p| p.client().map(|c| (c.id(), p.id().protocol_id())))
+                .collect();
+        self.entered_pointers
+            .retain(|k, _| live_ptr_keys.contains(k));
+
+        let target_kb = self.target_keyboard_focus();
+        let target_ptr = self.target_pointer_focus();
+
+        // ── Keyboard sweep ──────────────────────────────────────────
+        // Compute desired enter/leave; apply enters last so the new resource
+        // sees the correct (current) target.
+        let mut kb_leaves: Vec<(usize, wayland_server::backend::ClientId, u32)> = Vec::new();
+        let mut kb_enters: Vec<usize> = Vec::new();
+        for (i, kb) in self.keyboards.iter().enumerate() {
+            let kb_cid = match kb.client() {
+                Some(c) => c.id(),
+                None => continue,
+            };
+            let key = (kb_cid.clone(), kb.id().protocol_id());
+            let is_target = target_kb.as_ref().is_some_and(|(c, _)| c == &kb_cid);
+            match self.entered_keyboards.get(&key) {
+                Some((entered_cid, entered_sid)) => {
+                    let target_sid = target_kb.as_ref().map(|(_, s)| *s);
+                    if !is_target || target_sid != Some(*entered_sid) {
+                        kb_leaves.push((i, entered_cid.clone(), *entered_sid));
                     }
                 }
-                None
-            };
-
-        // ── Keyboard enters ────────────────────────────────────────
-        // (keyboard_index, surface_ref) where surface_ref encodes
-        // which list the surface is in: true=toplevel, false=client.
-        let mut kb_enters: Vec<(usize, usize, bool)> = Vec::new();
-        for (ki, kb) in self.keyboards.iter().enumerate() {
-            if !kb.is_alive() {
-                continue;
-            }
-            let Some(kb_client) = kb.client() else {
-                continue;
-            };
-            let kb_cid = kb_client.id();
-            if self.keyboard_entered_clients.contains(&kb_cid) {
-                continue;
-            }
-            if let Some(si) = find_surface(&kb_cid, &self.toplevel_surfaces) {
-                kb_enters.push((ki, si, true));
-            } else {
-                // Fall back to client_surfaces (XWayland).
-                for (si, surface) in self.client_surfaces.iter().enumerate() {
-                    if surface.client().map(|c| c.id()) == Some(kb_cid.clone()) {
-                        kb_enters.push((ki, si, false));
-                        break;
-                    }
-                }
-            }
-        }
-
-        for (ki, si, is_toplevel) in &kb_enters {
-            let serial = self.next_serial();
-            let surface = if *is_toplevel {
-                &self.toplevel_surfaces[*si]
-            } else {
-                &self.client_surfaces[*si]
-            };
-            let kb = &self.keyboards[*ki];
-            kb.enter(serial, surface, vec![]);
-            if let Some(c) = kb.client() {
-                self.keyboard_entered_clients.insert(c.id());
-            }
-        }
-
-        // ── Pointer enters ─────────────────────────────────────────
-        let mut ptr_enters: Vec<(usize, usize, bool)> = Vec::new();
-        for (pi, ptr) in self.pointers.iter().enumerate() {
-            if !ptr.is_alive() {
-                continue;
-            }
-            let Some(ptr_client) = ptr.client() else {
-                continue;
-            };
-            let ptr_cid = ptr_client.id();
-            if self.pointer_entered_clients.contains(&ptr_cid) {
-                continue;
-            }
-            if let Some(si) = find_surface(&ptr_cid, &self.toplevel_surfaces) {
-                ptr_enters.push((pi, si, true));
-            } else {
-                for (si, surface) in self.client_surfaces.iter().enumerate() {
-                    if surface.client().map(|c| c.id()) == Some(ptr_cid.clone()) {
-                        ptr_enters.push((pi, si, false));
-                        break;
+                None => {
+                    if is_target {
+                        kb_enters.push(i);
                     }
                 }
             }
         }
+        for (i, cid, sid) in kb_leaves {
+            if let Some(surf) = self.find_surface_by_id(&cid, sid) {
+                let serial = self.next_serial();
+                self.keyboards[i].leave(serial, &surf);
+            }
+            if let Some(c) = self.keyboards[i].client() {
+                let key = (c.id(), self.keyboards[i].id().protocol_id());
+                self.entered_keyboards.remove(&key);
+            }
+        }
+        if let Some((target_cid, target_sid)) = target_kb.clone()
+            && let Some(surf) = self.find_surface_by_id(&target_cid, target_sid)
+        {
+            for i in kb_enters {
+                // Only the focus target client can have its keyboards entered.
+                let Some(c) = self.keyboards[i].client() else {
+                    continue;
+                };
+                if c.id() != target_cid {
+                    continue;
+                }
+                let key = (c.id(), self.keyboards[i].id().protocol_id());
+                let serial = self.next_serial();
+                self.keyboards[i].enter(serial, &surf, vec![]);
+                self.entered_keyboards
+                    .insert(key, (target_cid.clone(), target_sid));
+            }
+        }
 
+        // ── Pointer sweep ──────────────────────────────────────────
+        let mut ptr_leaves: Vec<(usize, wayland_server::backend::ClientId, u32)> = Vec::new();
+        let mut ptr_enters: Vec<usize> = Vec::new();
+        for (i, ptr) in self.pointers.iter().enumerate() {
+            let ptr_cid = match ptr.client() {
+                Some(c) => c.id(),
+                None => continue,
+            };
+            let key = (ptr_cid.clone(), ptr.id().protocol_id());
+            let is_target = target_ptr.as_ref().is_some_and(|(c, _)| c == &ptr_cid);
+            match self.entered_pointers.get(&key) {
+                Some((entered_cid, entered_sid)) => {
+                    let target_sid = target_ptr.as_ref().map(|(_, s)| *s);
+                    if !is_target || target_sid != Some(*entered_sid) {
+                        ptr_leaves.push((i, entered_cid.clone(), *entered_sid));
+                    }
+                }
+                None => {
+                    if is_target {
+                        ptr_enters.push(i);
+                    }
+                }
+            }
+        }
+        for (i, cid, sid) in ptr_leaves {
+            if let Some(surf) = self.find_surface_by_id(&cid, sid) {
+                let serial = self.next_serial();
+                self.pointers[i].leave(serial, &surf);
+                self.pointers[i].frame();
+            }
+            if let Some(c) = self.pointers[i].client() {
+                let key = (c.id(), self.pointers[i].id().protocol_id());
+                self.entered_pointers.remove(&key);
+            }
+        }
         let cx = (self.output_width as f64) / 2.0;
         let cy = (self.output_height as f64) / 2.0;
-        for (pi, si, is_toplevel) in &ptr_enters {
-            let serial = self.next_serial();
-            let surface = if *is_toplevel {
-                &self.toplevel_surfaces[*si]
-            } else {
-                &self.client_surfaces[*si]
-            };
-            let ptr = &self.pointers[*pi];
-            ptr.enter(serial, surface, cx, cy);
-            ptr.frame();
-            if let Some(c) = ptr.client() {
-                self.pointer_entered_clients.insert(c.id());
+        if let Some((target_cid, target_sid)) = target_ptr.clone()
+            && let Some(surf) = self.find_surface_by_id(&target_cid, target_sid)
+        {
+            for i in ptr_enters {
+                let Some(c) = self.pointers[i].client() else {
+                    continue;
+                };
+                if c.id() != target_cid {
+                    continue;
+                }
+                let key = (c.id(), self.pointers[i].id().protocol_id());
+                let serial = self.next_serial();
+                self.pointers[i].enter(serial, &surf, cx, cy);
+                self.pointers[i].frame();
+                self.entered_pointers
+                    .insert(key, (target_cid.clone(), target_sid));
             }
         }
+    }
+
+    /// Whether the given keyboard has currently been sent `enter`.
+    #[inline]
+    fn keyboard_is_focused(&self, kb: &WlKeyboard) -> bool {
+        let Some(cid) = kb.client().map(|c| c.id()) else {
+            return false;
+        };
+        self.entered_keyboards
+            .contains_key(&(cid, kb.id().protocol_id()))
+    }
+
+    /// Whether the given pointer has currently been sent `enter`.
+    #[inline]
+    fn pointer_is_focused(&self, ptr: &WlPointer) -> bool {
+        let Some(cid) = ptr.client().map(|c| c.id()) else {
+            return false;
+        };
+        self.entered_pointers
+            .contains_key(&(cid, ptr.id().protocol_id()))
     }
 
     /// Forward a keyboard key event to the focused client.
@@ -504,6 +949,9 @@ impl WaylandState {
     /// event sends evdev keycodes directly — the XKB keymap handles the
     /// evdev→keysym translation on the client side.
     pub fn send_key(&mut self, key: u32, pressed: bool, time_ms: u32) {
+        if self.entered_keyboards.is_empty() {
+            return;
+        }
         let serial = self.next_serial();
         let state = if pressed {
             wayland_server::protocol::wl_keyboard::KeyState::Pressed
@@ -511,7 +959,7 @@ impl WaylandState {
             wayland_server::protocol::wl_keyboard::KeyState::Released
         };
         for kb in &self.keyboards {
-            if kb.is_alive() {
+            if kb.is_alive() && self.keyboard_is_focused(kb) {
                 kb.key(serial, time_ms, key, state);
             }
         }
@@ -528,9 +976,12 @@ impl WaylandState {
         mods_locked: u32,
         group: u32,
     ) {
+        if self.entered_keyboards.is_empty() {
+            return;
+        }
         let serial = self.next_serial();
         for kb in &self.keyboards {
-            if kb.is_alive() {
+            if kb.is_alive() && self.keyboard_is_focused(kb) {
                 kb.modifiers(serial, mods_depressed, mods_latched, mods_locked, group);
             }
         }
@@ -576,8 +1027,11 @@ impl WaylandState {
 
         self.pointer_x = (self.pointer_x + dx).clamp(0.0, self.output_width as f64 - 1.0);
         self.pointer_y = (self.pointer_y + dy).clamp(0.0, self.output_height as f64 - 1.0);
+        if self.entered_pointers.is_empty() {
+            return;
+        }
         for ptr in &self.pointers {
-            if ptr.is_alive() {
+            if ptr.is_alive() && self.pointer_is_focused(ptr) {
                 ptr.motion(time_ms, self.pointer_x, self.pointer_y);
                 ptr.frame();
             }
@@ -610,8 +1064,11 @@ impl WaylandState {
             return;
         }
 
+        if self.entered_pointers.is_empty() {
+            return;
+        }
         for ptr in &self.pointers {
-            if ptr.is_alive() {
+            if ptr.is_alive() && self.pointer_is_focused(ptr) {
                 ptr.motion(time_ms, self.pointer_x, self.pointer_y);
                 ptr.frame();
             }
@@ -620,6 +1077,9 @@ impl WaylandState {
 
     /// Forward a pointer button event to the focused client.
     pub fn send_pointer_button(&mut self, button: u32, pressed: bool, time_ms: u32) {
+        if self.entered_pointers.is_empty() {
+            return;
+        }
         let serial = self.next_serial();
         let state = if pressed {
             wl_pointer::ButtonState::Pressed
@@ -627,7 +1087,7 @@ impl WaylandState {
             wl_pointer::ButtonState::Released
         };
         for ptr in &self.pointers {
-            if ptr.is_alive() {
+            if ptr.is_alive() && self.pointer_is_focused(ptr) {
                 ptr.button(serial, time_ms, button, state);
                 ptr.frame();
             }
@@ -636,8 +1096,11 @@ impl WaylandState {
 
     /// Forward a scroll event to the focused client.
     pub fn send_pointer_axis(&mut self, dx: f64, dy: f64, time_ms: u32) {
+        if self.entered_pointers.is_empty() {
+            return;
+        }
         for ptr in &self.pointers {
-            if ptr.is_alive() {
+            if ptr.is_alive() && self.pointer_is_focused(ptr) {
                 if dy.abs() > f64::EPSILON {
                     ptr.axis(time_ms, wl_pointer::Axis::VerticalScroll, dy);
                 }
@@ -726,7 +1189,7 @@ impl WaylandServer {
 
         // Register protocol globals.
         let dh = display.handle();
-        let globals = protocols::register_globals(&dh, output_width, output_height);
+        let globals = protocols::register_globals(&dh, output_width, output_height, None);
 
         // Bind listening socket.
         let listener =
@@ -750,6 +1213,21 @@ impl WaylandServer {
     /// Get the Wayland socket name for clients to connect to.
     pub fn socket_name(&self) -> &str {
         &self.socket_name
+    }
+
+    /// Register the `wp_linux_drm_syncobj_manager_v1` global after DRM init.
+    ///
+    /// Must be called before XWayland starts so the global is visible.
+    pub fn register_syncobj_global(&self, device: protocols::SyncobjDevice) {
+        let dh = self.display.handle();
+        use wayland_protocols::wp::linux_drm_syncobj::v1::server::wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1;
+        dh.create_global::<WaylandState, WpLinuxDrmSyncobjManagerV1, protocols::SyncobjGlobalData>(
+            1,
+            protocols::SyncobjGlobalData {
+                device: Some(device),
+            },
+        );
+        info!("wp_linux_drm_syncobj_manager_v1: registered (late)");
     }
 
     /// Get the Wayland display fd for polling.

@@ -11,13 +11,18 @@
 use drm_fourcc::DrmFourcc;
 
 /// Maximum number of composition layers per frame.
-pub const MAX_LAYERS: usize = 4;
+pub const MAX_LAYERS: usize = 6;
 
 /// Layer indices by convention.
+///
+/// Z-order matches gamescope:
+///   base(0) < app(1) < override(2) < external_overlay(3) < overlay(4) < cursor(5)
 pub const LAYER_VIDEO_UNDERLAY: usize = 0;
 pub const LAYER_APP: usize = 1;
-pub const LAYER_OVERLAY: usize = 2;
-pub const LAYER_CURSOR: usize = 3;
+pub const LAYER_OVERRIDE: usize = 2;
+pub const LAYER_EXTERNAL_OVERLAY: usize = 3;
+pub const LAYER_OVERLAY: usize = 4;
+pub const LAYER_CURSOR: usize = 5;
 
 /// Filter mode for texture sampling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

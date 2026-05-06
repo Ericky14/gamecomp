@@ -1,0 +1,68 @@
+// Overlay premultiplied alpha-blend compute shader.
+//
+// Reads the current output image, blends an overlay texture on top using
+// premultiplied alpha, and writes the result back. Used as a second pass
+// after blit.comp to composite Steam/external overlays onto the display.
+//
+// Wayland surfaces use premultiplied alpha by protocol convention:
+//   result = src * opacity + dst * (1 - src.a * opacity)
+// where src.rgb is already premultiplied by src.a.
+//
+// Opaque formats (XRGB/XBGR) have their VkImageView alpha swizzled to ONE
+// by the Vulkan import path, so the shader reads alpha=1.0 automatically.
+// This matches gamescope's VK_COMPONENT_SWIZZLE_ONE approach.
+//
+// Performance note: This shader is only dispatched when overlays are
+// actually visible (rare — most frames are app-only). The read-modify-write
+// pattern requires the output image to be in GENERAL layout (not writeonly).
+
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// Output image (read-modify-write for alpha blending).
+layout(set = 0, binding = 0, rgba8) uniform image2D outputImage;
+
+// Overlay texture (sampled with bilinear filtering).
+layout(set = 0, binding = 1) uniform sampler2D overlayTexture;
+
+layout(push_constant) uniform PushConstants {
+    uvec2 dstSize;    // Output (display) dimensions.
+    float opacity;    // Global overlay opacity (0.0–1.0).
+    uint pad;
+} pc;
+
+void main() {
+    uvec2 pos = gl_GlobalInvocationID.xy;
+
+    // Early out for threads outside the output image.
+    if (pos.x >= pc.dstSize.x || pos.y >= pc.dstSize.y) {
+        return;
+    }
+
+    // Map output pixel to normalized overlay texture coordinate.
+    // Overlay covers the entire output (fullscreen).
+    vec2 uv = (vec2(pos) + 0.5) / vec2(pc.dstSize);
+
+    // Sample overlay with hardware bilinear filtering.
+    // For opaque formats, alpha reads as 1.0 via VK_COMPONENT_SWIZZLE_ONE.
+    vec4 overlay = texture(overlayTexture, uv);
+
+    float layerAlpha = overlay.a * pc.opacity;
+
+    // Skip fully transparent pixels (early out for performance).
+    if (layerAlpha < 1.0 / 255.0) {
+        return;
+    }
+
+    // Read current output pixel.
+    vec4 dst = imageLoad(outputImage, ivec2(pos));
+
+    // Premultiplied alpha blend (Wayland convention):
+    //   result = src * opacity + dst * (1 - src.a * opacity)
+    // src.rgb is already premultiplied by src.a.
+    vec3 blended = overlay.rgb * pc.opacity + dst.rgb * (1.0 - layerAlpha);
+    float alpha = layerAlpha + dst.a * (1.0 - layerAlpha);
+
+    imageStore(outputImage, ivec2(pos), vec4(blended, alpha));
+}

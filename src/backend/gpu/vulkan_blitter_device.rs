@@ -226,6 +226,110 @@ impl VulkanBlitter {
 
         info!("blitter: compute pipeline created (blit.comp)");
 
+        // --- Overlay blend pipeline (overlay_blend.comp) ---
+        // Second-pass shader for alpha-blending overlays onto the output.
+
+        let overlay_spv_bytes = include_bytes!(concat!(env!("OUT_DIR"), "/overlay_blend.spv"));
+        assert!(
+            overlay_spv_bytes.len().is_multiple_of(4),
+            "overlay_blend SPIR-V not 4-byte aligned"
+        );
+        let overlay_spv_words: Vec<u32> = overlay_spv_bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let overlay_shader_info = vk::ShaderModuleCreateInfo::default().code(&overlay_spv_words);
+        // SAFETY: Device is valid; shader code is valid SPIR-V from build.rs.
+        let overlay_shader_module =
+            unsafe { device.create_shader_module(&overlay_shader_info, None) }
+                .context("failed to create overlay_blend shader module")?;
+
+        // Descriptor set layout: binding 0 = storage_image (output, read-write),
+        // binding 1 = combined_image_sampler (overlay texture).
+        let overlay_bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+        ];
+        let overlay_ds_layout_info =
+            vk::DescriptorSetLayoutCreateInfo::default().bindings(&overlay_bindings);
+        // SAFETY: Device is valid; layout info references valid bindings.
+        let overlay_descriptor_set_layout =
+            unsafe { device.create_descriptor_set_layout(&overlay_ds_layout_info, None) }
+                .context("failed to create overlay descriptor set layout")?;
+
+        // Pipeline layout with OverlayPushConstants.
+        let overlay_push_range = vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .offset(0)
+            .size(std::mem::size_of::<OverlayPushConstants>() as u32);
+        let overlay_pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(std::slice::from_ref(&overlay_descriptor_set_layout))
+            .push_constant_ranges(std::slice::from_ref(&overlay_push_range));
+        // SAFETY: Device is valid; layout info is fully initialized.
+        let overlay_pipeline_layout =
+            unsafe { device.create_pipeline_layout(&overlay_pipeline_layout_info, None) }
+                .context("failed to create overlay pipeline layout")?;
+
+        // Compute pipeline for overlay_blend.comp.
+        let overlay_stage_info = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(overlay_shader_module)
+            .name(c"main");
+        let overlay_pipeline_info = vk::ComputePipelineCreateInfo::default()
+            .stage(overlay_stage_info)
+            .layout(overlay_pipeline_layout);
+        // SAFETY: Device is valid; pipeline info references valid shader + layout.
+        let overlay_compute_pipeline = unsafe {
+            device.create_compute_pipelines(
+                vk::PipelineCache::null(),
+                &[overlay_pipeline_info],
+                None,
+            )
+        }
+        .map_err(|(_, e)| e)
+        .context("failed to create overlay compute pipeline")?[0];
+
+        // Descriptor pool: 2 sets × (1 storage_image + 1 combined_image_sampler).
+        let overlay_pool_sizes = [
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_IMAGE)
+                .descriptor_count(2),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(2),
+        ];
+        let overlay_dp_info = vk::DescriptorPoolCreateInfo::default()
+            .max_sets(2)
+            .pool_sizes(&overlay_pool_sizes);
+        // SAFETY: Device is valid; pool info is fully initialized.
+        let overlay_descriptor_pool =
+            unsafe { device.create_descriptor_pool(&overlay_dp_info, None) }
+                .context("failed to create overlay descriptor pool")?;
+
+        // Allocate 2 overlay descriptor sets (one per potential overlay layer).
+        let overlay_set_layouts = [overlay_descriptor_set_layout; 2];
+        let overlay_ds_alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(overlay_descriptor_pool)
+            .set_layouts(&overlay_set_layouts);
+        // SAFETY: Device and pool are valid; layouts match pool sizes.
+        let overlay_descriptor_sets_vec =
+            unsafe { device.allocate_descriptor_sets(&overlay_ds_alloc_info) }
+                .context("failed to allocate overlay descriptor sets")?;
+        let overlay_descriptor_sets = [
+            overlay_descriptor_sets_vec[0],
+            overlay_descriptor_sets_vec[1],
+        ];
+
+        info!("blitter: overlay blend pipeline created (overlay_blend.comp)");
+
         let mut blitter = Self {
             entry,
             instance,
@@ -250,6 +354,12 @@ impl VulkanBlitter {
             descriptor_set,
             shader_module,
             output_image_views: Vec::new(),
+            overlay_shader_module,
+            overlay_descriptor_set_layout,
+            overlay_pipeline_layout,
+            overlay_compute_pipeline,
+            overlay_descriptor_pool,
+            overlay_descriptor_sets,
         };
 
         // Query all valid modifiers for import (before allocating outputs).

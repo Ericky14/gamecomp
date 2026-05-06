@@ -589,6 +589,12 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for HostState {
                 // When the host sends 0×0 it means "use your preferred size".
                 // Otherwise accept the host's actual dimensions — it may be
                 // constrained by decorations, screen size, or tiling.
+                //
+                // Only a non-zero configure from the WM represents a real
+                // window size assignment. The 0×0 fallback is our *desired*
+                // size which may exceed the actual display; propagating it
+                // would cause XWayland to launch at the wrong resolution.
+                let wm_assigned = width > 0;
                 let new_w = if width > 0 {
                     width as u32
                 } else {
@@ -608,19 +614,25 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for HostState {
                         desired_logical_w,
                         desired_logical_h,
                         fractional_scale = frac,
+                        wm_assigned,
                         "host resize: accepting host configure"
                     );
                     state.width = new_w;
                     state.height = new_h;
-                    // Compute physical pixel dimensions
-                    let phys_w = ((new_w as u64 * frac as u64) / 120) as u32;
-                    let phys_h = ((new_h as u64 * frac as u64) / 120) as u32;
-                    let _ = state.tx.send(WaylandEvent::Resized {
-                        width: new_w,
-                        height: new_h,
-                        physical_width: phys_w,
-                        physical_height: phys_h,
-                    });
+                    // Only propagate WM-assigned sizes to the main thread.
+                    // A 0×0 configure uses our desired size which may exceed
+                    // the host display; publishing it would cause XWayland
+                    // to launch at the wrong resolution.
+                    if wm_assigned {
+                        let phys_w = ((new_w as u64 * frac as u64) / 120) as u32;
+                        let phys_h = ((new_h as u64 * frac as u64) / 120) as u32;
+                        let _ = state.tx.send(WaylandEvent::Resized {
+                            width: new_w,
+                            height: new_h,
+                            physical_width: phys_w,
+                            physical_height: phys_h,
+                        });
+                    }
                 }
             }
             xdg_toplevel::Event::Close => {

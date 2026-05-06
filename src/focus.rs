@@ -76,19 +76,31 @@ impl FocusArbiter {
 
     /// Drain the XWM event channel and update internal state.
     ///
-    /// Must be called before [`update`] each tick.
-    pub fn drain_events(&mut self, event_rx: &calloop::channel::Channel<XwmEvent>) {
+    /// Must be called before [`update`] each tick. Returns focus change
+    /// events so the caller can extract overlay surface IDs.
+    pub fn drain_events(
+        &mut self,
+        event_rx: &calloop::channel::Channel<XwmEvent>,
+    ) -> Vec<XwmEvent> {
+        let mut focus_events = Vec::new();
         while let Ok(evt) = event_rx.try_recv() {
-            if let XwmEvent::BaselayerAppIdsChanged(ids) = evt {
-                debug!(?ids, "focus arbiter: baselayer app IDs updated");
-                self.baselayer_app_ids = ids;
-                // Reset stealer detection so all servers re-compete.
-                // Without this, clearing baselayer would leave the
-                // Phase-0 winner stuck in Phase 2 ("keep current winner")
-                // because no server's app_id actually changed.
-                self.prev_server_app_ids.fill(0);
+            match evt {
+                XwmEvent::BaselayerAppIdsChanged(ref ids) => {
+                    debug!(?ids, "focus arbiter: baselayer app IDs updated");
+                    self.baselayer_app_ids = ids.clone();
+                    // Reset stealer detection so all servers re-compete.
+                    // Without this, clearing baselayer would leave the
+                    // Phase-0 winner stuck in Phase 2 ("keep current winner")
+                    // because no server's app_id actually changed.
+                    self.prev_server_app_ids.fill(0);
+                }
+                XwmEvent::FocusChanged(..) => {
+                    focus_events.push(evt);
+                }
+                _ => {}
             }
         }
+        focus_events
     }
 
     /// Run one tick of the 4-phase focus arbitration.

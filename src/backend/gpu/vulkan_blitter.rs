@@ -176,6 +176,41 @@ struct BlitPushConstants {
     content_h: u32,
 }
 
+/// Push constants for the overlay blend compute shader (overlay_blend.comp).
+///
+/// Must match the GLSL `PushConstants` layout exactly:
+/// - `dstSize`:  output image dimensions
+/// - `opacity`:  global overlay opacity (0.0–1.0)
+/// - `pad`:      alignment padding
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct OverlayPushConstants {
+    dst_w: u32,
+    dst_h: u32,
+    opacity: f32,
+    pad: u32,
+}
+
+/// Description of an overlay layer to composite on top of the app buffer.
+pub struct OverlayLayer<'a> {
+    /// Borrowed fd for the overlay DMA-BUF first plane.
+    pub fd: std::os::unix::io::BorrowedFd<'a>,
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// DRM fourcc format code.
+    pub format: u32,
+    /// DRM modifier.
+    pub modifier: u64,
+    /// Byte offset of first plane.
+    pub offset: u32,
+    /// Row stride of first plane.
+    pub stride: u32,
+    /// Global opacity (0.0–1.0).
+    pub opacity: f32,
+}
+
 /// Vulkan-based DMA-BUF compositor.
 ///
 /// Imports client DMA-BUFs, composites them onto output images via a
@@ -228,6 +263,21 @@ pub struct VulkanBlitter {
     shader_module: vk::ShaderModule,
     /// Per-output image views (STORAGE, for compute shader writes).
     output_image_views: Vec<vk::ImageView>,
+
+    // --- Overlay blend pipeline (second pass, dispatched per overlay) ---
+    /// Shader module for overlay_blend.comp.
+    overlay_shader_module: vk::ShaderModule,
+    /// Descriptor set layout: binding 0 = storage_image (output, read-write),
+    /// binding 1 = combined_image_sampler (overlay texture).
+    overlay_descriptor_set_layout: vk::DescriptorSetLayout,
+    /// Pipeline layout with push constants for OverlayPushConstants.
+    overlay_pipeline_layout: vk::PipelineLayout,
+    /// Compute pipeline for overlay_blend.comp shader.
+    overlay_compute_pipeline: vk::Pipeline,
+    /// Descriptor pool for overlay descriptor sets.
+    overlay_descriptor_pool: vk::DescriptorPool,
+    /// Descriptor sets for overlay passes (one per potential overlay layer).
+    overlay_descriptor_sets: [vk::DescriptorSet; 2],
 }
 
 struct ImportedImage {
@@ -375,6 +425,19 @@ impl Drop for VulkanBlitter {
             self.device
                 .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
             self.device.destroy_shader_module(self.shader_module, None);
+
+            // Overlay pipeline resources.
+            self.device
+                .destroy_descriptor_pool(self.overlay_descriptor_pool, None);
+            self.device
+                .destroy_pipeline(self.overlay_compute_pipeline, None);
+            self.device
+                .destroy_pipeline_layout(self.overlay_pipeline_layout, None);
+            self.device
+                .destroy_descriptor_set_layout(self.overlay_descriptor_set_layout, None);
+            self.device
+                .destroy_shader_module(self.overlay_shader_module, None);
+
             self.device.destroy_sampler(self.sampler, None);
         }
 
@@ -388,6 +451,12 @@ impl Drop for VulkanBlitter {
             self.instance.destroy_instance(None);
         }
     }
+}
+
+/// Returns true if the DRM format has no alpha channel (XRGB/XBGR).
+#[inline(always)]
+fn is_opaque_drm_format(drm_format: u32) -> bool {
+    drm_format == DrmFourcc::Xrgb8888 as u32 || drm_format == DrmFourcc::Xbgr8888 as u32
 }
 
 /// Convert a DRM fourcc format to a VkFormat.

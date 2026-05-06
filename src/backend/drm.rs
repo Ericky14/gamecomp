@@ -117,6 +117,7 @@ struct ConnectorProps {
     crtc_id: Option<property::Handle>,
     vrr_capable: Option<property::Handle>,
     hdr_output_metadata: Option<property::Handle>,
+    colorspace: Option<property::Handle>,
 }
 
 /// State for a CRTC + connector + planes combination.
@@ -469,6 +470,9 @@ impl DrmBackend {
                             "vrr_capable" => conn_props.vrr_capable = Some(prop_handle),
                             "HDR_OUTPUT_METADATA" => {
                                 conn_props.hdr_output_metadata = Some(prop_handle)
+                            }
+                            "Colorspace" => {
+                                conn_props.colorspace = Some(prop_handle)
                             }
                             _ => {}
                         }
@@ -1054,6 +1058,25 @@ impl Backend for DrmBackend {
                     prop,
                     drm::control::property::Value::Blob(mode_blob.into()),
                 );
+            }
+            // Reset color properties to SDR defaults. A previous compositor
+            // (e.g., gamescope) may have set HDR mode on the connector which
+            // persists across DRM master transitions.
+            if let Some(prop) = output.connector_props.colorspace {
+                req.add_property(
+                    output.connector,
+                    prop,
+                    drm::control::property::Value::Unknown(0), // Default
+                );
+                info!("reset connector Colorspace to Default");
+            }
+            if let Some(prop) = output.connector_props.hdr_output_metadata {
+                req.add_property(
+                    output.connector,
+                    prop,
+                    drm::control::property::Value::Blob(0), // Clear blob
+                );
+                info!("cleared connector HDR_OUTPUT_METADATA");
             }
             debug!("first flip: including CRTC+connector in atomic request");
         }

@@ -274,6 +274,173 @@ tasks:
         DISPLAY={{.X_DISPLAY}} xprop -root -format GAMESCOPECTRL_BASELAYER_APPID 32c \
           -remove GAMESCOPECTRL_BASELAYER_APPID
 
+  # ─── Overlay testing ────────────────────────────────────────────────
+  # Tasks for testing overlay composition at runtime. Overlays are X11
+  # windows with STEAM_OVERLAY=1 or GAMESCOPE_EXTERNAL_OVERLAY=1 atoms.
+  #
+  # Quick test:
+  #   Terminal 1:  go-task run APP=vkcube
+  #   Terminal 2:  go-task overlay:run APP=glxgears
+  #
+  # One-shot overlay test (runs both app + overlay):
+  #   go-task overlay:test APP=vkcube OVERLAY_APP=glxgears
+  #
+  # Mark an existing window as overlay:
+  #   go-task overlay:mark WIN_ID=0x400003
+
+  overlay:run:
+    desc: "Launch an app as a Steam overlay on a running gamecomp (APP=program)"
+    requires:
+      vars: [APP]
+    vars:
+      X_DISPLAY: '{{.X11_DISPLAY | default .GAMECOMP_DISPLAY}}'
+      OPACITY: '{{.OPACITY | default "0xFFFFFFFF"}}'
+    preconditions:
+      - sh: '[ -n "{{.X_DISPLAY}}" ]'
+        msg: "No gamecomp display found. Is gamecomp running? Set X11_DISPLAY=:N manually."
+    cmds:
+      - |
+        echo "=== Overlay Test on {{.X_DISPLAY}} ==="
+        echo "Launching {{.APP}} as STEAM_OVERLAY..."
+
+        # Launch the overlay app in the background on the gamecomp display.
+        DISPLAY={{.X_DISPLAY}} {{.APP}} &
+        APP_PID=$!
+
+        # Wait for the window to appear (poll for up to 5 seconds).
+        WIN_ID=""
+        for i in $(seq 1 50); do
+          WIN_ID=$(DISPLAY={{.X_DISPLAY}} xdotool search --pid $APP_PID 2>/dev/null | head -1) || true
+          if [ -n "$WIN_ID" ]; then break; fi
+          sleep 0.1
+        done
+
+        if [ -z "$WIN_ID" ]; then
+          echo "ERROR: Could not find window for PID $APP_PID after 5s"
+          kill $APP_PID 2>/dev/null || true
+          exit 1
+        fi
+
+        # Convert decimal window ID to hex for display.
+        WIN_HEX=$(printf "0x%x" "$WIN_ID")
+        echo "Found window $WIN_HEX (PID $APP_PID)"
+
+        # Mark as Steam overlay.
+        DISPLAY={{.X_DISPLAY}} xprop -id "$WIN_ID" -format STEAM_OVERLAY 32c \
+          -set STEAM_OVERLAY 1
+        echo "Set STEAM_OVERLAY=1"
+
+        # Set overlay opacity.
+        DISPLAY={{.X_DISPLAY}} xprop -id "$WIN_ID" -format _NET_WM_OPACITY 32c \
+          -set _NET_WM_OPACITY {{.OPACITY}}
+        echo "Set _NET_WM_OPACITY={{.OPACITY}}"
+
+        echo ""
+        echo "Overlay running (PID $APP_PID, window $WIN_HEX)"
+        echo "Press Ctrl+C to stop."
+        wait $APP_PID 2>/dev/null || true
+
+  overlay:ext-run:
+    desc: "Launch an app as an external overlay on a running gamecomp (APP=program)"
+    requires:
+      vars: [APP]
+    vars:
+      X_DISPLAY: '{{.X11_DISPLAY | default .GAMECOMP_DISPLAY}}'
+      OPACITY: '{{.OPACITY | default "0xFFFFFFFF"}}'
+    preconditions:
+      - sh: '[ -n "{{.X_DISPLAY}}" ]'
+        msg: "No gamecomp display found. Is gamecomp running? Set X11_DISPLAY=:N manually."
+    cmds:
+      - |
+        echo "=== External Overlay Test on {{.X_DISPLAY}} ==="
+        echo "Launching {{.APP}} as GAMESCOPE_EXTERNAL_OVERLAY..."
+
+        DISPLAY={{.X_DISPLAY}} {{.APP}} &
+        APP_PID=$!
+
+        WIN_ID=""
+        for i in $(seq 1 50); do
+          WIN_ID=$(DISPLAY={{.X_DISPLAY}} xdotool search --pid $APP_PID 2>/dev/null | head -1) || true
+          if [ -n "$WIN_ID" ]; then break; fi
+          sleep 0.1
+        done
+
+        if [ -z "$WIN_ID" ]; then
+          echo "ERROR: Could not find window for PID $APP_PID after 5s"
+          kill $APP_PID 2>/dev/null || true
+          exit 1
+        fi
+
+        WIN_HEX=$(printf "0x%x" "$WIN_ID")
+        echo "Found window $WIN_HEX (PID $APP_PID)"
+
+        DISPLAY={{.X_DISPLAY}} xprop -id "$WIN_ID" -format GAMESCOPE_EXTERNAL_OVERLAY 32c \
+          -set GAMESCOPE_EXTERNAL_OVERLAY 1
+        echo "Set GAMESCOPE_EXTERNAL_OVERLAY=1"
+
+        DISPLAY={{.X_DISPLAY}} xprop -id "$WIN_ID" -format _NET_WM_OPACITY 32c \
+          -set _NET_WM_OPACITY {{.OPACITY}}
+        echo "Set _NET_WM_OPACITY={{.OPACITY}}"
+
+        echo ""
+        echo "External overlay running (PID $APP_PID, window $WIN_HEX)"
+        echo "Press Ctrl+C to stop."
+        wait $APP_PID 2>/dev/null || true
+
+  overlay:mark:
+    desc: "Mark an existing window as a Steam overlay (X11_DISPLAY=:N WIN_ID=0xNNN)"
+    requires:
+      vars: [WIN_ID]
+    vars:
+      X_DISPLAY: '{{.X11_DISPLAY | default .GAMECOMP_DISPLAY}}'
+      OPACITY: '{{.OPACITY | default "0xFFFFFFFF"}}'
+    cmds:
+      - |
+        echo "Marking window {{.WIN_ID}} as STEAM_OVERLAY on {{.X_DISPLAY}}"
+        DISPLAY={{.X_DISPLAY}} xprop -id {{.WIN_ID}} -format STEAM_OVERLAY 32c \
+          -set STEAM_OVERLAY 1
+        DISPLAY={{.X_DISPLAY}} xprop -id {{.WIN_ID}} -format _NET_WM_OPACITY 32c \
+          -set _NET_WM_OPACITY {{.OPACITY}}
+        echo "Done. Window {{.WIN_ID}} is now an overlay."
+
+  overlay:ext-mark:
+    desc: "Mark an existing window as an external overlay (X11_DISPLAY=:N WIN_ID=0xNNN)"
+    requires:
+      vars: [WIN_ID]
+    vars:
+      X_DISPLAY: '{{.X11_DISPLAY | default .GAMECOMP_DISPLAY}}'
+      OPACITY: '{{.OPACITY | default "0xFFFFFFFF"}}'
+    cmds:
+      - |
+        echo "Marking window {{.WIN_ID}} as GAMESCOPE_EXTERNAL_OVERLAY on {{.X_DISPLAY}}"
+        DISPLAY={{.X_DISPLAY}} xprop -id {{.WIN_ID}} -format GAMESCOPE_EXTERNAL_OVERLAY 32c \
+          -set GAMESCOPE_EXTERNAL_OVERLAY 1
+        DISPLAY={{.X_DISPLAY}} xprop -id {{.WIN_ID}} -format _NET_WM_OPACITY 32c \
+          -set _NET_WM_OPACITY {{.OPACITY}}
+        echo "Done. Window {{.WIN_ID}} is now an external overlay."
+
+  overlay:unmark:
+    desc: "Remove overlay atoms from a window (X11_DISPLAY=:N WIN_ID=0xNNN)"
+    requires:
+      vars: [WIN_ID]
+    vars:
+      X_DISPLAY: '{{.X11_DISPLAY | default .GAMECOMP_DISPLAY}}'
+    cmds:
+      - |
+        echo "Removing overlay atoms from window {{.WIN_ID}} on {{.X_DISPLAY}}"
+        DISPLAY={{.X_DISPLAY}} xprop -id {{.WIN_ID}} -remove STEAM_OVERLAY 2>/dev/null || true
+        DISPLAY={{.X_DISPLAY}} xprop -id {{.WIN_ID}} -remove GAMESCOPE_EXTERNAL_OVERLAY 2>/dev/null || true
+        echo "Done."
+
+  overlay:test:
+    desc: "Run gamecomp with an app + overlay (APP=vkcube OVERLAY_APP=glxgears)"
+    requires:
+      vars: [APP, OVERLAY_APP]
+    vars:
+      OPACITY: '{{.OPACITY | default "0xB0000000"}}'
+    cmds:
+      - ./scripts/overlay-test.sh {{.APP}} {{.OVERLAY_APP}} {{.WIDTH}} {{.HEIGHT}} {{.OPACITY}}
+
   loc:
     desc: Count lines of Rust source code
     cmds:

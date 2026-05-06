@@ -132,10 +132,10 @@ fn frame_builder_layer_assertions() {
         .with_overlay(1, 0, 0, 200, 100, 0.5)
         .build();
 
-    // App at LAYER_APP (1) + overlay at LAYER_OVERLAY (2) → layer_count = 3.
-    assert_layer_count(&frame, 3);
+    // App at LAYER_APP (1) + overlay at LAYER_OVERLAY (4) → layer_count = 5.
+    assert_layer_count(&frame, 5);
     assert_layer_active(&frame, 1); // LAYER_APP
-    assert_layer_active(&frame, 2); // LAYER_OVERLAY
+    assert_layer_active(&frame, 4); // LAYER_OVERLAY
     assert_layer_fullscreen(&frame, 1); // App covers full output
 }
 
@@ -153,4 +153,52 @@ fn vrf_mode_configuration() {
     assert!(!backend.vrr_enabled);
     backend.set_vrr(true).unwrap();
     assert!(backend.vrr_enabled);
+}
+
+#[test]
+fn frame_builder_external_overlay() {
+    let frame = FrameBuilder::new(1920, 1080)
+        .with_fullscreen_app(0)
+        .with_external_overlay(2, 0, 0, 400, 200, 0.9)
+        .build();
+
+    // LAYER_APP (1) + external_overlay at LAYER_EXTERNAL_OVERLAY (3) → layer_count = 4.
+    assert_layer_count(&frame, 4);
+    assert_layer_active(&frame, 1); // LAYER_APP
+    assert_layer_active(&frame, 3); // LAYER_EXTERNAL_OVERLAY
+    assert!(!frame.is_direct_scanout_candidate());
+    assert_eq!(frame.mode, CompositionMode::Composite);
+}
+
+#[test]
+fn frame_builder_all_overlays() {
+    let frame = FrameBuilder::new(1920, 1080)
+        .with_fullscreen_app(0)
+        .with_external_overlay(1, 0, 0, 400, 100, 0.7)
+        .with_overlay(2, 0, 0, 1920, 1080, 0.8)
+        .with_cursor(3, 100, 100)
+        .build();
+
+    // Layers active: APP(1), EXTERNAL_OVERLAY(3), OVERLAY(4), CURSOR(5) → layer_count = 6.
+    assert_layer_count(&frame, 6);
+    assert_layer_active(&frame, 1); // LAYER_APP
+    assert_layer_active(&frame, 3); // LAYER_EXTERNAL_OVERLAY
+    assert_layer_active(&frame, 4); // LAYER_OVERLAY
+    assert_layer_active(&frame, 5); // LAYER_CURSOR
+    assert!(!frame.is_direct_scanout_candidate());
+
+    // External overlay below Steam overlay (z-order).
+    assert!(frame.layers[3].opacity < frame.layers[4].opacity);
+}
+
+#[test]
+fn frame_builder_overlay_zero_opacity_still_active() {
+    let frame = FrameBuilder::new(1920, 1080)
+        .with_fullscreen_app(0)
+        .with_overlay(1, 0, 0, 1920, 1080, 0.0)
+        .build();
+
+    assert_layer_active(&frame, 4);
+    assert_eq!(frame.layers[4].opacity, 0.0);
+    assert!(!frame.is_direct_scanout_candidate());
 }

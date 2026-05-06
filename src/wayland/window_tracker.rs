@@ -150,6 +150,19 @@ pub struct FocusState {
     /// Wayland surface protocol ID of the focused app window.
     /// Used by the compositor to gate buffer presentation.
     pub focused_wl_surface_id: u32,
+    /// Wayland surface protocol ID of the overlay window.
+    pub overlay_wl_surface_id: u32,
+    /// Wayland surface protocol ID of the external overlay window.
+    pub external_overlay_wl_surface_id: u32,
+    /// Input focus mode of the overlay window (from `STEAM_INPUT_FOCUS`).
+    /// 0 = no input, 1 = overlay grabs input, 2 = overlay grabs but keyboard stays.
+    pub overlay_input_focus_mode: u32,
+    /// Input focus mode of the external overlay window.
+    pub external_overlay_input_focus_mode: u32,
+    /// Opacity of the overlay window (0.0–1.0).
+    pub overlay_opacity: f32,
+    /// Opacity of the external overlay window (0.0–1.0).
+    pub external_overlay_opacity: f32,
 }
 
 /// Tracks all X11 windows and determines focus.
@@ -269,6 +282,7 @@ impl WindowTracker {
     pub fn set_opacity(&mut self, id: u32, opacity: f32) {
         if let Some(win) = self.windows.get_mut(&id) {
             win.opacity = opacity;
+            self.focus_dirty = true;
         }
     }
 
@@ -371,7 +385,7 @@ impl WindowTracker {
         self.focus.focused_wl_surface_id = focused_win.map_or(0, |w| w.wl_surface_id);
 
         // --- Pick overlay window (highest opacity mapped overlay) ---
-        self.focus.overlay = self
+        let overlay_win = self
             .windows
             .values()
             .filter(|w| w.mapped && w.role == WindowRole::Overlay)
@@ -379,16 +393,23 @@ impl WindowTracker {
                 a.opacity
                     .partial_cmp(&b.opacity)
                     .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .map(|w| w.id);
+            });
+        self.focus.overlay = overlay_win.map(|w| w.id);
+        self.focus.overlay_wl_surface_id = overlay_win.map_or(0, |w| w.wl_surface_id);
+        self.focus.overlay_opacity = overlay_win.map_or(0.0, |w| w.opacity);
+        self.focus.overlay_input_focus_mode = overlay_win.map_or(0, |w| w.input_focus_mode);
 
         // --- Pick external overlay ---
-        self.focus.external_overlay = self
+        let ext_overlay_win = self
             .windows
             .values()
             .filter(|w| w.mapped && w.role == WindowRole::ExternalOverlay)
-            .max_by_key(|w| w.map_sequence)
-            .map(|w| w.id);
+            .max_by_key(|w| w.map_sequence);
+        self.focus.external_overlay = ext_overlay_win.map(|w| w.id);
+        self.focus.external_overlay_wl_surface_id = ext_overlay_win.map_or(0, |w| w.wl_surface_id);
+        self.focus.external_overlay_opacity = ext_overlay_win.map_or(0.0, |w| w.opacity);
+        self.focus.external_overlay_input_focus_mode =
+            ext_overlay_win.map_or(0, |w| w.input_focus_mode);
 
         // --- Pick popup/override-redirect ---
         self.focus.popup = self
@@ -405,8 +426,15 @@ impl WindowTracker {
             || self.focus.focused_app_id != old_focus.focused_app_id
             || self.focus.focused_wl_surface_id != old_focus.focused_wl_surface_id
             || self.focus.overlay != old_focus.overlay
+            || self.focus.overlay_wl_surface_id != old_focus.overlay_wl_surface_id
             || self.focus.external_overlay != old_focus.external_overlay
+            || self.focus.external_overlay_wl_surface_id != old_focus.external_overlay_wl_surface_id
             || self.focus.popup != old_focus.popup
+            || self.focus.overlay_opacity != old_focus.overlay_opacity
+            || self.focus.external_overlay_opacity != old_focus.external_overlay_opacity
+            || self.focus.overlay_input_focus_mode != old_focus.overlay_input_focus_mode
+            || self.focus.external_overlay_input_focus_mode
+                != old_focus.external_overlay_input_focus_mode
     }
 
     /// Build the list of all focusable AppIDs (for feedback atom).

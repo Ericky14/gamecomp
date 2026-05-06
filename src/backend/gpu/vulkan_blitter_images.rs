@@ -25,6 +25,32 @@ fn create_image_view_2d(
     unsafe { device.create_image_view(&view_info, None) }.context("failed to create image view")
 }
 
+/// Like [`create_image_view_2d`] but swizzles the alpha channel to ONE.
+///
+/// Used for opaque DRM formats (XRGB/XBGR) where the alpha byte is
+/// undefined. The GPU reads alpha as 1.0 regardless of buffer content,
+/// matching gamescope's approach (VK_COMPONENT_SWIZZLE_ONE).
+fn create_image_view_2d_swizzle_alpha_one(
+    device: &ash::Device,
+    image: vk::Image,
+    format: vk::Format,
+) -> anyhow::Result<vk::ImageView> {
+    let view_info = vk::ImageViewCreateInfo::default()
+        .image(image)
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .format(format)
+        .components(vk::ComponentMapping {
+            r: vk::ComponentSwizzle::IDENTITY,
+            g: vk::ComponentSwizzle::IDENTITY,
+            b: vk::ComponentSwizzle::IDENTITY,
+            a: vk::ComponentSwizzle::ONE,
+        })
+        .subresource_range(COLOR_SUBRESOURCE_RANGE);
+    // SAFETY: Device and image are valid; swizzle is well-formed.
+    unsafe { device.create_image_view(&view_info, None) }
+        .context("failed to create image view (alpha=ONE)")
+}
+
 impl VulkanBlitter {
     /// Import externally-allocated DMA-BUFs as output images.
     ///
@@ -487,8 +513,16 @@ impl VulkanBlitter {
                 .context("failed to bind imported dmabuf memory")?;
         }
 
-        let image_view = create_image_view_2d(&self.device, image, vk_format)
-            .context("failed to create client import image view")?;
+        let image_view = if is_opaque_drm_format(format) {
+            // Opaque formats (XRGB/XBGR) have no alpha channel — the alpha
+            // byte is undefined (often 0x00). Swizzle it to ONE so the GPU
+            // reads alpha as 1.0, matching gamescope's behavior.
+            create_image_view_2d_swizzle_alpha_one(&self.device, image, vk_format)
+                .context("failed to create opaque import image view")?
+        } else {
+            create_image_view_2d(&self.device, image, vk_format)
+                .context("failed to create client import image view")?
+        };
 
         Ok((image, memory, image_view))
     }
